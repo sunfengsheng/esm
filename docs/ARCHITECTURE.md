@@ -1,129 +1,233 @@
-# Architecture
+﻿# 架构文档
 
-```text
-Desktop / CLI / SDK <--named pipe--> Index service
-                                      |-- Query engine
-                                      |-- Metadata index
-                                      |-- NTFS MFT + USN provider
-                                      |-- Fallback scanner/watcher
-                                      `-- Extraction queue --> Xapian content DB
+## 1. 目标与边界
+
+`everything_sm` 是独立 clean-room Windows 文件搜索实现。核心目标：
+
+- 利用 NTFS 元数据快速建立文件名目录；
+- 用 USN Journal 增量保持目录新鲜；
+- 通过本地服务向低权限 GUI/CLI 提供查询；
+- 用快照/WAL 缩短重启并提高崩溃恢复能力；
+- 把文件名元数据搜索与未来内容全文索引分离。
+
+当前不实现 Everything ETP，也不把 Everything 私有实现作为代码依赖。
+
+## 2. 进程与组件
+
+```mermaid
+flowchart TB
+    subgraph Kernel["Windows / NTFS"]
+      MFT["MFT"]
+      USN["USN Journal"]
+      RDC["ReadDirectoryChangesW"]
+      FS["文件元数据 / Shell"]
+    end
+
+    subgraph Elevated["机器级或提升进程"]
+      Service["esm_service"]
+      Server["esm_server"]
+      Catalog["NtfsCatalog / MetadataIndex"]
+      Persistence["Snapshot / Checkpoint / WAL"]
+      PipeServer["Named Pipe worker pool"]
+    end
+
+    subgraph User["当前用户进程"]
+      Launcher["esm_launcher"]
+      GUI["esm_gui"]
+      CLI["esm_cli"]
+      UserData["GUI settings/history/bookmarks/filters"]
+    end
+
+    MFT --> Service
+    USN --> Service
+    RDC --> Server
+    FS --> Server
+    Service --> Catalog
+    Server --> Catalog
+    Catalog <--> Persistence
+    Catalog --> PipeServer
+    Launcher --> Service
+    Launcher --> Server
+    GUI <--> PipeServer
+    CLI <--> PipeServer
+    GUI <--> UserData
 ```
 
-## Planned process boundaries
+### 可执行文件职责
 
-- `esm_service`: privileged discovery, persistent metadata, journal ingestion and querying.
-- `esm_extract_worker`: low-privilege resource-limited content extraction.
-- `esm_gui`: unprivileged native Win32 desktop application.
-- `esm_cli`: administration, diagnostics and querying.
+- `esm_service`：SCM 服务宿主及安装/管理命令。
+- `esm_server`：前台 `scan`、`mft`、`live` 服务，便于开发和回退。
+- `esm_launcher`：安装版入口，优先使用机器服务，失败时启动隐藏扫描服务。
+- `esm_gui`：窗口、查询调度、结果展示和文件操作。
+- `esm_cli`：查询、扫描、MFT、Journal 和 live 诊断。
 
-The current phase has four executable surfaces. `esm_cli live` keeps discovery and queries in one process for diagnostics, `esm_server` is the foreground development host, `esm_service` is an installed LocalSystem SCM service, and `esm_gui` is an unprivileged native desktop client. The query hosts expose the same local Named Pipe protocol to both `esm_cli query` and `esm_gui`.
+## 3. 数据模型与文件身份
 
-## Identity
+`FileRecord` 表示可搜索条目，包含路径、名称、目录标志以及可用的大小、修改时间、属性和 NTFS 身份信息。
 
-Path is mutable and cannot be the primary key. NTFS records use volume identity plus file reference number and sequence. Hard links require one physical identity to map to multiple directory entries. Other providers use a stable provider identity when available and otherwise a persisted synthetic identity.
+NTFS 路径重建以文件引用号和父引用号连接 MFT 节点。多卷模式必须把卷身份加入命名空间，避免不同卷上相同文件引用号冲突。
 
-## Windows fallback scanner/watcher
+当前语义边界：
 
-For roots that are not using the privileged NTFS MFT/USN path, `esm_server scan` combines an authoritative recursive scanner with a recursive overlapped `ReadDirectoryChangesW` watcher. The watcher uses a 4-64 KiB notification buffer, a separate completion event, stop-token cancellation through `CancelIoEx`, strict `FILE_NOTIFY_INFORMATION` bounds validation, and explicit overflow reporting. A dedicated watcher thread remains responsive while a separate refresh thread waits for a 150 ms quiet period and then rebuilds the fallback index from a full scan. If events arrive during that scan, the generation counter immediately schedules another reconciliation, avoiding a watcher gap caused by doing the scan on the notification thread.
+- hard-link 的每个目录入口尚未在所有路径中完整独立表示；
+- sequence number 重用、删除后引用复用需要更多边界测试；
+- junction、symlink、mount point 和 reparse point 策略仍不完整；
+- ADS 不进入当前文件名目录。
 
-Fallback records derive fixed FNV-1a synthetic IDs from normalized invariant-lowercase absolute paths and apply the same operation to parent paths. Metadata comes from `GetFileAttributesExW`, including Windows attributes, 64-bit size, and native `FILETIME`. Directory reparse points are represented but recursion is disabled at those entries. These identities are stable across repeated scans while a path is unchanged, but are not physical file identities: a rename creates a new synthetic ID. Notification records are treated only as invalidation hints; they are not committed directly as authoritative state.
+## 4. Provider 路径
 
-This first provider stage does not claim complete FAT/exFAT semantics, network-share reconnect/recovery, cloud placeholders, offline/removable-volume lifecycle, provider-specific incremental deltas, automatic multi-volume discovery, or Linux/macOS backends.
+### 4.1 多卷 NTFS MFT provider
 
-## Index split
+默认安装模式：
 
-- Metadata index: names, paths, timestamps, sizes, attributes and properties.
-- Content index: extracted terms, language analysis and snippets.
+1. 枚举带盘符的本地 NTFS 固定卷；
+2. 对每个卷读取 MFT；
+3. 重建路径并加卷命名空间；
+4. 合并进 MetadataIndex；
+5. 启动每卷 live 更新；
+6. 常规协调约每分钟，完整协调约每 30 分钟；
+7. 周期性保存机器级 snapshot。
 
-Search plans query either index and merge by stable document identity.
+### 4.2 单卷 live provider
 
-## NTFS catalog representation
+单卷 live 模式使用 checkpoint、metadata snapshot 和 append-only WAL。checkpoint 必须位于不同卷，避免索引自己的持久化写入。
 
-`NtfsCatalog` separates stable catalog state from recent Journal mutations:
+### 4.3 目录扫描 provider
 
-```text
-owned ID-sorted vector<BaseNode> or mapped v2 node table
-                         + contiguous wchar_t name arena
-                         + unordered_map mutation overlay
-                         + base-ID tombstones
+非 NTFS/非提升场景可递归调用 Windows 文件 API 扫描目录。`DirectoryWatcher` 使用 `ReadDirectoryChangesW` 获取变化通知；当前回退策略会在相关变化后协调/重扫目录树，而不是精确维护所有 provider 语义。
+
+## 5. 目录存储
+
+### 5.1 NtfsCatalog
+
+`NtfsCatalog` 使用紧凑基础层保存稳定节点和名称 arena，并用 overlay 表示增量变化。该设计避免每次更新重建完整节点/字符串向量。
+
+v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视图下流式写节点和名称 arena，不再先物化百万级 `vector<FileRecord>`。
+
+### 5.2 MetadataIndex
+
+`MetadataIndex` 提供可搜索记录、完整路径和查询执行。它当前仍保存较多完整路径/字符串，是完整服务内存占用的主要来源之一。
+
+Catalog 与 MetadataIndex 尚未完全共享字符串存储；路径组件化、压缩和增量构建是后续重点。
+
+## 6. 名称 trigram 倒排索引
+
+交互式名称查询使用 `NameTrigramPostingIndex` 缩小候选范围：
+
+- 把名称生成连续 3 字符 gram；
+- 每个 gram 计算 16-bit hash，共 65,536 个 bucket；
+- 用 CSR 结构保存：`offsets[65537]` + 连续 `record_indices[]`；
+- posting 按 `natural_name_order` 构建，减少查询后再次排序；
+- 同时为 raw 名称和 accent-folded 名称生成 gram；
+- 从查询中提取必须出现的名称 trigram，选择最稀疏 posting 作为候选集合；
+- 对每个候选运行完整 query evaluator，消除 16-bit hash collision 和复杂语法造成的误报。
+
+```mermaid
+flowchart LR
+    Query["查询文本"] --> Parse["解析 / AST 后缀程序"]
+    Parse --> Grams["提取 mandatory name trigrams"]
+    Grams --> Select["选择最稀疏 posting"]
+    Select --> Candidates["候选 record indices"]
+    Candidates --> Eval["完整 evaluator"]
+    Eval --> Limit["按服务端顺序截断"]
+    Limit --> Result["IPC 结果"]
 ```
 
-The base is immutable between compactions and contains fixed-width metadata plus name offset/length pairs; it does not allocate a `std::wstring` per stable node. The same span-based catalog code reads either owned vectors or node/name ranges backed by a read-only v2 file mapping. Base lookup is a binary search by file-reference ID. The overlay is checked first, a tombstone hides a deleted base node, and only then is the base consulted. Updating a base node promotes it into the overlay, while newly created nodes enter the overlay directly.
+无法安全提取 mandatory 名称 gram 的查询（例如部分 `path:`、正则或复杂 OR）会使用更宽的候选路径或完整求值，因此延迟更高。
 
-Compaction merges the logical overlay/base view into new owned sorted vectors, rebuilds the contiguous name arena, and releases an attached file mapping. It can be requested explicitly and runs automatically at 100,000 overlay entries plus tombstones by default. A mapped base with no deltas can instead be materialized without a logical compaction when an atomic snapshot replacement needs the old file mapping closed. Catalog snapshots iterate the same merged logical view. Persistence records contain node metadata and names but omit complete paths.
+## 7. 查询引擎
 
-Paths are reconstructed on demand by following parent IDs with orphan and cycle protection. A directory rename identifies affected descendants and uses a parent-chain result cache so siblings sharing the same ancestry do not repeatedly traverse that chain. Stable catalog storage is compact and can remain memory-mapped after restart. Recent Journal batches are also persisted in an append-only WAL, while periodic checkpoint consolidation still rewrites a complete compact base image.
+查询解析器：
 
-## Reliability invariants
+- token 化普通词、引号、括号和逻辑运算符；
+- 用 shunting-yard 风格的优先级处理生成后缀 `QueryInstruction` program；
+- 支持隐式 AND；
+- `NOT > AND > OR`；
+- 把字段、比较符、大小、日期、属性、duplicate mode 和 request flags 写入 `ParsedQuery`。
 
-1. Journal cursors advance only after the mutable catalog and searchable index accept the associated batch.
-2. A persistent metadata snapshot contains the catalog state and the exact Journal cursor that belongs to that state.
-3. Rename is an atomic old-name removal plus new-name insertion.
-4. Query snapshots never observe half-applied batches.
-5. Full MFT reconciliation can rebuild derived state from authoritative volume state.
-6. Parsers run with explicit byte, count, string, time and memory limits.
+执行器对每个候选记录运行完整布尔程序。查询语法见 [QUERY_SYNTAX.md](QUERY_SYNTAX.md)。
 
-## USN checkpoint invariants
+## 8. 持久化与恢复
 
-`FSCTL_READ_USN_JOURNAL` must start from a checkpoint emitted by Windows: `FirstUsn`, `NextUsn`, or the leading `USN` returned by an earlier read. A numeric value manufactured inside the apparent `[FirstUsn, NextUsn]` range is not guaranteed to identify a record boundary and may be rejected with `ERROR_INVALID_PARAMETER`.
+### 8.1 Snapshot
 
-The race-free bootstrap sequence is therefore:
+metadata snapshot 包含版本、卷/模式标记、记录和校验信息。替换流程：
 
-1. Query the journal and save its exact `NextUsn`.
-2. Enumerate the MFT into the initial metadata index.
-3. Replay journal records beginning at the saved `NextUsn`.
-4. Persist each exact next-USN returned by Windows after the batch is applied atomically.
+1. 写入临时文件；
+2. 刷新写入；
+3. 校验完成；
+4. write-through rename 覆盖目标。
 
+如果当前 v2 文件仍被 mapping 使用，Catalog 会先 compact delta 或把不可变基础层物化到自有内存，避免 Windows 因打开 mapping 阻止替换。
 
-## Live-index session
+### 8.2 WAL
 
-`LiveIndexSession` owns the mutable NTFS catalog, compact metadata index, Journal identity and exact cursor. `esm_server live` and `esm_service` use the same recovery order:
+单卷 live 路径把增量变化作为带边界和校验的事务追加到 `<checkpoint>.wal`。启动恢复只重放完整事务，不完整尾部会被截断。checkpoint consolidation 把已确认增量合并回基线。
 
-1. Query the current USN Journal.
-2. Attempt to load `<checkpoint>.metadata` and verify its magic/version, checksum, volume identity, NTFS root ID, Journal ID and embedded exact `NextUsn`. Version 2 is opened as a read-only mapping; version 1 uses the compatibility loader.
-3. If valid, attach the v2 node table/name arena directly to `NtfsCatalog` (or rebuild owned catalog vectors for v1), reconstruct the searchable index, stream complete WAL transactions beginning at the embedded cursor, and then replay the live Journal to a fresh boundary. A successfully loaded v1 image is immediately rewritten as v2.
-4. If missing, corrupt, truncated, expired, from another volume, or from another Journal, capture an exact pre-MFT `NextUsn`, enumerate the MFT, build both in-memory structures, and replay from that captured boundary.
-5. Serve queries only after catch-up completes; continue polling in a background follower while queries use shared-lock snapshots.
-6. Before replacement, compact pending overlay/tombstone state or materialize an unchanged mapped base so the old mapping is released. Stream the fixed node table and UTF-16 name arena directly to `.tmp`, flush it, and publish with `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)`. Only after the snapshot and checkpoint are durable is the WAL reset. Polling automatically consolidates at 64 MiB; the SCM service also refreshes after five minutes or 100,000 changes and performs a final save during clean shutdown.
+### 8.3 当前限制
 
-The snapshot deliberately stores file-reference IDs, parent IDs and metadata rather than a full path string for every record. Version 2 uses an 80-byte header, a fixed 48-byte `CatalogBaseNode` table, a contiguous UTF-16 name arena, the UTF-16 volume name, and a trailing whole-file checksum. Nodes are strictly ID-sorted and reference names by 32-bit offset/length. Version 1 remains load-compatible and migrates automatically. Snapshot creation streams the compact arenas directly and no longer materializes a full temporary `vector<FileRecord>`. The base snapshot is still a complete state image; future work includes delta snapshots, shared catalog/search strings, faster parallel checksums and periodic reconciliation.
+默认多卷 MFT 服务主要使用完整 `mft-index.snapshot` 定期替换，尚未统一为通用 base snapshot + WAL + delta replay 数据库。这是后端下一阶段的重要工作。
 
+## 9. IPC
 
-## WAL and checkpoint consolidation
+Named Pipe 使用项目自有版本化二进制 frame：
 
-`<checkpoint>.wal` is a sequence of independently checksummed transactions. Each transaction records Journal identity, exact start/next USNs, change count and a bounded payload (64 MiB maximum). Append uses write-through file handles and flushes before the external checkpoint advances. Recovery reads a 52-byte header and one transaction payload at a time, validates continuity and checksum, applies only transactions newer than the loaded snapshot cursor, and updates the searchable overlay.
+- 严格 UTF-8 转换；
+- 4 MiB payload 上限；
+- 1000 结果上限；
+- exact read/write；
+- 客户端超时和有限重试；
+- `PIPE_REJECT_REMOTE_CLIENTS`；
+- 显式 DACL；
+- foreground server 与 SCM service 各使用 4 个 worker/pipe instance。
 
-A short final header or payload is a torn append: recovery keeps all complete transactions and truncates the physical file to `valid_bytes`. A fully present transaction with a bad checksum is corruption and returns `ERROR_CRC`; it is not silently discarded. Consolidation publishes a new atomic snapshot first, saves its exact checkpoint second, and resets the WAL last. Therefore a crash in the publication-to-reset window is safe: restart loads the newer snapshot and skips the still-present older WAL transactions by cursor. Tests cover torn-tail truncation, repeat replay, complete-transaction CRC failure and this checkpoint crash window.
+当前服务在 SYSTEM 权限下读取机器目录，但没有为每个查询 impersonate 调用用户，也没有按用户令牌过滤结果。安全边界详见 [OPERATIONS.md](OPERATIONS.md)。
 
-## Named Pipe IPC
+## 10. GUI 查询流水线
 
-`esm_server scan <root> [pipe-name]`, `esm_server mft <volume> [pipe-name]`, `esm_server live ...`, and the installed `esm_service` serve search requests. `esm_cli query <pipe-name> <query>` and `esm_gui [pipe-name]` are current clients.
+```mermaid
+sequenceDiagram
+    participant U as 用户输入
+    participant G as GUI UI线程
+    participant W as 查询线程
+    participant S as 索引服务
+    participant M as 元数据线程
 
-Protocol properties:
+    U->>G: 文本变化
+    G->>G: 去重/取消旧请求
+    G->>W: 活跃查询，limit=200
+    W->>S: Named Pipe request
+    S-->>W: 已排序轻量结果
+    W-->>G: 更新虚拟列表
+    G->>G: 约250ms refinement计时
+    G->>W: 稳定查询，limit=设置值(默认1000)
+    W->>S: Named Pipe request
+    S-->>W: 最终结果
+    W-->>G: 更新列表
+    G->>M: 延迟补齐大小/时间/图标
+    M-->>G: 分批刷新可见数据
+    G->>G: 约1秒后写查询历史
+```
 
-- fixed frame header with magic, protocol version, message type, request ID and payload size;
-- strict UTF-8 strings on the wire;
-- 4 MiB maximum payload and 1,000 maximum requested results;
-- exact byte-stream reads/writes with bounded client connection timeout;
-- `PIPE_REJECT_REMOTE_CLIENTS`, so the pipe cannot accept remote clients;
-- a protected DACL grants SYSTEM/administrators full control and authenticated local users read/write access;
-- four worker instances accept independent clients concurrently;
-- a shared stop flag plus wake connections unblock `ConnectNamedPipe` and join every worker during shutdown;
-- request flags include path/case/whole-word behavior plus a versioned sort field and direction;
-- malformed frames, flags, limits and UTF-8 are rejected before search execution.
+关键响应策略：
 
-This is now a bounded local transport integrated with the SCM lifecycle and persistent snapshot recovery, but not the final authorization model. The service still needs per-user/client policy and per-request cancellation.
+- 文本变化请求去重和取消过期结果；
+- 不重复排序服务端已按名称自然顺序返回的结果；
+- Shell 图标按扩展名缓存；
+- 文件元数据后台 hydration；
+- 搜索历史延迟写入，避免每次按键同步 I/O。
 
+## 11. 设置和用户数据
 
+GUI 设置、历史、书签、筛选器、运行次数/最近打开记录以及自定义 Pipe 均位于 `%LOCALAPPDATA%\everything_sm`。机器 snapshot 位于 `%ProgramData%\everything_sm\indexes`。机器级数据与当前用户偏好分离。
 
-## Native desktop client
+## 12. 并发和一致性
 
-`esm_gui` is a Win32 unprivileged Pipe client. A compact history-enabled search combo drives debounced asynchronous searches; generation IDs discard stale replies. A classic native menu bar and keyboard navigation expose the same file operations without adding a custom toolkit. Results use an owner-data `ListView`, Shell system-image-list icons and server-side column sorting. The current desktop layer also includes an original navy/teal multi-resolution Windows icon, tray/hotkey activation, status timing, persisted history storage, persisted column visibility/order/width, sort/preview/window state, persisted case-sensitive/whole-word/path matching switches, basic text preview, custom file operations/context menu, and multi-file Shell data objects shared by clipboard and OLE drag operations. It intentionally does not impersonate proprietary Everything UI resources. Shell-native context menus and Windows preview handlers, accessibility/DPI/dark-mode refinement, and GUI automation tests remain product work.
+- 服务启动/停止由 SCM 生命周期和 stoppable worker 管理；
+- 查询读取稳定索引视图；
+- 后台 USN/协调任务更新目录；
+- snapshot 保存使用独立读视图并可异步执行；
+- GUI 用 generation/request 状态丢弃过期响应；
+- 元数据和图标后台任务不得直接阻塞 UI 线程。
 
-## Checkpoint placement invariant
-
-The exact checkpoint and its sibling metadata snapshot (`<checkpoint>.metadata`) must not be stored on the NTFS volume being indexed. Updating either file on that volume produces another USN record, which can trigger another persistence write and form a self-sustaining loop. `esm_cli live`, `esm_server live`, and `esm_service` reject same-volume checkpoint paths; the snapshot inherits the same external placement.
-
-Keeping persistence outside the indexed volume also lets one atomic snapshot represent a catalog state plus its embedded Journal cursor without observing its own storage writes. A future transactional store may relax the prototype restriction only if internal writes are isolated from ingestion or handled as an explicit no-write replay case.
-
-
+未来架构修改必须同步更新本文件、`docs/CURRENT_STATUS.md` 和 `CHANGELOG.md`。

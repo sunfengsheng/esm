@@ -1,100 +1,140 @@
-# Product parity roadmap
+﻿# 路线图
 
-Baseline target: Everything 1.5.0.1418b Beta as observed on 2026-07-23. The target is versioned so upstream changes do not silently move acceptance criteria.
+路线图按“已具备基础能力”和“达到完整产品标准仍需完成”区分，避免把部分实现误写成完整兼容。
 
-## Definition of parity
+## P0：性能与资源占用
 
-A feature is complete only when behavior has an executable compatibility test, edge cases are covered, performance is measured, and restart/crash recovery is tested where persistent state is involved.
+### 查询
 
-## M1 - Searchable metadata index
+- [x] 基础名称 trigram 候选缩小。
+- [x] raw/accent-folded gram。
+- [x] posting 按自然名称顺序构建。
+- [x] GUI 两阶段 limit 和过期请求丢弃。
+- [ ] `path:` 专用路径组件/gram 索引。
+- [ ] 正则/复杂布尔查询的安全候选提取扩展。
+- [ ] posting 的增量更新和持久化。
+- [ ] 真实键盘到绘制完成的端到端延迟基准。
 
-- [x] Recursive fallback scanner
-- [x] In-memory filename/path index
-- [x] Quoted, scoped, excluded, wildcard, file/folder queries
-- [x] Unit tests and synthetic benchmark
-- [x] Compact string arena and stable record IDs
-- [x] Persistent checksummed metadata snapshot with embedded exact USN cursor
-- [x] Fixed-layout v2 snapshot with direct read-only node/name mapping and v1 migration
-- [x] Fast snapshot restart followed by Journal-tail catch-up
-- [ ] Natural sort and all metadata columns
-- [x] Checksummed append-only WAL with streaming replay and torn-tail truncation
-- [x] Crash-safe snapshot/WAL checkpoint consolidation and 64 MiB automatic threshold
-- [ ] Generalized incremental metadata database / delta snapshot format
+### 内存
 
-## M2 - NTFS-speed indexing
+- [x] 紧凑 `NtfsCatalog` 基础层 + overlay。
+- [x] v2 memory-mapped snapshot。
+- [x] snapshot 流式保存，消除完整临时 `vector<FileRecord>`。
+- [ ] Catalog 与 MetadataIndex 共享名称和路径组件。
+- [ ] 路径组件化/压缩，减少完整路径重复。
+- [ ] 索引直接 mmap 或增量构建。
+- [ ] 将约 326 万记录服务内存从当前数 GB 显著降低。
 
-- [x] Enumerate MFT with `FSCTL_ENUM_USN_DATA` (requires elevated service for live-volume validation)
-- [x] Reconstruct paths from file and parent reference numbers
-- [x] Detect path cycles and place unresolved records in an orphan bucket
-- [ ] Represent every hard-link directory entry independently
-- [ ] Define complete NTFS reparse-point, junction, symlink and mount-point policy
-- [x] Fallback scanner indexes reparse entries without traversing them
-- [x] Read and atomically checkpoint the USN Journal
-- [x] Apply create/delete/rename/update events transactionally
-- [x] Compact incremental index overlays automatically
-- [x] Reject corrupt, expired, wrong-volume, or wrong-Journal snapshots and rebuild from MFT
-- [x] Replace the high-memory mutable catalog with a compact base + overlay
-- [x] Memory-map the immutable catalog base snapshot
-- [x] Prototype continuous journal catch-up in the in-process `live` CLI
-- [x] Move race-free bootstrap and continuous Journal following into `esm_server live`
-- [ ] Add periodic full reconciliation
-- [x] Local-only bounded Named Pipe query protocol and CLI/server prototype
-- [x] Protected Pipe DACL for elevated-server/non-elevated-client queries
-- [x] Concurrent Pipe worker pool and clean host shutdown primitive
-- [x] Windows SCM Service install/start/status/stop/uninstall lifecycle
-- [x] LocalSystem service host with start-pending checkpoints and clean stop handling
-- [ ] Per-user client authorization
-- [x] Windows `ReadDirectoryChangesW` fallback watcher with debounced full reconciliation
-- [ ] Provider-specific incremental FAT/exFAT and network-share semantics
-- [ ] Removable/offline volume lifecycle, cloud providers and multi-volume discovery
-- [ ] Linux/macOS providers
+## P1：统一持久化
 
-## M3 - Everything-compatible query engine
+- [x] atomic checksummed snapshot。
+- [x] 单卷 live append-only WAL。
+- [x] 完整事务重放和 torn-tail 截断。
+- [x] checkpoint consolidation 基础能力。
+- [ ] 多卷默认服务使用统一 base snapshot + WAL。
+- [ ] 通用 delta replay 和事务恢复。
+- [ ] checkpoint 期间持续服务且无大内存峰值。
+- [ ] schema 版本迁移与回滚策略。
+- [ ] 定期恢复演练和损坏注入测试。
 
-- [ ] Boolean operators and precedence
-- [ ] Complete wildcard and regex behavior
-- [ ] Case, whole-word, diacritic and path toggles
-- [ ] Size/date/attribute/property functions
-- [ ] Macros, bookmarks and filters
-- [x] Persisted desktop query-history storage
-- [ ] Search-history UI and query refinement cache
-- [ ] Duplicate-file functions
-- [ ] Natural sorting and fast incremental query refinement
+## P2：查询兼容
 
-## M4 - Desktop product
+### 已有基础
 
-- [x] Native Windows search window with asynchronous live results
-- [x] Classic compact menu/search/results/status layout with search-history dropdown and keyboard navigation
-- [x] Global `Ctrl+Alt+Space` hotkey and system tray
-- [x] Fixed metadata columns, Shell file icons and server-side column sorting
-- [x] Basic text preview and custom context menu
-- [x] Copy path/file, rename, recycle delete, double-click open and open-location
-- [x] Column visibility/order/width, sort/preview/window settings persistence and multi-file Shell clipboard/drag data objects
-- [ ] Shell-native context menu and Windows preview-handler integration
-- [ ] Installer, auto-start, update and diagnostics
+- [x] 引号、作用域和排除词。
+- [x] AND/OR/NOT、括号和优先级。
+- [x] wildcard 和基础 regex。
+- [x] size/date/attribute predicate。
+- [x] case/whole-word/path/diacritic flags。
+- [x] bookmarks、filters、history。
+- [x] duplicate name/size/name-size。
+- [x] 基础自然排序。
 
-## M5 - Servers and integrations
+### 仍需完整化
 
-- [x] CLI client
-- [x] Versioned binary search IPC prototype
-- [x] Native GUI client over the same IPC
-- [x] Everything-style seven-menu GUI, persistent view/search switches, category filter selector, bookmarks, result export, and original multi-size Windows icon
-- [ ] Stable public SDK / IPC compatibility contract
-- [ ] HTTP server
-- [ ] ETP-compatible server/client behavior
-- [ ] Multi-machine result federation
+- [ ] Everything 全部函数和别名。
+- [ ] 宏与参数化宏。
+- [ ] 完整相对日期、范围和时间字段。
+- [ ] 完整属性/文件系统函数。
+- [ ] 完整 wildcard/regex/escape 兼容矩阵。
+- [ ] 全部 duplicate functions。
+- [ ] 完整自然排序边界和 locale 行为。
+- [ ] 增量 query refinement cache，而不仅是 GUI 两阶段查询。
+- [ ] 与 Everything 公开语法文档逐项对照测试。
 
-## M6 - Content and property indexing
+## P3：NTFS 完整语义
 
-- [ ] Crash-isolated extraction workers
-- [ ] Plain text/source code and Windows IFilter
-- [ ] PDF and OOXML extractors
-- [ ] Xapian content index
-- [ ] Chinese tokenization and character n-grams
-- [ ] Snippets, highlighting and OCR extension point
+- [x] MFT 枚举和父路径重建。
+- [x] USN 创建、删除、重命名和更新基础处理。
+- [x] 多卷固定 NTFS 发现和命名空间。
+- [x] 周期性常规/完整协调基础能力。
+- [ ] 每个 hard-link 目录入口的独立表示。
+- [ ] 完整 file reference sequence number 重用处理。
+- [ ] 明确 reparse/junction/symlink traversal 策略。
+- [ ] mount point 和 volume GUID path 策略。
+- [ ] 权限、所有者和 ACL 变化语义。
+- [ ] ADS 列举和搜索。
+- [ ] 离线卷、可移动卷和卷移除/重接状态机。
+- [ ] 更强的 MFT/USN fuzz 与故障注入。
 
-## Clean-room policy
+## P4：非 NTFS 和 provider
 
-Reproduce behavior, not proprietary code, branding, icons or binaries. Public documentation, observable black-box behavior, documented Windows APIs, and officially published SDK/protocol material are acceptable inputs.
+- [x] 普通递归扫描原型。
+- [x] `ReadDirectoryChangesW` 触发的回退协调。
+- [ ] FAT/exFAT 完整实时 provider。
+- [ ] 网络共享 provider 和断线重连。
+- [ ] 云盘占位符/provider 语义。
+- [ ] 自动发现并统一管理非 NTFS 数据源。
+- [ ] Linux provider。
+- [ ] macOS provider。
+- [ ] provider SDK 和稳定生命周期接口。
 
+## P5：GUI 产品化
 
+- [x] 原生搜索窗口、实时列表和系统托盘。
+- [x] 全局快捷键、列管理、文件图标和选择感知右键菜单。
+- [x] 拖放、双击打开、打开所在目录、重命名、删除、复制/移动。
+- [x] 书签、筛选器、历史、文件列表和导出。
+- [x] Everything 风格七菜单结构和菜单冒烟测试。
+- [ ] Windows 原生 Shell context menu extension/完整 IContextMenu 托管。
+- [ ] Windows Preview Handler 集成。
+- [ ] 高 DPI、多显示器和可访问性完整测试。
+- [ ] 深色模式和主题。
+- [ ] 大结果集 paint/scroll 性能专项优化。
+- [ ] 安装、首次建库和错误恢复的引导 UI。
+
+## P6：安全、运维和发布
+
+- [x] 本地 Pipe、拒绝远程客户端和显式 DACL。
+- [x] NSIS 安装/卸载。
+- [x] delayed-auto Windows 服务。
+- [x] GitHub Actions 构建、测试、installer/portable artifact 和 tag release。
+- [x] 文档同步 Hook 与 CI 检查。
+- [ ] per-request impersonation。
+- [ ] 按用户 ACL 过滤查询结果。
+- [ ] 服务最小权限设计。
+- [ ] 结构化日志、日志轮转和诊断包。
+- [ ] 崩溃报告和隐私策略。
+- [ ] 代码签名与安装包签名。
+- [ ] 安全自动升级、回滚和数据库迁移。
+- [ ] 稳定公开 SDK/API 版本策略。
+- [ ] HTTP/ETP 服务；如实现 ETP，必须明确兼容范围。
+
+## P7：内容搜索
+
+- [ ] 定义与文件名目录分离的内容索引接口。
+- [ ] Xapian 可选 provider 原型。
+- [ ] 文本提取器隔离进程。
+- [ ] 内容类型、大小、权限和隐私策略。
+- [ ] 增量内容重建和删除传播。
+- [ ] 内容查询与文件名查询组合。
+
+## 完成标准
+
+任何条目只有同时满足以下条件才能标记完成：
+
+1. 实现已进入 `main`；
+2. 有自动化测试或明确人工验证；
+3. 用户/架构/运维/性能文档已同步；
+4. `CHANGELOG.md` 已记录；
+5. 不以单一 happy path 代替完整边界声明。

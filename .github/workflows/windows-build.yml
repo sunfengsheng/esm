@@ -23,6 +23,19 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check documentation updates
+        shell: pwsh
+        env:
+          ESM_DOC_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          ESM_DOC_PUSH_BASE: ${{ github.event.before }}
+          ESM_DOC_HEAD: ${{ github.sha }}
+        run: |
+          $base = $env:ESM_DOC_PR_BASE
+          if ([string]::IsNullOrWhiteSpace($base)) { $base = $env:ESM_DOC_PUSH_BASE }
+          .\tools\check-docs-updated.ps1 -BaseRef $base -HeadRef $env:ESM_DOC_HEAD
 
       - name: Install UCRT64 MinGW toolchain
         uses: msys2/setup-msys2@v2

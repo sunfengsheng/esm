@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT="$ROOT/tools/check-docs-updated.ps1"
+
+if command -v cygpath >/dev/null 2>&1; then
+  SCRIPT="$(cygpath -w "$SCRIPT")"
+fi
+
+exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SCRIPT" -Staged

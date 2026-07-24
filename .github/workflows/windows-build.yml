@@ -34,6 +34,10 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
 
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --yes --no-progress --limit-output
+
       - name: Configure Release build
         shell: msys2 {0}
         run: >-

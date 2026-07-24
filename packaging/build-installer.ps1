@@ -3,6 +3,7 @@ param(
     [string]$BuildDirectory = "build-release",
     [string]$Configuration = "Release",
     [string]$Version,
+    [string]$MakeNsisPath,
     [switch]$SkipBuild
 )
 
@@ -12,7 +13,7 @@ $buildPath = [IO.Path]::GetFullPath((Join-Path $projectRoot $BuildDirectory))
 $distPath = Join-Path $projectRoot "dist"
 $nsiPath = Join-Path $PSScriptRoot "everything_sm.nsi"
 $nsisRoot = Join-Path $projectRoot "tools\nsis\nsis-3.12\nsis-3.12"
-$makeNsis = Join-Path $nsisRoot "makensis.exe"
+$bundledMakeNsis = Join-Path $nsisRoot "makensis.exe"
 $nsisZip = Join-Path $projectRoot "tools\nsis\nsis-3.12.zip"
 
 $cmakeListsPath = Join-Path $projectRoot "CMakeLists.txt"
@@ -34,6 +35,17 @@ if ($versionParts.Count -gt 4 -or ($versionParts | Where-Object { $_ -lt 0 -or $
 }
 $resourceVersion = ($versionParts -join '.')
 
+$makeNsisCandidates = @()
+if (-not [string]::IsNullOrWhiteSpace($MakeNsisPath)) {
+    $makeNsisCandidates += [IO.Path]::GetFullPath($MakeNsisPath)
+}
+$makeNsisCommand = Get-Command makensis.exe -ErrorAction SilentlyContinue
+if ($makeNsisCommand) { $makeNsisCandidates += $makeNsisCommand.Source }
+if (${env:ProgramFiles(x86)}) { $makeNsisCandidates += Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe" }
+if ($env:ProgramFiles) { $makeNsisCandidates += Join-Path $env:ProgramFiles "NSIS\makensis.exe" }
+$makeNsisCandidates += $bundledMakeNsis
+$makeNsis = $makeNsisCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if (-not $makeNsis) { $makeNsis = $bundledMakeNsis }
 if (-not (Test-Path -LiteralPath $makeNsis)) {
     if (-not (Test-Path -LiteralPath $nsisZip)) {
         New-Item -ItemType Directory -Force -Path (Split-Path $nsisZip) | Out-Null

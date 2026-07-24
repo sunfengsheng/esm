@@ -1,0 +1,122 @@
+name: Windows build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build, test, and package
+    runs-on: windows-2025
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install UCRT64 MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure Release build
+        shell: msys2 {0}
+        run: >-
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DESM_BUILD_TESTS=ON
+          -DESM_BUILD_BENCHMARKS=OFF
+
+      - name: Compile
+        shell: msys2 {0}
+        run: cmake --build build-ci --parallel 4
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: ctest --test-dir build-ci --output-on-failure
+
+      - name: Build NSIS installer
+        shell: pwsh
+        env:
+          ESM_REF_TYPE: ${{ github.ref_type }}
+          ESM_REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = $null
+          if ($env:ESM_REF_TYPE -eq 'tag') {
+            if ($env:ESM_REF_NAME -notmatch '^v([0-9]+(?:\.[0-9]+){2,3})$') {
+              throw "Release tags must use vMAJOR.MINOR.PATCH, for example v0.1.0"
+            }
+            $version = $Matches[1]
+          }
+          .\packaging\build-installer.ps1 -BuildDirectory build-ci -Version $version -SkipBuild
+
+      - name: Build portable archive
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath dist -Filter 'everything_sm-*-setup.exe' | Select-Object -First 1
+          if (-not $installer -or $installer.Name -notmatch '^everything_sm-(.+)-setup\.exe$') {
+            throw 'Unable to determine package version from installer name.'
+          }
+          $version = $Matches[1]
+          $stage = Join-Path $env:RUNNER_TEMP "everything_sm-$version-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          'esm_gui.exe','esm_launcher.exe','esm_server.exe','esm_service.exe','esm_cli.exe' | ForEach-Object {
+            Copy-Item -LiteralPath (Join-Path 'build-ci' $_) -Destination $stage
+          }
+          Copy-Item -LiteralPath README.md -Destination $stage
+          $archive = Join-Path (Resolve-Path dist) "everything_sm-$version-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal -Force
+          $hash = Get-FileHash -LiteralPath $archive -Algorithm SHA256
+          Set-Content -LiteralPath "$archive.sha256" -Encoding ascii -Value "$($hash.Hash)  $([IO.Path]::GetFileName($archive))"
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: everything_sm-windows-${{ github.run_number }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows packages
+        uses: actions/download-artifact@v8
+        with:
+          name: everything_sm-windows-${{ github.run_number }}
+          path: dist
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "everything_sm $GITHUB_REF_NAME"
+          fi

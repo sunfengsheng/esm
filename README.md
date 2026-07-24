@@ -1,5 +1,7 @@
 ﻿# everything_sm
 
+[![Windows build](https://github.com/sunfengsheng/esm/actions/workflows/windows-build.yml/badge.svg)](https://github.com/sunfengsheng/esm/actions/workflows/windows-build.yml)
+
 A clean-room Windows file search engine targeting functional and performance parity with Everything.
 
 > Status: multi-volume NTFS discovery, persistent MFT snapshots, NTFS indexing, continuous USN following, checksummed append-only WAL recovery, memory-mapped v2 compact snapshots, local IPC, a Windows SCM service, a first native desktop GUI, a Windows fallback realtime watcher, and an NSIS installer with a native fallback launcher are operational. The project can recursively scan, reconcile watched directory trees after `ReadDirectoryChangesW` notifications, enumerate a live NTFS MFT, reconstruct paths, replay create/delete/rename updates, recover complete WAL transactions after a crash, truncate torn WAL tails, stream compact catalog snapshots without a temporary `vector<FileRecord>`, and serve bounded searches to CLI and GUI clients. Full Everything query/NTFS parity, a generalized delta database, provider-specific FAT/exFAT/network semantics, per-user authorization, code signing/automatic upgrades, and Xapian content indexing remain.

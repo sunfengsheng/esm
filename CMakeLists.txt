@@ -52,6 +52,7 @@ add_executable(esm_gui WIN32
 )
 target_link_libraries(esm_gui PRIVATE esm_core comctl32 comdlg32 shell32 ole32 uuid)
 if(MINGW)
+  target_link_options(esm_cli PRIVATE -static)
   target_link_options(esm_server PRIVATE -static)
   target_link_options(esm_service PRIVATE -municode -static)
   target_link_options(esm_launcher PRIVATE -municode -mwindows -static)

@@ -11,10 +11,14 @@
 !endif
 
 !define PRODUCT_NAME "everything_sm"
-!define PRODUCT_VERSION "0.1.0"
-!define PRODUCT_VERSION_RESOURCE "0.1.0.0"
+!ifndef PRODUCT_VERSION
+  !define PRODUCT_VERSION "0.1.0"
+!endif
+!ifndef PRODUCT_VERSION_RESOURCE
+  !define PRODUCT_VERSION_RESOURCE "0.1.0.0"
+!endif
 !define PRODUCT_PUBLISHER "everything_sm Project"
-!define PRODUCT_WEB_SITE "https://github.com/"
+!define PRODUCT_WEB_SITE "https://github.com/sunfengsheng/esm"
 !define PRODUCT_DIR_REGKEY "Software\everything_sm"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\everything_sm"
 !define PRODUCT_PIPE "everything_sm_service"

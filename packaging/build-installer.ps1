@@ -1,7 +1,8 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$BuildDirectory = "build-release",
     [string]$Configuration = "Release",
+    [string]$Version,
     [switch]$SkipBuild
 )
 
@@ -13,6 +14,25 @@ $nsiPath = Join-Path $PSScriptRoot "everything_sm.nsi"
 $nsisRoot = Join-Path $projectRoot "tools\nsis\nsis-3.12\nsis-3.12"
 $makeNsis = Join-Path $nsisRoot "makensis.exe"
 $nsisZip = Join-Path $projectRoot "tools\nsis\nsis-3.12.zip"
+
+$cmakeListsPath = Join-Path $projectRoot "CMakeLists.txt"
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $cmakeLists = Get-Content -LiteralPath $cmakeListsPath -Raw
+    $match = [regex]::Match($cmakeLists, 'project\s*\([^)]*\bVERSION\s+([0-9]+(?:\.[0-9]+){2,3})', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) {
+        throw "Unable to read project version from $cmakeListsPath"
+    }
+    $Version = $match.Groups[1].Value
+}
+if ($Version -notmatch '^[0-9]+(?:\.[0-9]+){2,3}$') {
+    throw "Invalid installer version '$Version'. Expected numeric x.y.z or x.y.z.w."
+}
+$versionParts = @($Version.Split('.') | ForEach-Object { [int]$_ })
+while ($versionParts.Count -lt 4) { $versionParts += 0 }
+if ($versionParts.Count -gt 4 -or ($versionParts | Where-Object { $_ -lt 0 -or $_ -gt 65535 })) {
+    throw "Installer version '$Version' cannot be represented as a Windows four-part version."
+}
+$resourceVersion = ($versionParts -join '.')
 
 if (-not (Test-Path -LiteralPath $makeNsis)) {
     if (-not (Test-Path -LiteralPath $nsisZip)) {
@@ -52,10 +72,11 @@ foreach ($name in $required) {
 
 New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 & $makeNsis /V4 /WX "/DPROJECT_ROOT=$projectRoot" "/DBUILD_DIR=$buildPath" `
-    "/DOUTPUT_DIR=$distPath" $nsiPath
+    "/DOUTPUT_DIR=$distPath" "/DPRODUCT_VERSION=$Version" `
+    "/DPRODUCT_VERSION_RESOURCE=$resourceVersion" $nsiPath
 if ($LASTEXITCODE -ne 0) { throw "NSIS compilation failed: $LASTEXITCODE" }
 
-$installer = Join-Path $distPath "everything_sm-0.1.0-setup.exe"
+$installer = Join-Path $distPath "everything_sm-$Version-setup.exe"
 if (-not (Test-Path -LiteralPath $installer)) {
     throw "Installer was not produced: $installer"
 }
@@ -68,4 +89,3 @@ Write-Host "Installer: $installer"
 Write-Host "SHA256:    $($hash.Hash)"
 Write-Host "Hash file: $hashFile"
 Write-Host "Size:      $((Get-Item -LiteralPath $installer).Length) bytes"
-

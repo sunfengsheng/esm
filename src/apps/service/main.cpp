@@ -68,6 +68,16 @@ struct ServiceConfiguration {
 ServiceRuntime runtime;
 ServiceConfiguration configuration;
 
+void release_transient_process_memory() {
+    // Full MFT reconciliation and snapshot generation temporarily allocate
+    // multi-million-record vectors alongside the live catalog and search
+    // index. Return released heap pages to Windows after those phases so the
+    // service does not retain its startup peak as resident working set.
+    if (const auto heap = GetProcessHeap(); heap != nullptr) {
+        (void)HeapCompact(heap, 0);
+    }
+}
+
 void log_event(WORD type, std::wstring_view message) {
     HANDLE source = RegisterEventSourceW(nullptr, service_name);
     if (source == nullptr) return;
@@ -307,19 +317,6 @@ esm::MetadataSnapshotIoResult save_mft_auto_snapshot(
     return result;
 }
 
-std::vector<esm::FileRecord> snapshot_live_volumes(
-    const std::vector<VolumeLiveState>& states) {
-    std::vector<esm::FileRecord> records;
-    for (const auto& state : states) {
-        if (!state.catalog) continue;
-        auto volume_records = state.catalog->snapshot();
-        esm::namespace_ntfs_records(state.volume.identity, volume_records);
-        records.insert(records.end(),
-                       std::make_move_iterator(volume_records.begin()),
-                       std::make_move_iterator(volume_records.end()));
-    }
-    return records;
-}
 
 void run_mft_auto_service() {
     std::error_code directory_error;
@@ -385,7 +382,9 @@ void run_mft_auto_service() {
             return;
         }
         const auto count = built.records.size();
-        index.replace(built.records);
+        // Persist while the reconciliation records already exist, then let the
+        // index consume and release them before allocating its accelerators.
+        // This avoids retaining a second multi-million-record path vector.
         const auto saved =
             save_mft_auto_snapshot(snapshot_path, built.records);
         if (!saved.ok) {
@@ -393,37 +392,22 @@ void run_mft_auto_service() {
                       L"Initial multi-volume MFT snapshot save failed, error=" +
                           std::to_wstring(saved.error));
         }
+        index.replace(std::move(built.records));
         initial_states = std::move(built.states);
         log_event(EVENTLOG_INFORMATION_TYPE,
                   L"Indexed " + std::to_wstring(count) + L" entries on " +
                       join_volumes(built.volumes));
     }
 
+    release_transient_process_memory();
     report_service_status(SERVICE_RUNNING);
     std::jthread coordinator(
         [&, states = std::move(initial_states), loaded_snapshot]
         (std::stop_token token) mutable {
         bool rebuild_required = loaded_snapshot || states.empty();
         auto next_full_reconciliation = std::chrono::steady_clock::now();
-        auto last_snapshot_request = std::chrono::steady_clock::now();
-        std::future<esm::MetadataSnapshotIoResult> snapshot_save;
-
         while (!token.stop_requested() &&
                !runtime.stop.load(std::memory_order_relaxed)) {
-            if (snapshot_save.valid() &&
-                snapshot_save.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready) {
-                const auto saved = snapshot_save.get();
-                if (!saved.ok) {
-                    log_event(EVENTLOG_WARNING_TYPE,
-                              L"Multi-volume MFT snapshot save failed, "
-                              L"error=" + std::to_wstring(saved.error));
-                } else {
-                    log_event(EVENTLOG_INFORMATION_TYPE,
-                              L"Saved multi-volume MFT snapshot");
-                }
-            }
-
             const auto now = std::chrono::steady_clock::now();
             if (rebuild_required || now >= next_full_reconciliation) {
                 auto built = build_all_ntfs_volumes();
@@ -431,6 +415,17 @@ void run_mft_auto_service() {
                     !built.records.empty()) {
                     const auto count = built.records.size();
                     const auto volumes = join_volumes(built.volumes);
+                    // Reuse the records already produced by reconciliation for
+                    // persistence. Generating another full-path snapshot from
+                    // the live catalogs caused the service to jump back into
+                    // the multi-gigabyte range every five minutes.
+                    const auto saved =
+                        save_mft_auto_snapshot(snapshot_path, built.records);
+                    if (!saved.ok) {
+                        log_event(EVENTLOG_WARNING_TYPE,
+                                  L"Multi-volume MFT snapshot save failed, "
+                                  L"error=" + std::to_wstring(saved.error));
+                    }
                     index.replace(std::move(built.records));
                     states = std::move(built.states);
                     rebuild_required = false;
@@ -440,6 +435,7 @@ void run_mft_auto_service() {
                     log_event(EVENTLOG_INFORMATION_TYPE,
                               L"Reconciled " + volumes + L" with " +
                                   std::to_wstring(count) + L" entries");
+                    release_transient_process_memory();
                 } else {
                     next_full_reconciliation =
                         std::chrono::steady_clock::now() +
@@ -469,28 +465,7 @@ void run_mft_auto_service() {
                 }
             }
 
-            if (!rebuild_required && !snapshot_save.valid() &&
-                std::chrono::steady_clock::now() - last_snapshot_request >=
-                    snapshot_refresh_interval) {
-                auto records = snapshot_live_volumes(states);
-                last_snapshot_request = std::chrono::steady_clock::now();
-                snapshot_save = std::async(
-                    std::launch::async,
-                    [snapshot_path, records = std::move(records)]() mutable {
-                        return save_mft_auto_snapshot(snapshot_path, records);
-                    });
-            }
-
             std::this_thread::sleep_for(mft_live_poll_interval);
-        }
-
-        if (snapshot_save.valid()) {
-            const auto saved = snapshot_save.get();
-            if (!saved.ok) {
-                log_event(EVENTLOG_WARNING_TYPE,
-                          L"Final multi-volume snapshot completion failed, "
-                          L"error=" + std::to_wstring(saved.error));
-            }
         }
     });
 

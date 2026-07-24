@@ -1,4 +1,4 @@
-﻿# 架构文档
+# 架构文档
 
 ## 1. 目标与边界
 
@@ -106,9 +106,17 @@ v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视�
 
 ### 5.2 MetadataIndex
 
-`MetadataIndex` 提供可搜索记录、完整路径和查询执行。它当前仍保存较多完整路径/字符串，是完整服务内存占用的主要来源之一。
+`MetadataIndex` 提供可搜索记录和查询执行。基础层不再为每个条目都保存完整路径：
 
-Catalog 与 MetadataIndex 尚未完全共享字符串存储；路径组件化、压缩和增量构建是后续重点。
+- 目录记录保存完整路径；
+- 能验证父目录和路径后缀的普通文件只保存文件名、`parent_id` 和紧凑元数据；
+- 查询、排序和结果物化时用父目录路径重建完整路径；
+- 父记录缺失、父记录不是目录或路径形状不匹配时保留完整路径作为正确性回退；
+- 增量 overlay 暂时保留完整 `FileRecord`，compaction 后重新执行路径组件化。
+
+rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 通过打包目录、路径模式和属性标志保持约 48 字节/记录；名称 bigram Bloom 使用 128 位/记录，路径 trigram Bloom 使用 256 位/记录。
+
+Catalog 与 MetadataIndex 尚未完全共享名称和节点元数据；posting、签名和两套基础节点仍是后续 memory-map/压缩重点。
 
 ## 6. 名称 trigram 倒排索引
 
@@ -116,8 +124,9 @@ Catalog 与 MetadataIndex 尚未完全共享字符串存储；路径组件化、
 
 - 把名称生成连续 3 字符 gram；
 - 每个 gram 计算 16-bit hash，共 65,536 个 bucket；
-- 用 CSR 结构保存：`offsets[65537]` + 连续 `record_indices[]`；
-- posting 按 `natural_name_order` 构建，减少查询后再次排序；
+- posting 按 `natural_name_order` 构建，保存单调递增的自然顺序位置；
+- 每个 bucket 使用 `byte_offsets[]`、`counts[]` 和连续 `encoded_positions[]`；
+- 相邻自然顺序位置做 unsigned delta，再用 varint 编码；查询只解码被选中的 bucket；
 - 同时为 raw 名称和 accent-folded 名称生成 gram；
 - 从查询中提取必须出现的名称 trigram，选择最稀疏 posting 作为候选集合；
 - 对每个候选运行完整 query evaluator，消除 16-bit hash collision 和复杂语法造成的误报。
@@ -127,7 +136,8 @@ flowchart LR
     Query["查询文本"] --> Parse["解析 / AST 后缀程序"]
     Parse --> Grams["提取 mandatory name trigrams"]
     Grams --> Select["选择最稀疏 posting"]
-    Select --> Candidates["候选 record indices"]
+    Select --> Decode["delta/varint 解码自然顺序位置"]
+    Decode --> Candidates["映射为候选 record indices"]
     Candidates --> Eval["完整 evaluator"]
     Eval --> Limit["按服务端顺序截断"]
     Limit --> Result["IPC 结果"]
@@ -166,7 +176,7 @@ metadata snapshot 包含版本、卷/模式标记、记录和校验信息。替�
 
 ### 8.3 当前限制
 
-默认多卷 MFT 服务主要使用完整 `mft-index.snapshot` 定期替换，尚未统一为通用 base snapshot + WAL + delta replay 数据库。这是后端下一阶段的重要工作。
+默认多卷 MFT 服务仍使用完整 `mft-index.snapshot`，尚未统一为通用 base snapshot + WAL + delta replay 数据库。为避免周期性多 GiB 峰值，多卷 snapshot 不再每 5 分钟从所有 Catalog 重新物化完整路径；它在完整 MFT reconciliation 已经产生记录向量时先写 snapshot，再由 `MetadataIndex` 消费并释放同一向量。因此 snapshot 新鲜度当前与完整 reconciliation 周期绑定。
 
 ## 9. IPC
 
@@ -226,7 +236,7 @@ GUI 设置、历史、书签、筛选器、运行次数/最近打开记录以及
 - 服务启动/停止由 SCM 生命周期和 stoppable worker 管理；
 - 查询读取稳定索引视图；
 - 后台 USN/协调任务更新目录；
-- snapshot 保存使用独立读视图并可异步执行；
+- 单卷 Catalog snapshot 可使用独立只读视图流式保存；多卷 snapshot 复用完整 reconciliation 记录，避免额外全量路径副本；
 - GUI 用 generation/request 状态丢弃过期响应；
 - 元数据和图标后台任务不得直接阻塞 UI 线程。
 

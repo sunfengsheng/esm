@@ -36,6 +36,18 @@ struct SearchOptions {
     bool descending{};
 };
 struct SearchResult { FileRecord record; int score{}; };
+struct MetadataIndexStorageStats {
+    std::size_t base_records{};
+    std::size_t name_only_paths{};
+    std::size_t string_characters{};
+    std::size_t record_bytes{};
+    std::size_t string_bytes{};
+    std::size_t signature_bytes{};
+    std::size_t posting_entries{};
+    std::size_t posting_bytes{};
+    std::size_t ordering_bytes{};
+    std::size_t total_base_capacity_bytes{};
+};
 class MetadataIndex {
 public:
     static constexpr std::size_t default_auto_compaction_threshold = 100'000;
@@ -46,6 +58,9 @@ public:
         : auto_compaction_threshold_(auto_compaction_threshold) {}
 
     void replace(const std::vector<FileRecord>& records);
+    // Consumes and releases the source record vector after compact path data
+    // has been copied, before the expensive search accelerators are built.
+    void replace(std::vector<FileRecord>&& records);
     void apply_delta(std::vector<FileRecord> upserts,
                      const std::vector<std::uint64_t>& removed_ids);
     [[nodiscard]] std::vector<SearchResult> search(std::wstring_view query, const SearchOptions& options = {}) const;
@@ -54,23 +69,32 @@ public:
     [[nodiscard]] bool compact();
     void set_auto_compaction_threshold(std::size_t threshold);
     [[nodiscard]] std::size_t compaction_count() const;
+    [[nodiscard]] MetadataIndexStorageStats storage_stats() const;
 private:
     struct CompactRecord {
         std::uint64_t id{};
         std::uint64_t parent_id{};
         std::uint64_t size{};
         std::int64_t last_write_time{};
-        std::uint32_t attributes{};
+        std::uint32_t attributes : 31 {};
+        std::uint32_t directory : 1 {};
         std::uint32_t path_offset{};
-        std::uint32_t path_length{};
+        std::uint32_t path_length : 31 {};
+        std::uint32_t name_only_path : 1 {};
         std::uint32_t name_offset{};
-        std::uint32_t name_length{};
-        bool directory{};
+
+        [[nodiscard]] std::uint32_t name_length() const noexcept {
+            return path_offset + path_length - name_offset;
+        }
     };
-    [[nodiscard]] std::wstring_view path_view(const CompactRecord& record) const;
+    [[nodiscard]] std::wstring_view path_view(
+        const CompactRecord& record, std::wstring& scratch) const;
     [[nodiscard]] std::wstring_view name_view(const CompactRecord& record) const;
     [[nodiscard]] FileRecord materialize(const CompactRecord& record) const;
-    struct NameGramSignature {
+    struct NameBigramSignature {
+        std::array<std::uint64_t, 2> words{};
+    };
+    struct PathTrigramSignature {
         std::array<std::uint64_t, 4> words{};
     };
     struct NamePrefixRange {
@@ -84,16 +108,19 @@ private:
         std::uint32_t end{};
     };
     struct NameTrigramPostingIndex {
-        std::vector<std::uint32_t> offsets;
-        std::vector<std::uint32_t> record_indices;
+        // Each bucket stores monotonically increasing positions in
+        // natural_name_order, delta encoded as unsigned varints.
+        std::vector<std::uint32_t> byte_offsets;
+        std::vector<std::uint32_t> counts;
+        std::vector<std::uint8_t> encoded_positions;
     };
     struct NameSearchAccelerators {
-        std::vector<NameGramSignature> bigram_signatures;
+        std::vector<NameBigramSignature> bigram_signatures;
         NameTrigramPostingIndex trigram_postings;
         // Explicit path: queries are otherwise forced to touch every full
         // path string. A single trigram Bloom signature per record keeps the
         // common path-substring case on a contiguous, metadata-only scan.
-        std::vector<NameGramSignature> path_trigram_signatures;
+        std::vector<PathTrigramSignature> path_trigram_signatures;
         // Base records in the exact case-insensitive natural name/path/id
         // order used by the default GUI sort. Queries can walk this order and
         // stop after one page instead of sorting every match.
@@ -109,6 +136,10 @@ private:
         std::vector<NameFirstCharacterRange> folded_first_character_ranges;
     };
 
+    void replace_impl(const std::vector<FileRecord>& records,
+                      std::vector<FileRecord>* consumable_records);
+    static void compact_base_paths(std::vector<CompactRecord>& records,
+                                   std::vector<wchar_t>& strings);
     [[nodiscard]] static NameSearchAccelerators
     build_name_search_accelerators(
         const std::vector<CompactRecord>& records,
@@ -119,9 +150,9 @@ private:
     mutable std::shared_mutex mutex_;
     std::vector<CompactRecord> records_;
     std::vector<wchar_t> strings_;
-    std::vector<NameGramSignature> name_bigram_signatures_;
+    std::vector<NameBigramSignature> name_bigram_signatures_;
     NameTrigramPostingIndex name_trigram_postings_;
-    std::vector<NameGramSignature> path_trigram_signatures_;
+    std::vector<PathTrigramSignature> path_trigram_signatures_;
     std::vector<std::uint32_t> natural_name_order_;
     std::vector<std::uint32_t> name_prefix_order_;
     std::vector<NamePrefixRange> name_prefix_ranges_;

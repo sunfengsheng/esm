@@ -237,6 +237,33 @@ MetadataIndex::build_name_search_accelerators(
         throw std::length_error("name accelerator exceeds 32-bit indices");
     }
 
+    const auto record_path = [&](std::size_t index,
+                                 std::wstring& scratch) -> std::wstring_view {
+        const auto& record = records[index];
+        const std::wstring_view stored(strings.data() + record.path_offset,
+                                       record.path_length);
+        if (!record.name_only_path) return stored;
+
+        const auto parent = std::lower_bound(
+            records.begin(), records.end(), record.parent_id,
+            [](const CompactRecord& candidate, std::uint64_t id) {
+                return candidate.id < id;
+            });
+        if (parent == records.end() || parent->id != record.parent_id ||
+            parent->name_only_path) {
+            return stored;
+        }
+        const std::wstring_view parent_path(
+            strings.data() + parent->path_offset, parent->path_length);
+        scratch.assign(parent_path);
+        if (!scratch.ends_with(L"\\") && !scratch.ends_with(L"/")) {
+            scratch.push_back(L'\\');
+        }
+        scratch.append(strings.data() + record.name_offset,
+                       record.name_length());
+        return scratch;
+    };
+
     NameSearchAccelerators accelerators;
     accelerators.bigram_signatures.resize(records.size());
     accelerators.path_trigram_signatures.resize(records.size());
@@ -244,10 +271,10 @@ MetadataIndex::build_name_search_accelerators(
     prefix_entries.reserve(records.size());
     std::vector<std::uint64_t> folded_prefix_entries;
 
-    const auto add_gram = [](NameGramSignature& signature,
+    const auto add_gram = [](NameBigramSignature& signature,
                              std::uint32_t hash) {
         for (unsigned shift : {0U, 8U, 16U, 24U}) {
-            const auto bit = (hash >> shift) & 0xffU;
+            const auto bit = (hash >> shift) & 0x7fU;
             signature.words[bit >> 6U] |=
                 std::uint64_t{1} << (bit & 63U);
         }
@@ -257,7 +284,7 @@ MetadataIndex::build_name_search_accelerators(
          ++record_index) {
         const auto& record = records[record_index];
         const std::wstring_view name(strings.data() + record.name_offset,
-                                     record.name_length);
+                                     record.name_length());
         if (!name.empty()) {
             const auto key = name_prefix_key(name);
             prefix_entries.push_back(
@@ -272,8 +299,8 @@ MetadataIndex::build_name_search_accelerators(
         };
         add_name_grams(name);
 
-        const std::wstring_view path(strings.data() + record.path_offset,
-                                     record.path_length);
+        std::wstring path_scratch;
+        const auto path = record_path(record_index, path_scratch);
         const auto add_path_trigrams = [&](std::wstring_view value) {
             auto& signature =
                 accelerators.path_trigram_signatures[record_index];
@@ -388,7 +415,7 @@ MetadataIndex::build_name_search_accelerators(
         const auto& record = records[index];
         natural_name_prefixes[index] = natural_name_sort_prefix(
             std::wstring_view(strings.data() + record.name_offset,
-                              record.name_length));
+                              record.name_length()));
     }
     const auto natural_name_before =
         [&](std::uint32_t left_index, std::uint32_t right_index) {
@@ -401,15 +428,17 @@ MetadataIndex::build_name_search_accelerators(
             const auto& left = records[left_index];
             const auto& right = records[right_index];
             const std::wstring_view left_name(
-                strings.data() + left.name_offset, left.name_length);
+                strings.data() + left.name_offset, left.name_length());
             const std::wstring_view right_name(
-                strings.data() + right.name_offset, right.name_length);
+                strings.data() + right.name_offset, right.name_length());
             int order = natural_compare(left_name, right_name, false);
             if (!order) {
-                const std::wstring_view left_path(
-                    strings.data() + left.path_offset, left.path_length);
-                const std::wstring_view right_path(
-                    strings.data() + right.path_offset, right.path_length);
+                std::wstring left_path_scratch;
+                std::wstring right_path_scratch;
+                const auto left_path =
+                    record_path(left_index, left_path_scratch);
+                const auto right_path =
+                    record_path(right_index, right_path_scratch);
                 order = natural_compare(left_path, right_path, false);
             }
             if (!order) {
@@ -541,7 +570,7 @@ MetadataIndex::build_name_search_accelerators(
 
             const auto& record = records[record_index];
             const std::wstring_view name(strings.data() + record.name_offset,
-                                         record.name_length);
+                                         record.name_length());
             visit_value(name);
             if (std::any_of(name.begin(), name.end(),
                             [](wchar_t ch) { return ch >= 0x80; })) {
@@ -569,35 +598,179 @@ MetadataIndex::build_name_search_accelerators(
             ++posting_counts[bucket];
         });
     }
-    accelerators.trigram_postings.offsets.resize(
+    std::vector<std::uint32_t> posting_offsets(
         name_trigram_bucket_count + 1);
     std::uint64_t posting_count = 0;
     for (std::size_t bucket = 0; bucket < name_trigram_bucket_count; ++bucket) {
-        accelerators.trigram_postings.offsets[bucket] =
-            static_cast<std::uint32_t>(posting_count);
+        posting_offsets[bucket] = static_cast<std::uint32_t>(posting_count);
         posting_count += posting_counts[bucket];
         if (posting_count > std::numeric_limits<std::uint32_t>::max()) {
             throw std::length_error(
-                "name trigram posting index exceeds 32-bit offsets");
+                "name trigram posting index exceeds 32-bit entries");
         }
     }
-    accelerators.trigram_postings.offsets.back() =
-        static_cast<std::uint32_t>(posting_count);
-    accelerators.trigram_postings.record_indices.resize(
+    posting_offsets.back() = static_cast<std::uint32_t>(posting_count);
+
+    // Build postings as positions in natural_name_order instead of record
+    // indices. Positions are monotonic inside every bucket, so unsigned delta
+    // varints are substantially smaller than the previous 32-bit CSR array.
+    std::vector<std::uint32_t> posting_positions(
         static_cast<std::size_t>(posting_count));
-    auto cursors = accelerators.trigram_postings.offsets;
+    auto cursors = posting_offsets;
     std::fill(seen.begin(), seen.end(), 0);
     generation = 0;
-    for (const auto record_index : accelerators.natural_name_order) {
+    for (std::uint32_t natural_position = 0;
+         natural_position < accelerators.natural_name_order.size();
+         ++natural_position) {
+        const auto record_index =
+            accelerators.natural_name_order[natural_position];
         visit_record_trigram_buckets(record_index, [&](std::uint32_t bucket) {
-            accelerators.trigram_postings.record_indices[cursors[bucket]++] =
-                record_index;
+            posting_positions[cursors[bucket]++] = natural_position;
         });
     }
+
+    const auto varint_size = [](std::uint32_t value) {
+        std::size_t bytes = 1;
+        while (value >= 0x80U) {
+            value >>= 7U;
+            ++bytes;
+        }
+        return bytes;
+    };
+    std::uint64_t encoded_size = 0;
+    for (std::size_t bucket = 0; bucket < name_trigram_bucket_count; ++bucket) {
+        std::uint32_t previous = 0;
+        for (auto position = posting_offsets[bucket];
+             position < posting_offsets[bucket + 1]; ++position) {
+            const auto current = posting_positions[position];
+            encoded_size += varint_size(current - previous);
+            previous = current;
+        }
+    }
+    if (encoded_size > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error(
+            "compressed name trigram postings exceed 32-bit byte offsets");
+    }
+
+    auto& postings = accelerators.trigram_postings;
+    postings.byte_offsets.resize(name_trigram_bucket_count + 1);
+    postings.counts = posting_counts;
+    postings.encoded_positions.reserve(static_cast<std::size_t>(encoded_size));
+    const auto append_varint = [&](std::uint32_t value) {
+        while (value >= 0x80U) {
+            postings.encoded_positions.push_back(
+                static_cast<std::uint8_t>((value & 0x7fU) | 0x80U));
+            value >>= 7U;
+        }
+        postings.encoded_positions.push_back(static_cast<std::uint8_t>(value));
+    };
+    for (std::size_t bucket = 0; bucket < name_trigram_bucket_count; ++bucket) {
+        postings.byte_offsets[bucket] = static_cast<std::uint32_t>(
+            postings.encoded_positions.size());
+        std::uint32_t previous = 0;
+        for (auto position = posting_offsets[bucket];
+             position < posting_offsets[bucket + 1]; ++position) {
+            const auto current = posting_positions[position];
+            append_varint(current - previous);
+            previous = current;
+        }
+    }
+    postings.byte_offsets.back() = static_cast<std::uint32_t>(
+        postings.encoded_positions.size());
     return accelerators;
 }
 
+void MetadataIndex::compact_base_paths(
+    std::vector<CompactRecord>& records,
+    std::vector<wchar_t>& strings) {
+    std::vector<std::uint8_t> name_only(records.size());
+    std::size_t compact_characters = 0;
+
+    const auto stored_path = [&](const CompactRecord& record) {
+        return std::wstring_view(strings.data() + record.path_offset,
+                                 record.path_length);
+    };
+    const auto stored_name = [&](const CompactRecord& record) {
+        return std::wstring_view(strings.data() + record.name_offset,
+                                 record.name_length());
+    };
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        const auto& record = records[index];
+        bool can_store_name_only = false;
+        if (!record.directory && record.parent_id != 0) {
+            const auto parent = std::lower_bound(
+                records.begin(), records.end(), record.parent_id,
+                [](const CompactRecord& candidate, std::uint64_t id) {
+                    return candidate.id < id;
+                });
+            if (parent != records.end() && parent->id == record.parent_id &&
+                parent->directory) {
+                const auto parent_path = stored_path(*parent);
+                const auto path = stored_path(record);
+                const auto name = stored_name(record);
+                if (path.size() >= name.size() && path.ends_with(name)) {
+                    const auto prefix_length = path.size() - name.size();
+                    if (parent_path.ends_with(L"\\") ||
+                        parent_path.ends_with(L"/")) {
+                        can_store_name_only =
+                            prefix_length == parent_path.size() &&
+                            path.starts_with(parent_path);
+                    } else {
+                        can_store_name_only =
+                            prefix_length == parent_path.size() + 1 &&
+                            path.starts_with(parent_path) &&
+                            (path[parent_path.size()] == L'\\' ||
+                             path[parent_path.size()] == L'/');
+                    }
+                }
+            }
+        }
+        name_only[index] = can_store_name_only ? 1 : 0;
+        compact_characters += can_store_name_only
+            ? record.name_length() : record.path_length;
+    }
+    if (compact_characters > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("compact string arena exceeds 32-bit offsets");
+    }
+
+    std::vector<wchar_t> compact_strings;
+    compact_strings.reserve(compact_characters);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        auto& record = records[index];
+        const auto path = stored_path(record);
+        const auto name = stored_name(record);
+        const auto offset = static_cast<std::uint32_t>(compact_strings.size());
+        if (name_only[index] != 0) {
+            compact_strings.insert(compact_strings.end(), name.begin(),
+                                   name.end());
+            record.path_offset = offset;
+            record.path_length = static_cast<std::uint32_t>(name.size());
+            record.name_offset = offset;
+            record.name_only_path = true;
+        } else {
+            const auto relative_name = record.name_offset - record.path_offset;
+            compact_strings.insert(compact_strings.end(), path.begin(),
+                                   path.end());
+            record.path_offset = offset;
+            record.path_length = static_cast<std::uint32_t>(path.size());
+            record.name_offset = offset + relative_name;
+            record.name_only_path = false;
+        }
+    }
+    strings.swap(compact_strings);
+}
+
 void MetadataIndex::replace(const std::vector<FileRecord>& source) {
+    replace_impl(source, nullptr);
+}
+
+void MetadataIndex::replace(std::vector<FileRecord>&& source) {
+    replace_impl(source, &source);
+}
+
+void MetadataIndex::replace_impl(
+    const std::vector<FileRecord>& source,
+    std::vector<FileRecord>* consumable_source) {
     std::size_t total_chars = 0;
     for (const auto& item : source) total_chars += item.path.size();
     if (total_chars > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("string arena exceeds 32-bit offsets");
@@ -614,13 +787,20 @@ void MetadataIndex::replace(const std::vector<FileRecord>& source) {
         if (!item.name.empty() && item.path.size() >= item.name.size() && item.path.ends_with(item.name)) relative_name = item.path.size() - item.name.size();
         else { const auto slash = item.path.find_last_of(L"\\/"); relative_name = slash == std::wstring::npos ? 0 : slash + 1; }
         record.name_offset = record.path_offset + static_cast<std::uint32_t>(relative_name);
-        record.name_length = record.path_length - static_cast<std::uint32_t>(relative_name);
         records.push_back(record);
     }
     std::sort(records.begin(), records.end(),
               [](const CompactRecord& a, const CompactRecord& b) {
                   return a.id < b.id;
               });
+    if (consumable_source != nullptr) {
+        // The compact records and path arena now contain everything needed by
+        // the index. Release millions of source wstrings before allocating the
+        // trigram postings and sort accelerators so they do not overlap at the
+        // memory peak or remain alive for the lifetime of the service.
+        std::vector<FileRecord>().swap(*consumable_source);
+    }
+    compact_base_paths(records, strings);
     auto name_accelerators = build_name_search_accelerators(records, strings);
     std::unordered_map<std::uint64_t, FileRecord> old_overlay;
     std::unordered_set<std::uint64_t> old_removed;
@@ -715,10 +895,11 @@ void MetadataIndex::compact_locked() {
     if (overlay_.empty() && removed_.empty()) return;
 
     std::size_t total_chars = 0;
+    std::wstring path_scratch;
     for (const auto& record : records_) {
         if (removed_.find(record.id) == removed_.end() &&
             overlay_.find(record.id) == overlay_.end()) {
-            total_chars += record.path_length;
+            total_chars += path_view(record, path_scratch).size();
         }
     }
     for (const auto& [id, record] : overlay_) {
@@ -740,10 +921,13 @@ void MetadataIndex::compact_locked() {
             continue;
         }
         CompactRecord record = source;
-        const auto relative_name = source.name_offset - source.path_offset;
+        const auto path = path_view(source, path_scratch);
+        const auto relative_name = path.size() - source.name_length();
         record.path_offset = static_cast<std::uint32_t>(strings.size());
-        record.name_offset = record.path_offset + relative_name;
-        const auto path = path_view(source);
+        record.path_length = static_cast<std::uint32_t>(path.size());
+        record.name_offset = record.path_offset +
+                             static_cast<std::uint32_t>(relative_name);
+        record.name_only_path = false;
         strings.insert(strings.end(), path.begin(), path.end());
         compacted.push_back(record);
     }
@@ -770,8 +954,6 @@ void MetadataIndex::compact_locked() {
         }
         record.name_offset = record.path_offset +
                              static_cast<std::uint32_t>(relative_name);
-        record.name_length = record.path_length -
-                             static_cast<std::uint32_t>(relative_name);
         compacted.push_back(record);
     }
 
@@ -779,6 +961,7 @@ void MetadataIndex::compact_locked() {
               [](const CompactRecord& a, const CompactRecord& b) {
                   return a.id < b.id;
               });
+    compact_base_paths(compacted, strings);
     auto name_accelerators = build_name_search_accelerators(compacted, strings);
     records_ = std::move(compacted);
     strings_ = std::move(strings);
@@ -824,12 +1007,71 @@ std::size_t MetadataIndex::compaction_count() const {
     return compaction_count_;
 }
 
-std::wstring_view MetadataIndex::path_view(const CompactRecord& record) const { return {strings_.data() + record.path_offset, record.path_length}; }
-std::wstring_view MetadataIndex::name_view(const CompactRecord& record) const { return {strings_.data() + record.name_offset, record.name_length}; }
+MetadataIndexStorageStats MetadataIndex::storage_stats() const {
+    std::shared_lock lock(mutex_);
+    MetadataIndexStorageStats stats;
+    stats.base_records = records_.size();
+    stats.name_only_paths = static_cast<std::size_t>(std::count_if(
+        records_.begin(), records_.end(),
+        [](const CompactRecord& record) { return record.name_only_path; }));
+    stats.string_characters = strings_.size();
+    stats.record_bytes = records_.capacity() * sizeof(CompactRecord);
+    stats.string_bytes = strings_.capacity() * sizeof(wchar_t);
+    stats.signature_bytes =
+        name_bigram_signatures_.capacity() * sizeof(NameBigramSignature) +
+        path_trigram_signatures_.capacity() * sizeof(PathTrigramSignature);
+    stats.posting_entries = std::accumulate(
+        name_trigram_postings_.counts.begin(),
+        name_trigram_postings_.counts.end(), std::size_t{});
+    stats.posting_bytes =
+        (name_trigram_postings_.byte_offsets.capacity() +
+         name_trigram_postings_.counts.capacity()) * sizeof(std::uint32_t) +
+        name_trigram_postings_.encoded_positions.capacity() *
+            sizeof(std::uint8_t);
+    stats.ordering_bytes =
+        (natural_name_order_.capacity() + name_prefix_order_.capacity() +
+         folded_name_prefix_order_.capacity()) * sizeof(std::uint32_t) +
+        (name_prefix_ranges_.capacity() + folded_name_prefix_ranges_.capacity()) *
+            sizeof(NamePrefixRange) +
+        (name_first_character_ranges_.capacity() +
+         folded_name_first_character_ranges_.capacity()) *
+            sizeof(NameFirstCharacterRange);
+    stats.total_base_capacity_bytes =
+        stats.record_bytes + stats.string_bytes + stats.signature_bytes +
+        stats.posting_bytes + stats.ordering_bytes;
+    return stats;
+}
+
+std::wstring_view MetadataIndex::path_view(
+    const CompactRecord& record, std::wstring& scratch) const {
+    const std::wstring_view stored(strings_.data() + record.path_offset,
+                                   record.path_length);
+    if (!record.name_only_path) return stored;
+
+    const auto parent = std::lower_bound(
+        records_.begin(), records_.end(), record.parent_id,
+        [](const CompactRecord& candidate, std::uint64_t id) {
+            return candidate.id < id;
+        });
+    if (parent == records_.end() || parent->id != record.parent_id ||
+        parent->name_only_path) {
+        return stored;
+    }
+    const std::wstring_view parent_path(
+        strings_.data() + parent->path_offset, parent->path_length);
+    scratch.assign(parent_path);
+    if (!scratch.ends_with(L"\\") && !scratch.ends_with(L"/")) {
+        scratch.push_back(L'\\');
+    }
+    scratch.append(name_view(record));
+    return scratch;
+}
+std::wstring_view MetadataIndex::name_view(const CompactRecord& record) const { return {strings_.data() + record.name_offset, record.name_length()}; }
 FileRecord MetadataIndex::materialize(const CompactRecord& item) const {
     FileRecord result;
+    std::wstring path_scratch;
     result.id = item.id; result.parent_id = item.parent_id; result.size = item.size; result.last_write_time = item.last_write_time;
-    result.attributes = item.attributes; result.directory = item.directory; result.path.assign(path_view(item)); result.name.assign(name_view(item));
+    result.attributes = item.attributes; result.directory = item.directory; result.path.assign(path_view(item, path_scratch)); result.name.assign(name_view(item));
     return result;
 }
 std::vector<SearchResult> MetadataIndex::search(
@@ -857,6 +1099,11 @@ std::vector<SearchResult> MetadataIndex::search(
     struct CandidateSortView {
         std::wstring_view name;
         std::wstring_view path;
+        std::wstring path_storage;
+        bool owns_path{};
+        [[nodiscard]] std::wstring_view path_value() const {
+            return owns_path ? std::wstring_view(path_storage) : path;
+        }
         std::uint64_t size{};
         std::int64_t last_write_time{};
         std::int64_t creation_time{};
@@ -884,7 +1131,8 @@ std::vector<SearchResult> MetadataIndex::search(
         }
         const auto& record = records_[candidate.index];
         view.name = name_view(record);
-        view.path = path_view(record);
+        view.owns_path = record.name_only_path;
+        view.path = path_view(record, view.path_storage);
         view.size = record.size;
         view.last_write_time = record.last_write_time;
         view.attributes = record.attributes;
@@ -906,7 +1154,7 @@ std::vector<SearchResult> MetadataIndex::search(
             order = natural_compare(left.name, right.name, sensitive);
             break;
         case SortField::path:
-            order = natural_compare(left.path, right.path, sensitive);
+            order = natural_compare(left.path_value(), right.path_value(), sensitive);
             break;
         case SortField::size:
             if (left.size != right.size) order = left.size < right.size ? -1 : 1;
@@ -950,7 +1198,7 @@ std::vector<SearchResult> MetadataIndex::search(
         case SortField::file_list_name:
             break;
         }
-        if (!order) order = natural_compare(left.path, right.path, sensitive);
+        if (!order) order = natural_compare(left.path_value(), right.path_value(), sensitive);
         if (!order) {
             order = left_candidate.id < right_candidate.id
                 ? -1 : (left_candidate.id > right_candidate.id ? 1 : 0);
@@ -962,26 +1210,26 @@ std::vector<SearchResult> MetadataIndex::search(
         return candidate_order(left, right) < 0;
     };
 
-    NameGramSignature required_bigram_signature{};
-    NameGramSignature required_path_trigram_signature{};
+    NameBigramSignature required_bigram_signature{};
+    PathTrigramSignature required_path_trigram_signature{};
     bool use_bigram_signature = false;
     bool use_path_trigram_signature = false;
     bool use_name_trigram_postings = false;
-    std::uint32_t name_posting_begin = 0;
-    std::uint32_t name_posting_end = 0;
+    std::uint32_t name_posting_bucket = 0;
+    std::uint32_t name_posting_count = 0;
     bool use_path_name_trigram_postings = false;
-    std::uint32_t path_name_posting_begin = 0;
-    std::uint32_t path_name_posting_end = 0;
+    std::uint32_t path_name_posting_bucket = 0;
+    std::uint32_t path_name_posting_count = 0;
 
-    const auto add_required_gram = [](NameGramSignature& signature,
+    const auto add_required_gram = [](NameBigramSignature& signature,
                                       std::uint32_t hash) {
         for (unsigned shift : {0U, 8U, 16U, 24U}) {
-            const auto bit = (hash >> shift) & 0xffU;
+            const auto bit = (hash >> shift) & 0x7fU;
             signature.words[bit >> 6U] |=
                 std::uint64_t{1} << (bit & 63U);
         }
     };
-    const auto add_required_path_gram = [](NameGramSignature& signature,
+    const auto add_required_path_gram = [](PathTrigramSignature& signature,
                                            std::uint32_t hash) {
         const auto bit = hash & 0xffU;
         signature.words[bit >> 6U] |=
@@ -1003,18 +1251,18 @@ std::vector<SearchResult> MetadataIndex::search(
                     term.value[offset], term.value[offset + 1],
                     term.value[offset + 2]);
                 add_required_path_gram(required_path_trigram_signature, hash);
-                if (name_trigram_postings_.offsets.size() ==
-                    name_trigram_bucket_count + 1) {
+                if (name_trigram_postings_.byte_offsets.size() ==
+                        name_trigram_bucket_count + 1 &&
+                    name_trigram_postings_.counts.size() ==
+                        name_trigram_bucket_count) {
                     const auto bucket = hash & name_trigram_bucket_mask;
-                    const auto begin = name_trigram_postings_.offsets[bucket];
-                    const auto end =
-                        name_trigram_postings_.offsets[bucket + 1];
+                    const auto count =
+                        name_trigram_postings_.counts[bucket];
                     if (!use_path_name_trigram_postings ||
-                        end - begin <
-                            path_name_posting_end - path_name_posting_begin) {
+                        count < path_name_posting_count) {
                         use_path_name_trigram_postings = true;
-                        path_name_posting_begin = begin;
-                        path_name_posting_end = end;
+                        path_name_posting_bucket = bucket;
+                        path_name_posting_count = count;
                     }
                 }
             }
@@ -1025,20 +1273,21 @@ std::vector<SearchResult> MetadataIndex::search(
         } else if (name_only && term.value.size() >= 3) {
             for (std::size_t offset = 0; offset + 2 < term.value.size();
                  ++offset) {
-                if (name_trigram_postings_.offsets.size() !=
-                    name_trigram_bucket_count + 1) {
+                if (name_trigram_postings_.byte_offsets.size() !=
+                        name_trigram_bucket_count + 1 ||
+                    name_trigram_postings_.counts.size() !=
+                        name_trigram_bucket_count) {
                     continue;
                 }
                 const auto bucket = name_trigram_key(
                     term.value[offset], term.value[offset + 1],
                     term.value[offset + 2]) & name_trigram_bucket_mask;
-                const auto begin = name_trigram_postings_.offsets[bucket];
-                const auto end = name_trigram_postings_.offsets[bucket + 1];
+                const auto count = name_trigram_postings_.counts[bucket];
                 if (!use_name_trigram_postings ||
-                    end - begin < name_posting_end - name_posting_begin) {
+                    count < name_posting_count) {
                     use_name_trigram_postings = true;
-                    name_posting_begin = begin;
-                    name_posting_end = end;
+                    name_posting_bucket = bucket;
+                    name_posting_count = count;
                 }
             }
         }
@@ -1087,8 +1336,8 @@ std::vector<SearchResult> MetadataIndex::search(
         return evaluate(query, terms, name, path, size, modified, attributes,
                         options.match_path, sensitive, whole_word);
     };
-    const auto signature_contains = [](const NameGramSignature& candidate,
-                                       const NameGramSignature& required) {
+    const auto signature_contains = [](const auto& candidate,
+                                       const auto& required) {
         for (std::size_t word = 0; word < candidate.words.size(); ++word) {
             if ((candidate.words[word] & required.words[word]) !=
                 required.words[word]) {
@@ -1097,6 +1346,62 @@ std::vector<SearchResult> MetadataIndex::search(
         }
         return true;
     };
+    const auto decode_posting = [&](std::uint32_t bucket) {
+        std::vector<std::uint32_t> positions;
+        if (bucket >= name_trigram_postings_.counts.size() ||
+            bucket + 1 >= name_trigram_postings_.byte_offsets.size()) {
+            return positions;
+        }
+        const auto count = name_trigram_postings_.counts[bucket];
+        const auto begin = name_trigram_postings_.byte_offsets[bucket];
+        const auto end = name_trigram_postings_.byte_offsets[bucket + 1];
+        if (begin > end ||
+            end > name_trigram_postings_.encoded_positions.size()) {
+            return positions;
+        }
+        positions.reserve(count);
+        std::size_t cursor = begin;
+        std::uint32_t current = 0;
+        while (cursor < end && positions.size() < count) {
+            std::uint32_t delta = 0;
+            unsigned shift = 0;
+            for (;;) {
+                if (cursor >= end || shift > 28U) {
+                    positions.clear();
+                    return positions;
+                }
+                const auto byte =
+                    name_trigram_postings_.encoded_positions[cursor++];
+                delta |= static_cast<std::uint32_t>(byte & 0x7fU) << shift;
+                if ((byte & 0x80U) == 0) break;
+                shift += 7U;
+            }
+            current += delta;
+            if (current >= natural_name_order_.size()) {
+                positions.clear();
+                return positions;
+            }
+            positions.push_back(current);
+        }
+        if (cursor != end || positions.size() != count) positions.clear();
+        return positions;
+    };
+
+    std::vector<std::uint32_t> name_posting_positions;
+    if (use_name_trigram_postings) {
+        name_posting_positions = decode_posting(name_posting_bucket);
+        if (name_posting_positions.size() != name_posting_count) {
+            use_name_trigram_postings = false;
+        }
+    }
+    std::vector<std::uint32_t> path_name_posting_positions;
+    if (use_path_name_trigram_postings) {
+        path_name_posting_positions =
+            decode_posting(path_name_posting_bucket);
+        if (path_name_posting_positions.size() != path_name_posting_count) {
+            use_path_name_trigram_postings = false;
+        }
+    }
 
     // The GUI defaults to case-insensitive natural name order. Walking a
     // pre-sorted base order and merging the small delta overlay means we only
@@ -1122,7 +1427,7 @@ std::vector<SearchResult> MetadataIndex::search(
                   candidate_before);
 
         const auto base_order_size = use_name_trigram_postings
-            ? static_cast<std::size_t>(name_posting_end - name_posting_begin)
+            ? name_posting_positions.size()
             : natural_name_order_.size();
         std::size_t order_position = options.descending ? base_order_size : 0;
         const auto next_base_match = [&]() -> std::optional<Candidate> {
@@ -1130,10 +1435,10 @@ std::vector<SearchResult> MetadataIndex::search(
                    (options.descending && order_position != 0)) {
                 const auto position = options.descending
                     ? --order_position : order_position++;
-                const auto index = use_name_trigram_postings
-                    ? name_trigram_postings_.record_indices[
-                          name_posting_begin + position]
-                    : natural_name_order_[position];
+                const auto natural_position = use_name_trigram_postings
+                    ? name_posting_positions[position]
+                    : static_cast<std::uint32_t>(position);
+                const auto index = natural_name_order_[natural_position];
                 const auto& record = records_[index];
                 if (!suppressed_base_ids_.empty() &&
                     std::binary_search(suppressed_base_ids_.begin(),
@@ -1151,7 +1456,8 @@ std::vector<SearchResult> MetadataIndex::search(
                     continue;
                 }
                 const auto name = name_view(record);
-                const auto path = path_view(record);
+                std::wstring path_scratch;
+                const auto path = path_view(record, path_scratch);
                 if (!accepted(record.directory, name, path, record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
@@ -1284,7 +1590,8 @@ std::vector<SearchResult> MetadataIndex::search(
                 // (for example cafe/café). The raw pass already evaluated it.
                 if (folded_only && in_raw_prefix_range(name)) continue;
                 if (!prefix_text_match(prefix_term, name, sensitive)) continue;
-                const auto path = path_view(record);
+                std::wstring path_scratch;
+                const auto path = path_view(record, path_scratch);
                 if (!accepted(record.directory, name, path, record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
@@ -1324,13 +1631,11 @@ std::vector<SearchResult> MetadataIndex::search(
     if (simple_path_query) {
         const auto& path_term = terms[0];
         const auto candidate_count = use_path_name_trigram_postings
-            ? static_cast<std::size_t>(path_name_posting_end -
-                                       path_name_posting_begin)
+            ? path_name_posting_positions.size()
             : records_.size();
         for (std::size_t position = 0; position < candidate_count; ++position) {
             const auto index = use_path_name_trigram_postings
-                ? name_trigram_postings_.record_indices[
-                      path_name_posting_begin + position]
+                ? natural_name_order_[path_name_posting_positions[position]]
                 : position;
             const auto& record = records_[index];
             if (std::binary_search(suppressed_base_ids_.begin(),
@@ -1339,7 +1644,8 @@ std::vector<SearchResult> MetadataIndex::search(
             }
             const auto name = name_view(record);
             if (!text_match(path_term, name, sensitive, whole_word)) continue;
-            const auto path = path_view(record);
+            std::wstring path_scratch;
+            const auto path = path_view(record, path_scratch);
             if (!accepted(record.directory, name, path, record.size,
                           record.last_write_time, record.attributes)) {
                 continue;
@@ -1407,7 +1713,8 @@ std::vector<SearchResult> MetadataIndex::search(
                  text_match(terms[0], name, sensitive, whole_word))) {
                 return;
             }
-            const auto path = path_view(record);
+            std::wstring path_scratch;
+            const auto path = path_view(record, path_scratch);
             if (accepted(record.directory, name, path, record.size,
                          record.last_write_time, record.attributes)) {
                 consider({rank_record(terms, name, path, options.match_path,
@@ -1426,10 +1733,8 @@ std::vector<SearchResult> MetadataIndex::search(
         };
 
         if (use_name_trigram_postings) {
-            for (std::uint32_t position = name_posting_begin;
-                 position < name_posting_end; ++position) {
-                const auto index =
-                    name_trigram_postings_.record_indices[position];
+            for (const auto natural_position : name_posting_positions) {
+                const auto index = natural_name_order_[natural_position];
                 if (use_bigram_signature &&
                     !signature_contains(name_bigram_signatures_[index],
                                         required_bigram_signature)) {

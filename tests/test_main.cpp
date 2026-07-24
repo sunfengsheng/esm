@@ -290,6 +290,115 @@ void test_advanced_query_and_sorting() {
             "natural name sort");
 }
 
+void test_index_rvalue_replace_releases_source() {
+    esm::MetadataIndex index;
+    std::vector<esm::FileRecord> records;
+    records.reserve(8);
+    auto directory = record(10, L"folder", L"D:\\folder");
+    directory.directory = true;
+    records.push_back(std::move(directory));
+    auto file = record(11, L"release-test.txt",
+                       L"D:\\folder\\release-test.txt");
+    file.parent_id = 10;
+    records.push_back(std::move(file));
+
+    index.replace(std::move(records));
+
+    require(records.empty() && records.capacity() == 0,
+            "rvalue index replacement releases source storage");
+    const auto stats = index.storage_stats();
+    require(stats.name_only_paths == 1,
+            "base index stores child files as name-only paths");
+    const auto results = index.search(L"path:folder release-test");
+    require(results.size() == 1 &&
+                results.front().record.path ==
+                    L"D:\\folder\\release-test.txt",
+            "componentized index reconstructs searchable paths");
+}
+
+void test_index_componentized_path_fallback_and_compaction() {
+    esm::MetadataIndex orphan_index;
+    auto orphan = record(21, L"orphan.txt", L"D:\\lost\\orphan.txt");
+    orphan.parent_id = 999;
+    std::vector<esm::FileRecord> orphan_records;
+    orphan_records.push_back(std::move(orphan));
+    orphan_index.replace(std::move(orphan_records));
+    require(orphan_index.storage_stats().name_only_paths == 0,
+            "orphan path keeps the complete fallback string");
+    const auto orphan_results = orphan_index.search(L"path:lost orphan");
+    require(orphan_results.size() == 1 &&
+                orphan_results.front().record.path == L"D:\\lost\\orphan.txt",
+            "orphan fallback path remains searchable");
+
+    esm::MetadataIndex compacted_index(0);
+    auto directory = record(30, L"folder", L"D:\\folder");
+    directory.directory = true;
+    auto child = record(31, L"before.txt", L"D:\\folder\\before.txt");
+    child.parent_id = 30;
+    std::vector<esm::FileRecord> base;
+    base.push_back(std::move(directory));
+    base.push_back(std::move(child));
+    compacted_index.replace(std::move(base));
+
+    auto renamed = record(31, L"after.txt", L"D:\\folder\\after.txt");
+    renamed.parent_id = 30;
+    std::vector<esm::FileRecord> upserts;
+    upserts.push_back(std::move(renamed));
+    compacted_index.apply_delta(std::move(upserts), {});
+    require(compacted_index.compact(),
+            "overlay compaction rebuilds the compact base");
+    require(compacted_index.storage_stats().name_only_paths == 1,
+            "compaction restores name-only child paths");
+    const auto renamed_results = compacted_index.search(L"path:folder after");
+    require(renamed_results.size() == 1 &&
+                renamed_results.front().record.path ==
+                    L"D:\\folder\\after.txt",
+            "componentized path survives overlay compaction");
+}
+
+void test_compressed_trigram_postings() {
+    constexpr std::size_t record_count = 16'384;
+    esm::MetadataIndex index;
+    std::vector<esm::FileRecord> records;
+    records.reserve(record_count);
+    for (std::size_t i = 0; i < record_count; ++i) {
+        const auto name = L"shared-trigram-payload-" +
+            std::to_wstring(i) + L".txt";
+        records.push_back(record(i + 1, name, L"D:\\posting\\" + name));
+    }
+    index.replace(std::move(records));
+
+    const auto stats = index.storage_stats();
+    require(stats.posting_entries > record_count,
+            "trigram posting builder records shared grams");
+    require(stats.posting_bytes <
+                stats.posting_entries * sizeof(std::uint32_t),
+            "delta-varint postings use less storage than uint32 entries");
+
+    esm::SearchOptions options;
+    options.limit = record_count;
+    options.sort = esm::SortField::name;
+    auto results = index.search(L"shared-trigram-payload", options);
+    require(results.size() == record_count,
+            "compressed postings preserve all natural-order matches");
+    require(results.front().record.id == 1 &&
+                results.back().record.id == record_count,
+            "compressed postings preserve ascending natural order");
+
+    options.descending = true;
+    results = index.search(L"shared-trigram-payload", options);
+    require(results.size() == record_count &&
+                results.front().record.id == record_count &&
+                results.back().record.id == 1,
+            "compressed postings preserve descending natural order");
+
+    options.sort = esm::SortField::relevance;
+    options.descending = false;
+    results = index.search(L"payload", options);
+    require(results.size() == record_count,
+            "compressed postings preserve relevance-query matches");
+}
+
 void test_wildcard() {
     require(esm::wildcard_match(L"*.cpp", L"main.cpp"), "star wildcard");
     require(esm::wildcard_match(L"file?.txt", L"file1.txt"), "question wildcard");
@@ -1953,7 +2062,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

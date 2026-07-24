@@ -127,6 +127,27 @@ int main(int argc, char** argv) {
         Clock::now() - build_start);
     std::cout << "build_ms=" << build_ms.count() << "\n";
     print_memory("base");
+    const auto base_stats = index.storage_stats();
+    std::cout << "base_name_only_paths=" << base_stats.name_only_paths
+              << " base_string_mb="
+              << static_cast<double>(base_stats.string_bytes) /
+                     (1024.0 * 1024.0)
+              << " base_posting_entries=" << base_stats.posting_entries
+              << " base_posting_bytes_per_entry="
+              << (base_stats.posting_entries == 0
+                      ? 0.0
+                      : static_cast<double>(base_stats.posting_bytes) /
+                            static_cast<double>(base_stats.posting_entries))
+              << " base_posting_compression_ratio="
+              << (base_stats.posting_entries == 0
+                      ? 0.0
+                      : static_cast<double>(base_stats.posting_bytes) /
+                            static_cast<double>(base_stats.posting_entries *
+                                                sizeof(std::uint32_t)))
+              << " base_index_capacity_mb="
+              << static_cast<double>(base_stats.total_base_capacity_bytes) /
+                     (1024.0 * 1024.0)
+              << "\n";
     run_queries(index, "base");
 
     std::vector<std::size_t> levels;

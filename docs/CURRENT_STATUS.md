@@ -1,4 +1,4 @@
-﻿# 当前状态（2026-07-24）
+# 当前状态（2026-07-24）
 
 本文描述当前 `main` 分支能力，不代表稳定版本承诺。项目目标是接近 Everything 的体验和性能，但目前不能称为完整复刻或完全兼容。
 
@@ -30,7 +30,7 @@
 - 大小写、全字、路径、变音符号选项。
 - `dupe:name`、`dupe:size`、`dupe:name-size`。
 - 基础 Explorer 风格自然排序和服务端排序。
-- 65536 桶的 16-bit trigram hash CSR 名称倒排索引。
+- 65536 桶的 16-bit trigram hash 名称倒排索引，posting 按自然顺序位置做 delta/varint 压缩。
 - 从必须出现的名称 trigram 中选择最稀疏 posting，最终由完整 evaluator 消除 hash collision 误报。
 - raw 与 accent-folded 名称 gram，默认忽略变音符号时仍可走候选索引。
 
@@ -66,7 +66,7 @@
 
 ### WAL/增量持久化
 
-单卷 live 路径具有 WAL 和 checkpoint 恢复；默认多卷服务仍以周期性完整 snapshot 为主，尚未成为统一的 base snapshot + append-only WAL + delta replay + checkpoint consolidation 数据库。
+单卷 live 路径具有 WAL 和 checkpoint 恢复；默认多卷服务仍以完整 snapshot 为主，尚未成为统一的 base snapshot + append-only WAL + delta replay + checkpoint consolidation 数据库。多卷 snapshot 当前在完整 MFT reconciliation 时复用同一记录向量，不再每 5 分钟额外物化所有完整路径，因此降低了内存峰值，但 snapshot 新鲜度与完整 reconciliation 周期绑定。
 
 ### 非 NTFS
 
@@ -90,32 +90,35 @@
 
 ## 4. 当前性能观察
 
-约 3,262,754 条真实 snapshot、名称排序、limit 1000 的已记录服务端查询 p50：
+3,263,985 条真实 snapshot、名称自然排序、limit 1000，Release 构建独立运行 3 次；每次查询 9 次，下表是各次 p50 的中位数：
 
-| 查询 | 本地索引 p50 | 已安装服务 p50 |
+| 查询 | 本地索引 p50 | 已安装服务历史 p50 |
 |---|---:|---:|
-| `1` | 1.92 ms | 2.43 ms |
-| `12` | 3.85 ms | 3.85 ms |
-| `123` | 1.42 ms | 2.18 ms |
-| `txt` | 0.96 ms | 1.25 ms |
-| `windows` | 1.14 ms | 1.29 ms |
-| `report` | 1.89 ms | 3.02 ms |
-| `123456789.txt` | 0.04 ms | 0.17 ms |
-| `path:test1` | 13.95 ms | 19.60 ms |
+| `1` | 2.08 ms | 2.43 ms |
+| `12` | 6.12 ms | 3.85 ms |
+| `123` | 2.97 ms | 2.18 ms |
+| `txt` | 1.60 ms | 1.25 ms |
+| `windows` | 1.67 ms | 1.29 ms |
+| `report` | 4.55 ms | 3.02 ms |
+| `123456789.txt` | 0.21 ms | 0.17 ms |
+| `path:test1` | 17.84 ms | 19.60 ms |
 
-`report` 从约 276 ms 降到约 3 ms，`123456789.txt` 从约 466 ms 降到约 0.17 ms。名称索引构建约 26.7 秒。
+本轮名称索引构建中位数约 27.041 秒。单索引 Working Set 中位数约 628.79 MiB，结构容量约 619.34 MiB。posting 约 72.00 MiB，66,803,856 个 entry 平均约 1.13 字节，是原始 `uint32_t` posting 容量的约 28%。
 
-这些数据是特定机器和 snapshot 的开发基线，不是通用 SLA。完整方法见 [PERFORMANCE.md](PERFORMANCE.md)。
+这些数据是特定机器和 snapshot 的开发基线，不是通用 SLA；已安装服务查询列来自上一轮 IPC 基线。完整方法见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ## 5. 已知资源问题
 
-约 326 万记录的已安装服务曾测得：
+用户观察到的旧安装服务稳定内存约为 1.85–2 GiB；更早的开发版本曾达到 Working Set 约 3589 MB、Private Bytes 约 3662 MB。本轮通过释放 rvalue 源记录、普通文件路径组件化、128 位名称 Bloom、delta/varint posting 和 48 字节 `CompactRecord`，把真实 326 万条单搜索索引降到约 628.79 MiB Working Set。
 
-- Working Set：约 3589 MB；
-- Private Bytes：约 3662 MB；
-- Virtual Size：约 7832 MB。
+当前已安装完整服务实测：
 
-这说明查询延迟已经显著改善，但完整服务内存仍远高于 Everything，需要继续优化 MetadataIndex 的完整路径/字符串表示、索引共享和增量构建。
+- reconciliation 峰值约 1.54 GiB；
+- 首轮稳定约 929 MiB Working Set / 930 MiB Private Bytes；
+- 后续每 5 秒一次、持续约 6 分钟的 72 次采样中，Working Set 为 870.66–930.54 MiB，Private Bytes 为 942.89–942.92 MiB；
+- 采样期间没有重新增长到 2–3 GiB。
+
+因此 900 MiB 仍然偏大：它约为用户观察到的 Everything 300 MiB 的 3 倍。当前主要剩余项是 `NtfsCatalog` 与 `MetadataIndex` 的两套基础节点/名称、约 223.55 MiB UTF-16 字符 arena、约 149.41 MiB Bloom 签名，以及尚未持久化/mmap 的搜索结构。下一阶段优先做搜索索引持久化/mmap、Catalog 与查询层共享基础数据，并评估目录级路径签名以减少每文件路径 Bloom。
 
 ## 6. 发布判断
 

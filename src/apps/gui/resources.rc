@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDI_ESM_APP ICON "../../../assets/icon/everything_sm.ico"

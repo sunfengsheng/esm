@@ -1,0 +1,32 @@
+﻿# Build outputs
+/build/
+/build-*/
+/out/
+/dist/
+
+# Downloaded/bundled build tools
+/tools/nsis/
+
+# CMake and IDE user state
+CMakeUserPresets.json
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Runtime indexes, databases, journals, and logs
+*.db
+*.sqlite
+*.sqlite3
+*.snapshot
+*.wal
+*.log
+*.tmp
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.bak
+*.swp
+*~

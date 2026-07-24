@@ -90,39 +90,34 @@
 
 ## 4. 当前性能观察
 
-3,264,059 条真实 snapshot、名称自然排序、limit 1000，Release 构建独立运行 3 次；每次查询 9 次，下表是各次 p50 的中位数：
+3,264,136 条真实 snapshot、名称自然排序、limit 1000，Release 构建独立运行 3 次；每次查询 9 次，下表是各次 p50 的中位数：
 
-| 查询 | 本地索引 p50 | 已安装服务历史 p50 |
+| 查询 | 本地索引 p50 | 已安装服务单次验证 |
 |---|---:|---:|
-| `1` | 1.88 ms | 2.43 ms |
-| `12` | 5.61 ms | 3.85 ms |
-| `123` | 2.32 ms | 2.18 ms |
-| `txt` | 1.43 ms | 1.25 ms |
-| `windows` | 1.63 ms | 1.29 ms |
-| `report` | 4.01 ms | 3.02 ms |
-| `123456789.txt` | 0.17 ms | 0.17 ms |
-| `path:test1` | 31.04 ms | 19.60 ms |
+| `1` | 1.55 ms | 9.98 ms（单次验证） |
+| `12` | 4.81 ms | 已验证可用 |
+| `123` | 2.81 ms | 已验证可用 |
+| `txt` | 2.17 ms | 已验证可用 |
+| `windows` | 1.36 ms | 已验证可用 |
+| `report` | 4.46 ms | 已验证可用 |
+| `123456789.txt` | 0.04 ms | 1.18 ms（单次验证） |
+| `path:test1` | 43.46 ms | 已验证可用 |
 
-本轮名称索引构建中位数约 22.528 秒。单索引 Working Set 中位数约 557.69 MiB，Private Bytes 中位数约 556.27 MiB，结构容量约 548.55 MiB。posting 约 72.00 MiB，66,805,057 个 entry 平均约 1.13 字节，是原始 `uint32_t` posting 容量的约 28%。
+本轮名称索引构建中位数约 21.777 秒。单索引 Working Set 中位数约 474.66 MiB，Private Bytes 中位数约 473.04 MiB，结构容量约 466.16 MiB。posting 约 72.01 MiB，66,807,284 个 entry 平均约 1.13 字节，是原始 `uint32_t` posting 容量的约 28%。
 
-这些数据是特定机器和 snapshot 的开发基线，不是通用 SLA；已安装服务查询列来自上一轮 IPC 基线。当前共享目录路径签名版本尚未安装为完整服务重新采样，且 `path:` 查询存在明确回退。完整方法见 [PERFORMANCE.md](PERFORMANCE.md)。
+这些数据是特定机器和 snapshot 的开发基线，不是通用 SLA；已安装服务列只包含本轮单次功能验证，不应当作 p50。`path:` 查询存在明确回退。完整方法见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ## 5. 已知资源问题
 
 用户观察到的旧安装服务稳定内存约为 1.85–2 GiB；更早的开发版本曾达到 Working Set 约 3589 MB、Private Bytes 约 3662 MB。第一阶段通过释放 rvalue 源记录、普通文件路径组件化、128 位名称 Bloom、delta/varint posting 和 48 字节 `CompactRecord`，把真实 326 万条单搜索索引降到约 628.79 MiB Working Set。
 
-第二阶段把每记录 256 位完整路径 Bloom 改为目录级共享路径签名和每记录 32 位 owner，并让 posting 构建直接写最终 varint byte span。真实单索引进一步降到约 557.69 MiB Working Set / 556.27 MiB Private Bytes，结构容量约 548.55 MiB；签名容量从约 149.41 MiB 降到约 78.62 MiB。代价是 `path:test1` p50 从上一阶段 17.84 ms 增至 31.04 ms。
+第二阶段把每记录 256 位完整路径 Bloom 改为目录级共享路径签名和每记录 32 位 owner，并让 posting 构建直接写最终 varint byte span。第三阶段让正常目录和文件都使用名称 + 父链重建路径，字符 arena 从约 223.56 MiB 降到约 141.16 MiB；真实单索引进一步降到约 474.66 MiB Working Set / 473.04 MiB Private Bytes。代价是 `path:test1` 的 3 次 p50 中位数约 43.46 ms。
 
-当前已安装完整服务仍是上一阶段实测：
+默认多卷 `mft-auto` 服务现已直接把命名空间化 USN 增量应用到 `MetadataIndex`，不再长期保留每卷重复的 `NtfsCatalog`。最终安装二进制与构建产物 SHA-256 一致；索引替换后连续 12 次、每 5 秒采样均为约 479.28 MiB Working Set / 479.33 MiB Private Bytes。优化前同机稳定 Private Bytes 约 957.6–958.0 MiB，本轮下降约 50%。
 
-- reconciliation 峰值约 1.54 GiB；
-- 首轮稳定约 929 MiB Working Set / 930 MiB Private Bytes；
-- 后续每 5 秒一次、持续约 6 分钟的 72 次采样中，Working Set 为 870.66–930.54 MiB，Private Bytes 为 942.89–942.92 MiB；
-- 采样期间没有重新增长到 2–3 GiB。
+同机 Everything 1.4.1.1030 主进程和辅助进程合计约 316.77 MiB Private Bytes；当前 ESM 约为其 1.51 倍，已经不再是约 3 倍，但仍然偏大，不能声称达到 Everything。ESM 约 326.4 万条、snapshot 约 966.69 MiB；Everything 约 369.9 万条、数据库约 146.20 MiB，两者不是相同记录集或存储格式。
 
-因此 900 MiB 仍然偏大：它约为用户观察到的 Everything 300 MiB 的 3 倍。当前主要剩余项是 `NtfsCatalog` 与 `MetadataIndex` 的两套基础节点/名称、约 223.56 MiB UTF-16 字符 arena，以及尚未持久化/mmap 的搜索结构。当前本地构建虽然把单索引再降约 71 MiB，但尚未安装并完成完整服务稳定采样，不能提前宣称服务已经降到某个数字。
-
-单进程真实 snapshot 构建采用 10 ms 采样时，峰值仍约 2154.9 MiB Working Set / 2174.1 MiB Private Bytes，因为构建前仍完整物化 `vector<FileRecord>`。下一阶段优先做流式 snapshot -> 紧凑索引、Catalog 与查询层共享基础数据，以及可 mmap 的持久化搜索结构。
+单进程真实 snapshot 构建采用 10 ms 采样时，峰值仍约 2154.98 MiB Working Set / 2174.28 MiB Private Bytes；完整服务启动 reconciliation 的既有峰值约 2.57 GiB Private Bytes。下一阶段优先避免完整 `vector<FileRecord>` 物化、压缩 `CompactRecord`/字符串 arena，并把稳定搜索结构持久化或 mmap。
 
 ## 6. 发布判断
 

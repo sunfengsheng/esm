@@ -3,7 +3,6 @@
 #include "esm/journal_checkpoint.hpp"
 #include "esm/metadata_snapshot.hpp"
 #include "esm/named_pipe.hpp"
-#include "esm/ntfs_catalog.hpp"
 #include "esm/ntfs_enumerator.hpp"
 #include "esm/usn_journal.hpp"
 #include "esm/volume_discovery.hpp"
@@ -144,7 +143,7 @@ std::wstring service_start_failure(const esm::LiveStartResult& result) {
 
 struct VolumeLiveState {
     esm::NtfsVolumeInfo volume;
-    std::unique_ptr<esm::NtfsCatalog> catalog;
+    std::uint64_t root_id{};
     std::uint64_t journal_id{};
     std::int64_t cursor{};
     bool live{};
@@ -174,8 +173,8 @@ std::wstring join_volumes(const std::vector<std::wstring>& volumes) {
 }
 
 DWORD catch_up_volume(VolumeLiveState& state,
-                      esm::MetadataIndex* index = nullptr) {
-    if (!state.live || !state.catalog) return ERROR_NOT_SUPPORTED;
+                      esm::MetadataIndex& index) {
+    if (!state.live) return ERROR_NOT_SUPPORTED;
     const auto journal = esm::query_usn_journal(state.volume.root);
     if (!journal.available) return journal.error;
     if (esm::validate_checkpoint(
@@ -191,15 +190,10 @@ DWORD catch_up_volume(VolumeLiveState& state,
         if (batch.error != ERROR_SUCCESS) return batch.error;
         if (batch.next_usn <= state.cursor) return ERROR_INVALID_DATA;
 
-        auto delta = state.catalog->apply(batch);
-        if (index != nullptr) {
-            esm::namespace_ntfs_records(state.volume.identity,
-                                        delta.upserts);
-            esm::namespace_ntfs_file_ids(state.volume.identity,
-                                         delta.removed_ids);
-            index->apply_delta(std::move(delta.upserts),
-                               delta.removed_ids);
-        }
+        index.apply_ntfs_changes(state.volume.identity,
+                                 state.volume.root,
+                                 state.root_id,
+                                 batch);
         state.cursor = batch.next_usn;
     }
     return ERROR_SUCCESS;
@@ -217,28 +211,14 @@ VolumeBuildResult build_volume_live_state(esm::NtfsVolumeInfo volume) {
         return result;
     }
 
-    result.state.catalog = std::make_unique<esm::NtfsCatalog>(
-        result.state.volume.root, scan.root_id);
-    result.state.catalog->replace(scan.records);
-    scan.records.clear();
-    scan.records.shrink_to_fit();
-
+    result.state.root_id = scan.root_id;
     if (boundary.available) {
         result.state.journal_id = boundary.journal_id;
         result.state.cursor = boundary.next_usn;
         result.state.live = true;
-        const auto catch_up_error = catch_up_volume(result.state);
-        if (catch_up_error != ERROR_SUCCESS) {
-            result.state.live = false;
-            log_event(EVENTLOG_WARNING_TYPE,
-                      L"USN catch-up unavailable for " +
-                          result.state.volume.root + L", error=" +
-                          std::to_wstring(catch_up_error) +
-                          L"; periodic MFT reconciliation will be used");
-        }
     }
 
-    result.records = result.state.catalog->snapshot();
+    result.records = std::move(scan.records);
     esm::namespace_ntfs_records(result.state.volume.identity,
                                 result.records);
     return result;
@@ -452,7 +432,7 @@ void run_mft_auto_service() {
                         rebuild_required = true;
                         break;
                     }
-                    const auto error = catch_up_volume(state, &index);
+                    const auto error = catch_up_volume(state, index);
                     if (error != ERROR_SUCCESS) {
                         log_event(EVENTLOG_WARNING_TYPE,
                                   L"USN polling failed for " +

@@ -36,7 +36,7 @@
 
 ```text
 C:\ProgramData\everything_sm\indexes\mft-index.snapshot
-record_count = 3,264,059
+record_count = 3,264,136
 sort = name natural order
 limit = 1000
 ```
@@ -47,15 +47,15 @@ limit = 1000
 
 | 查询 | p50 |
 |---|---:|
-| `1` | 1.88 ms |
-| `12` | 5.61 ms |
-| `123` | 2.32 ms |
-| `txt` | 1.43 ms |
-| `windows` | 1.63 ms |
-| `report` | 4.01 ms |
-| `123456789` | 3.23 ms |
-| `123456789.txt` | 0.17 ms |
-| `path:test1` | 31.04 ms |
+| `1` | 1.55 ms |
+| `12` | 4.81 ms |
+| `123` | 2.81 ms |
+| `txt` | 2.17 ms |
+| `windows` | 1.36 ms |
+| `report` | 4.46 ms |
+| `123456789` | 0.81 ms |
+| `123456789.txt` | 0.04 ms |
+| `path:test1` | 43.46 ms |
 
 ### 已安装服务 IPC 查询 p50
 
@@ -79,7 +79,7 @@ limit = 1000
 | `report` | 约 276 ms | 约 3 ms |
 | `123456789.txt` | 约 466 ms | 约 0.17 ms |
 
-本轮最终代码的 3 次真实索引构建耗时为 22.102–22.548 秒，中位数约 22.528 秒。`path:test1` 因路径签名改为目录共享而回退到 31.04 ms；这是用约 70 MiB 稳定内存换取的已知路径查询权衡，不能隐瞒或与纯名称查询混为一谈。
+本轮最终代码的 3 次真实索引构建耗时为 20.418–21.970 秒，中位数约 21.777 秒。目录也改为父链组件化后，`path:test1` 的 3 次 p50 中位数为 43.46 ms；纯名称查询仍大致为 0.04–4.81 ms。这是进一步节省约 83 MiB 单索引稳定内存后的已知路径查询权衡，不能隐瞒或与纯名称查询混为一谈。
 
 ## 4. GUI 合成连续变化测试
 
@@ -109,51 +109,46 @@ limit = 1000
 
 ### 5.2 当前真实 snapshot 的单索引结构
 
-测试方法：2026-07-24，Release 构建；输入为 `C:\ProgramData\everything_sm\indexes\mft-index.snapshot`；记录数 3,264,059；完整进程独立运行 3 次。索引构建结束后读取 Working Set 和 Private Bytes，通过 `MetadataIndex::storage_stats()` 统计 vector capacity；另以 10 ms 间隔采样 snapshot 已载入到索引替换完成之间的进程峰值。
+测试方法：2026-07-24，Release 构建；输入为 `C:\ProgramData\everything_sm\indexes\mft-index.snapshot`；记录数 3,264,136；完整进程独立运行 3 次。索引构建结束后读取 Working Set 和 Private Bytes，通过 `MetadataIndex::storage_stats()` 统计 vector capacity；另以 10 ms 间隔采样 snapshot 已载入到索引替换完成之间的进程峰值。
 
 | 项目 | 观察值 |
 |---|---:|
-| 索引完成 Working Set | 557.62–557.71 MiB，中位数 557.69 MiB |
-| 索引完成 Private Bytes | 556.20–556.30 MiB，中位数 556.27 MiB |
-| 基础索引结构容量 | 约 548.55 MiB |
+| 索引完成 Working Set | 473.88–474.68 MiB，中位数 474.66 MiB |
+| 索引完成 Private Bytes | 473.01–473.05 MiB，中位数 473.04 MiB |
+| 基础索引结构容量 | 约 466.16 MiB |
 | CompactRecord | 约 149.42 MiB |
-| 字符 arena | 约 223.56 MiB |
+| 字符 arena | 约 141.16 MiB |
 | Bloom 签名及 owner | 约 78.62 MiB |
-| 目录路径签名 | 536,073 份 |
+| 目录路径签名 | 536,095 份 |
 | 每记录路径签名 owner | 约 12.45 MiB |
-| trigram posting | 约 72.00 MiB |
-| posting entry 数 | 66,805,057 |
+| trigram posting | 约 72.01 MiB |
+| posting entry 数 | 66,807,284 |
 | posting 平均字节/entry | 约 1.13 B |
 | 相对 `uint32_t` posting 的容量比例 | 约 0.28 |
 | 排序/前缀结构 | 约 24.96 MiB |
-| name-only 子文件路径 | 2,727,986 条 |
+| name-only 目录和文件路径 | 3,263,997 条 |
 
-第二阶段不再为每条记录保存一份 256 位完整路径 Bloom。目录保存共享的 256 位完整目录路径签名，每条记录只保存 32 位 owner；文件名部分复用已有的 128 位名称签名。含 `\`、`/`、`:` 的路径词不使用该共享过滤，直接回退完整 evaluator，避免跨路径边界产生 false negative。相对第一阶段，签名容量从约 149.41 MiB 降到约 78.62 MiB，单索引 Working Set 从约 628.79 MiB 降到约 557.69 MiB。
+第二阶段不再为每条记录保存一份 256 位完整路径 Bloom。目录保存共享的 256 位完整目录路径签名，每条记录只保存 32 位 owner；文件名部分复用已有的 128 位名称签名。第三阶段进一步让正常目录和文件都只保存名称并通过 `parent_id` 父链重建路径，仅根、orphan 和异常关系保留完整路径锚点。含 `\`、`/`、`:` 的路径词不使用共享签名过滤，直接回退完整 evaluator，避免跨路径边界产生 false negative。字符 arena 从约 223.56 MiB 降到约 141.16 MiB，单索引 Private Bytes 从约 556.27 MiB 降到约 473.04 MiB。
 
-posting 构建也改为两遍统计并直接把 delta/varint 写入最终 byte span，不再临时保存约 255 MiB 的 `uint32_t posting_positions`。最终 posting 容量仍约 72.00 MiB，构建时间中位数从约 27.041 秒降到约 22.528 秒。由于测试前仍先把完整 `vector<FileRecord>` snapshot 载入内存，构建阶段 10 ms 采样峰值仍为约 2154.9 MiB Working Set / 2174.1 MiB Private Bytes；这不是完整服务 reconciliation 峰值，也说明下一阶段仍需流式加载或直接从持久化紧凑结构构建。
+posting 构建仍使用两遍统计并直接把 delta/varint 写入最终 byte span，不临时保存约 255 MiB 的 `uint32_t posting_positions`。最终 posting 容量约 72.01 MiB，构建时间中位数约 21.777 秒。由于测试前仍先把完整 `vector<FileRecord>` snapshot 载入内存，构建阶段 10 ms 采样峰值仍为约 2154.98 MiB Working Set / 2174.28 MiB Private Bytes；这不是完整服务 reconciliation 峰值，也说明下一阶段仍需流式加载或直接从持久化紧凑结构构建。
 
-共享路径签名节省约 70 MiB，但 `path:test1` 的 3 次 p50 中位数从上一阶段 17.84 ms 增至 31.04 ms。纯名称查询仍大致为 1–6 ms。最终 evaluator 仍负责正确性校验，因此 Bloom/hash 误报只增加候选，不改变结果。
+共享路径签名和全父链路径组件化累计显著降低稳定内存，但 `path:test1` 的 3 次 p50 中位数为 43.46 ms。纯名称查询仍大致为 0.04–4.81 ms。最终 evaluator 仍负责正确性校验，因此 Bloom/hash 误报只增加候选，不改变结果。曾试验把名称 Bloom 从 128 位压到 64 位，`path:test1` 接近 90 ms，因此没有保留该方案。
 
-### 5.3 完整服务观察
+### 5.3 完整服务与 Everything 对比
 
-当前已安装服务二进制与本轮构建的 SHA-256 一致。一次覆盖旧 snapshot 加载、多卷 MFT reconciliation、搜索索引替换和稳定运行的采样中：
+测试方法：2026-07-24，把 `build-release\esm_service.exe` 以管理员权限替换到 `C:\Program Files\everything_sm`，确认安装文件 SHA-256 与构建产物一致；服务 PID 32204 启动后每 5 秒采样 Working Set 和 Private Bytes。启动 reconciliation 期间本轮采样看到约 1.49 GiB Private Bytes；更完整的前次启动采样峰值约 2.57 GiB，二者都属于短时构建峰值，不应与稳定状态混为一谈。
 
-| 阶段 | Working Set | Private Bytes |
-|---|---:|---:|
-| reconciliation 峰值 | 约 1.54 GiB | 约 1.55 GiB |
-| 首轮稳定状态 | 约 929 MiB | 约 930 MiB |
-
-随后在 2026-07-24 对同一服务 PID 每 5 秒采样一次、共 72 次（约 6 分钟）：
+索引替换后连续 12 次、约 1 分钟采样完全稳定：
 
 | 指标 | Working Set | Private Bytes |
 |---|---:|---:|
-| 最小值 | 870.66 MiB | 942.89 MiB |
-| 最大值 | 930.54 MiB | 942.92 MiB |
-| 最后一次 | 870.66 MiB | 942.89 MiB |
+| 最小值 | 479.28 MiB | 479.33 MiB |
+| 最大值 | 479.28 MiB | 479.33 MiB |
+| 最后一次 | 479.28 MiB | 479.33 MiB |
 
-这 6 分钟内没有再次增长到 2–3 GiB，说明已删除的“每 5 分钟全量路径 snapshot 物化”没有反弹。Working Set 中途下降是 Windows 回收冷页，Private Bytes 基本不变，因此真实稳定私有提交量仍应按约 943 MiB 观察，不能把 871 MiB 当作结构内存已经释放。
+优化前同机已安装服务稳定 Private Bytes 约 957.6–958.0 MiB。多卷 `mft-auto` 不再长期保留每卷 `NtfsCatalog` 后，稳定私有提交量下降约 50%，并且已接近单搜索索引的约 473 MiB，证明原先 Catalog 与 MetadataIndex 的大规模重复驻留已消除。
 
-相对用户看到的旧服务约 1.85–2 GiB，本轮稳定内存基本减半；但它仍明显高于 Everything 在该机器上约 300 MiB 的用户观察值，不能声称已经达到目标。剩余差距主要来自每卷 `NtfsCatalog` 与全局 `MetadataIndex` 两套基础元数据、约 223.56 MiB UTF-16 字符 arena、名称/共享路径签名，以及尚未持久化/mmap 的搜索加速器。当前工作树的单索引已经进一步降到约 557.69 MiB，但尚未把这一版安装为完整服务重新采样，因此不能直接把约 71 MiB 单索引降幅等同为完整服务稳定内存降幅。
+同一时刻本机 Everything 1.4.1.1030 主进程约 312.78 MiB Private Bytes，辅助/服务进程约 3.99 MiB，合计约 316.77 MiB；其数据库约 146.20 MiB、总条目约 369.9 万。ESM snapshot 约 966.69 MiB、索引条目约 326.4 万。两者不是相同记录集、文件格式或实现，不能直接当作严格同条件基准；按当前稳定 Private Bytes 粗略比较，ESM 约为 Everything 的 1.51 倍，仍未达到目标。
 
 没有保留 `EmptyWorkingSet`/`SetProcessWorkingSetSize(-1, -1)` 方案：它只能改变任务管理器 Working Set，并会增加冷页缺页和首次宽泛查询延迟。当前只在大阶段结束后调用 `HeapCompact` 回收已经释放的临时堆块。
 

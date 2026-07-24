@@ -108,10 +108,10 @@ v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视�
 
 `MetadataIndex` 提供可搜索记录和查询执行。基础层不再为每个条目都保存完整路径：
 
-- 目录记录保存完整路径；
-- 能验证父目录和路径后缀的普通文件只保存文件名、`parent_id` 和紧凑元数据；
-- 查询、排序和结果物化时用父目录路径重建完整路径；
-- 父记录缺失、父记录不是目录或路径形状不匹配时保留完整路径作为正确性回退；
+- 能验证父节点为目录且路径关系一致的普通目录和文件，都只保存名称、`parent_id` 和紧凑元数据；
+- 卷根、父记录缺失、父记录不是目录、循环或路径形状不匹配的记录保留完整路径锚点；
+- 查询、排序和结果物化时沿最多 512 层父链回溯到完整路径锚点，再顺序拼接目录/文件名；
+- 纯名称查询不读取完整路径，只有 `match_path` 或显式 `path:` 条件才执行父链重建；
 - 增量 overlay 暂时保留完整 `FileRecord`，compaction 后重新执行路径组件化。
 
 rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 通过打包目录、路径模式和属性标志保持约 48 字节/记录；名称 bigram Bloom 使用 128 位/记录。
@@ -120,7 +120,7 @@ rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `
 
 名称 trigram posting 使用两遍直接编码：第一遍统计每个 bucket 的 entry 数和 delta/varint 字节数，计算最终 byte offsets；第二遍直接写入最终 `encoded_positions`。构建过程不再保留一份完整的临时 `uint32_t posting_positions`。
 
-Catalog 与 MetadataIndex 尚未完全共享名称和节点元数据；当前 snapshot 加载也仍先物化完整 `vector<FileRecord>`。两套基础节点、UTF-16 arena、构建峰值和搜索结构持久化仍是后续 memory-map/压缩重点。
+默认多卷 `mft-auto` 路径不再长期保留每卷 `NtfsCatalog`：初始 MFT 记录命名空间化后直接构建全局 `MetadataIndex`，后续 `MetadataIndex::apply_ntfs_changes` 直接处理 raw USN create/update/rename/delete，并在目录重命名时刷新受影响后代。单卷 live/snapshot/WAL 路径仍使用 `NtfsCatalog`。当前 snapshot 加载仍先物化完整 `vector<FileRecord>`；UTF-16 arena、构建峰值、紧凑记录布局和搜索结构持久化仍是后续 memory-map/压缩重点。
 
 ## 6. 名称 trigram 倒排索引
 
@@ -180,7 +180,7 @@ metadata snapshot 包含版本、卷/模式标记、记录和校验信息。替�
 
 ### 8.3 当前限制
 
-默认多卷 MFT 服务仍使用完整 `mft-index.snapshot`，尚未统一为通用 base snapshot + WAL + delta replay 数据库。为避免周期性多 GiB 峰值，多卷 snapshot 不再每 5 分钟从所有 Catalog 重新物化完整路径；它在完整 MFT reconciliation 已经产生记录向量时先写 snapshot，再由 `MetadataIndex` 消费并释放同一向量。因此 snapshot 新鲜度当前与完整 reconciliation 周期绑定。
+默认多卷 MFT 服务仍使用完整 `mft-index.snapshot`，尚未统一为通用 base snapshot + WAL + delta replay 数据库。多卷服务不再保存每卷 Catalog，也不再每 5 分钟从 Catalog 重新物化完整路径；完整 reconciliation 产生统一记录向量后先写 snapshot，再由 `MetadataIndex` 消费并释放该向量。实时阶段直接把每卷 USN 增量应用到全局索引，因此内存中的搜索结果可实时更新，但磁盘 snapshot 新鲜度仍与完整 reconciliation 周期绑定。
 
 ## 9. IPC
 

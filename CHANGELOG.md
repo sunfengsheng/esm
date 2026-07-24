@@ -20,6 +20,10 @@
 
 ### Performance
 
+- 默认多卷 `mft-auto` 服务不再长期保留每卷 `NtfsCatalog`；USN create/update/rename/delete 现在直接命名空间化并应用到全局 `MetadataIndex`，完整服务稳定 Private Bytes 从约 958 MiB 降到约 479 MiB。
+- 基础索引把正常目录和文件都压缩为“名称 + parent ID”；仅卷根、orphan 或路径关系异常记录保留完整路径锚点。真实 326 万条单索引字符 arena 从约 223.56 MiB 降到约 141.16 MiB，Private Bytes 从约 556 MiB 降到约 473 MiB。
+- 同机实测 Everything 1.4 主进程和辅助进程合计约 316.77 MiB Private Bytes；当前 ESM 稳定约 479.33 MiB，约为其 1.51 倍，尚未达到 Everything。
+- 当前启动 reconciliation 仍会短时达到约 2.57 GiB Private Bytes，单进程 snapshot 构建峰值约 2.17 GiB；完整 `vector<FileRecord>` 物化和约 966.69 MiB snapshot 仍是下一阶段重点。
 - 路径 trigram Bloom 从“每条记录一份 256 位完整路径签名”改为“每个目录一份共享路径签名 + 每条记录一个 32 位 owner”；真实 326 万条单索引签名容量从约 149.41 MiB 降到约 78.62 MiB，Working Set 中位数从约 628.79 MiB 降到约 557.69 MiB。
 - posting 构建改为两遍统计并直接写最终 delta/varint byte span，不再分配约 255 MiB 的临时 `uint32_t posting_positions`；同机真实索引构建中位数从约 27.041 秒降到约 22.528 秒。
 - 真实 snapshot 基准增加 10 ms 构建期 Working Set/Private Bytes 峰值采样和路径签名 owner 统计；当前单进程构建峰值仍约 2.17 GiB，说明仍需流式 snapshot 构建。

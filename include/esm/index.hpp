@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "esm/file_record.hpp"
 #include "esm/query.hpp"
+#include "esm/usn_journal.hpp"
 #include <cstddef>
 #include <array>
 #include <cstdint>
@@ -65,6 +66,13 @@ public:
     void replace(std::vector<FileRecord>&& records);
     void apply_delta(std::vector<FileRecord> upserts,
                      const std::vector<std::uint64_t>& removed_ids);
+    // Applies raw per-volume USN changes directly to the searchable base.
+    // IDs are namespaced internally so the multi-volume service does not need
+    // to retain a duplicate NtfsCatalog for every indexed volume.
+    void apply_ntfs_changes(std::wstring_view volume_identity,
+                            std::wstring_view volume_root,
+                            std::uint64_t root_id,
+                            const UsnChangeBatch& batch);
     [[nodiscard]] std::vector<SearchResult> search(std::wstring_view query, const SearchOptions& options = {}) const;
     [[nodiscard]] std::size_t size() const;
     [[nodiscard]] std::size_t pending_delta_size() const;

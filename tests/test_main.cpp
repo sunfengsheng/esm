@@ -356,6 +356,83 @@ void test_index_componentized_path_fallback_and_compaction() {
             "componentized path survives overlay compaction");
 }
 
+void test_index_direct_ntfs_changes() {
+    constexpr std::wstring_view identity = L"test-volume-direct-usn";
+    constexpr std::uint64_t raw_root_id = 5;
+    const auto scoped = [](std::uint64_t id) {
+        return esm::namespace_ntfs_file_id(L"test-volume-direct-usn", id);
+    };
+
+    auto root = record(scoped(raw_root_id), L"", L"C:\\");
+    root.parent_id = scoped(raw_root_id);
+    root.directory = true;
+    root.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    auto folder = record(scoped(10), L"folder", L"C:\\folder");
+    folder.parent_id = scoped(raw_root_id);
+    folder.directory = true;
+    folder.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    auto child = record(scoped(11), L"before.txt",
+                        L"C:\\folder\\before.txt");
+    child.parent_id = scoped(10);
+
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> base;
+    base.push_back(std::move(root));
+    base.push_back(std::move(folder));
+    base.push_back(std::move(child));
+    index.replace(std::move(base));
+
+    esm::UsnChangeBatch create_batch;
+    esm::UsnChange created;
+    created.file_id = 12;
+    created.parent_id = 10;
+    created.reason = USN_REASON_FILE_CREATE;
+    created.attributes = FILE_ATTRIBUTE_ARCHIVE;
+    created.name = L"created.txt";
+    create_batch.changes.push_back(std::move(created));
+    index.apply_ntfs_changes(identity, L"C:\\", raw_root_id, create_batch);
+    auto results = index.search(L"path:folder created");
+    require(results.size() == 1 && results.front().record.id == scoped(12) &&
+                results.front().record.path == L"C:\\folder\\created.txt",
+            "direct USN create updates searchable namespaced index");
+
+    esm::UsnChangeBatch rename_batch;
+    esm::UsnChange old_name;
+    old_name.file_id = 10;
+    old_name.parent_id = raw_root_id;
+    old_name.reason = USN_REASON_RENAME_OLD_NAME;
+    old_name.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    old_name.name = L"folder";
+    rename_batch.changes.push_back(std::move(old_name));
+    esm::UsnChange new_name;
+    new_name.file_id = 10;
+    new_name.parent_id = raw_root_id;
+    new_name.reason = USN_REASON_RENAME_NEW_NAME;
+    new_name.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    new_name.name = L"renamed";
+    rename_batch.changes.push_back(std::move(new_name));
+    index.apply_ntfs_changes(identity, L"C:\\", raw_root_id, rename_batch);
+    results = index.search(L"path:renamed before");
+    require(results.size() == 1 &&
+                results.front().record.path == L"C:\\renamed\\before.txt",
+            "direct USN directory rename refreshes descendant paths");
+    results = index.search(L"path:renamed created");
+    require(results.size() == 1 &&
+                results.front().record.path == L"C:\\renamed\\created.txt",
+            "direct USN directory rename refreshes created descendants");
+
+    esm::UsnChangeBatch delete_batch;
+    esm::UsnChange deleted;
+    deleted.file_id = 11;
+    deleted.parent_id = 10;
+    deleted.reason = USN_REASON_FILE_DELETE;
+    deleted.name = L"before.txt";
+    delete_batch.changes.push_back(std::move(deleted));
+    index.apply_ntfs_changes(identity, L"C:\\", raw_root_id, delete_batch);
+    require(index.search(L"before.txt").empty(),
+            "direct USN delete suppresses the base record");
+}
+
 void test_shared_directory_path_signatures() {
     esm::MetadataIndex index;
     auto root = record(1, L"shared", L"D:\\shared");
@@ -379,6 +456,8 @@ void test_shared_directory_path_signatures() {
     index.replace(std::move(records));
 
     const auto stats = index.storage_stats();
+    require(stats.name_only_paths == 3,
+            "nested directories and files share parent-linked path components");
     require(stats.path_signature_count < stats.base_records,
             "directory path signatures are shared by child files");
     require(stats.path_signature_owner_bytes >=
@@ -2108,7 +2187,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

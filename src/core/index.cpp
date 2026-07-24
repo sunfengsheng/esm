@@ -1,8 +1,10 @@
 #include "esm/index.hpp"
+#include "esm/volume_discovery.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cwctype>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -12,6 +14,7 @@
 #include <stdexcept>
 #include <thread>
 #include <windows.h>
+#include <winioctl.h>
 namespace esm {
 namespace {
 wchar_t normalize_char(wchar_t ch,bool sensitive){if(sensitive)return ch;if(ch>=L'A'&&ch<=L'Z')return (wchar_t)(ch+(L'a'-L'A'));if(ch<128)return ch;return (wchar_t)std::towlower(ch);}
@@ -782,7 +785,7 @@ void MetadataIndex::compact_base_paths(
     for (std::size_t index = 0; index < records.size(); ++index) {
         const auto& record = records[index];
         bool can_store_name_only = false;
-        if (!record.directory && record.parent_id != 0) {
+        if (record.parent_id != 0 && record.parent_id != record.id) {
             const auto parent = std::lower_bound(
                 records.begin(), records.end(), record.parent_id,
                 [](const CompactRecord& candidate, std::uint64_t id) {
@@ -885,8 +888,11 @@ void MetadataIndex::replace_impl(
         // memory peak or remain alive for the lifetime of the service.
         std::vector<FileRecord>().swap(*consumable_source);
     }
-    compact_base_paths(records, strings);
+    // Build accelerators while every record still has its complete path. The
+    // final compact arena can then store both files and directories as parent
+    // linked names without making construction perform recursive path walks.
     auto name_accelerators = build_name_search_accelerators(records, strings);
+    compact_base_paths(records, strings);
     std::unordered_map<std::uint64_t, FileRecord> old_overlay;
     std::unordered_set<std::uint64_t> old_removed;
     std::vector<std::uint64_t> old_suppressed_base_ids;
@@ -953,6 +959,221 @@ void MetadataIndex::apply_delta(
         overlay_.insert_or_assign(id, std::move(record));
         if (!live) ++live_size_;
     }
+    if (auto_compaction_threshold_ != 0 &&
+        overlay_.size() + removed_.size() >= auto_compaction_threshold_) {
+        compact_locked();
+    } else {
+        rebuild_suppressed_base_ids_locked();
+    }
+}
+
+void MetadataIndex::apply_ntfs_changes(
+    std::wstring_view volume_identity,
+    std::wstring_view volume_root,
+    std::uint64_t root_id,
+    const UsnChangeBatch& batch) {
+    const auto scoped_root_id =
+        namespace_ntfs_file_id(volume_identity, root_id);
+    std::unique_lock lock(mutex_);
+
+    const auto base_record = [&](std::uint64_t id) -> const CompactRecord* {
+        const auto found = std::lower_bound(
+            records_.begin(), records_.end(), id,
+            [](const CompactRecord& record, std::uint64_t value) {
+                return record.id < value;
+            });
+        return found != records_.end() && found->id == id ? &*found : nullptr;
+    };
+    const auto live_record = [&](std::uint64_t id,
+                                 FileRecord& result) -> bool {
+        if (const auto found = overlay_.find(id); found != overlay_.end()) {
+            result = found->second;
+            return true;
+        }
+        if (removed_.find(id) != removed_.end()) return false;
+        const auto* base = base_record(id);
+        if (base == nullptr) return false;
+        result = materialize(*base);
+        return true;
+    };
+    const auto parent_id_of = [&](std::uint64_t id,
+                                  std::uint64_t& parent_id) -> bool {
+        if (const auto found = overlay_.find(id); found != overlay_.end()) {
+            parent_id = found->second.parent_id;
+            return true;
+        }
+        if (removed_.find(id) != removed_.end()) return false;
+        const auto* base = base_record(id);
+        if (base == nullptr) return false;
+        parent_id = base->parent_id;
+        return true;
+    };
+    const auto promote = [&](std::uint64_t id) -> FileRecord& {
+        if (auto found = overlay_.find(id); found != overlay_.end()) {
+            return found->second;
+        }
+        const auto* base = base_record(id);
+        if (base == nullptr || removed_.find(id) != removed_.end()) {
+            throw std::logic_error("cannot promote missing index record");
+        }
+        auto [inserted, created] = overlay_.emplace(id, materialize(*base));
+        (void)created;
+        return inserted->second;
+    };
+
+    std::unordered_set<std::uint64_t> pending_renames;
+    std::unordered_set<std::uint64_t> changed_ids;
+    std::unordered_set<std::uint64_t> path_roots;
+    pending_renames.reserve(batch.changes.size() / 8 + 1);
+    changed_ids.reserve(batch.changes.size() / 2 + 1);
+
+    for (const auto& raw_change : batch.changes) {
+        const auto id = namespace_ntfs_file_id(
+            volume_identity, raw_change.file_id);
+        const auto parent_id = namespace_ntfs_file_id(
+            volume_identity, raw_change.parent_id);
+        if ((raw_change.reason & USN_REASON_RENAME_OLD_NAME) != 0) {
+            pending_renames.insert(id);
+            continue;
+        }
+
+        if ((raw_change.reason & USN_REASON_FILE_DELETE) != 0) {
+            FileRecord deleting;
+            if (live_record(id, deleting)) {
+                if (deleting.directory) path_roots.insert(id);
+                const bool in_base = base_record(id) != nullptr;
+                overlay_.erase(id);
+                if (in_base) removed_.insert(id);
+                else removed_.erase(id);
+                --live_size_;
+            }
+            pending_renames.erase(id);
+            changed_ids.erase(id);
+            continue;
+        }
+
+        const bool create =
+            (raw_change.reason & USN_REASON_FILE_CREATE) != 0;
+        const bool rename_new =
+            (raw_change.reason & USN_REASON_RENAME_NEW_NAME) != 0;
+        FileRecord existing;
+        const bool found = live_record(id, existing);
+        if (!found) {
+            if (!create && !rename_new) continue;
+            FileRecord record;
+            record.id = id;
+            record.parent_id = parent_id;
+            record.attributes = raw_change.attributes;
+            record.directory =
+                (raw_change.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            record.name = raw_change.name;
+            removed_.erase(id);
+            overlay_.insert_or_assign(id, std::move(record));
+            changed_ids.insert(id);
+            ++live_size_;
+            pending_renames.erase(id);
+            continue;
+        }
+
+        auto& record = promote(id);
+        if (rename_new) {
+            record.parent_id = parent_id;
+            record.name = raw_change.name;
+            if (record.directory) path_roots.insert(id);
+            pending_renames.erase(id);
+        } else if (create) {
+            record.parent_id = parent_id;
+            record.name = raw_change.name;
+        }
+        record.attributes = raw_change.attributes;
+        record.directory =
+            (raw_change.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        changed_ids.insert(id);
+    }
+
+    std::unordered_map<std::uint64_t, std::wstring> paths;
+    paths.reserve(changed_ids.size() * 2 + path_roots.size() + 8);
+    paths.emplace(scoped_root_id, std::wstring(volume_root));
+    std::unordered_set<std::uint64_t> resolving;
+    resolving.reserve(64);
+    std::function<std::wstring(std::uint64_t, unsigned)> resolve =
+        [&](std::uint64_t id, unsigned depth) -> std::wstring {
+        if (id == scoped_root_id) return std::wstring(volume_root);
+        if (const auto cached = paths.find(id); cached != paths.end()) {
+            return cached->second;
+        }
+        if (depth > 512 || !resolving.insert(id).second) {
+            return std::wstring(volume_root) + L"\\$Cycle";
+        }
+        FileRecord record;
+        if (!live_record(id, record)) {
+            resolving.erase(id);
+            return std::wstring(volume_root) + L"\\$OrphanFiles";
+        }
+        auto path = resolve(record.parent_id, depth + 1);
+        if (!path.ends_with(L"\\") && !path.ends_with(L"/")) {
+            path.push_back(L'\\');
+        }
+        path += record.name;
+        resolving.erase(id);
+        paths.emplace(id, path);
+        return path;
+    };
+    const auto refresh_path = [&](FileRecord& record) {
+        record.path = resolve(record.parent_id, 0);
+        if (!record.path.ends_with(L"\\") &&
+            !record.path.ends_with(L"/")) {
+            record.path.push_back(L'\\');
+        }
+        record.path += record.name;
+        paths.insert_or_assign(record.id, record.path);
+    };
+
+    std::unordered_map<std::uint64_t, bool> affected_cache;
+    affected_cache.reserve(path_roots.size() * 4 + 64);
+    affected_cache.emplace(scoped_root_id, false);
+    for (const auto id : path_roots) affected_cache.insert_or_assign(id, true);
+    std::unordered_set<std::uint64_t> resolving_affected;
+    resolving_affected.reserve(64);
+    std::function<bool(std::uint64_t, unsigned)> is_path_affected =
+        [&](std::uint64_t id, unsigned depth) -> bool {
+        if (const auto cached = affected_cache.find(id);
+            cached != affected_cache.end()) {
+            return cached->second;
+        }
+        if (depth > 512 || !resolving_affected.insert(id).second) return false;
+        std::uint64_t parent_id = 0;
+        bool affected = false;
+        if (parent_id_of(id, parent_id) && parent_id != id) {
+            affected = is_path_affected(parent_id, depth + 1);
+        }
+        resolving_affected.erase(id);
+        affected_cache.emplace(id, affected);
+        return affected;
+    };
+
+    if (!path_roots.empty()) {
+        for (const auto& base : records_) {
+            if (removed_.find(base.id) != removed_.end()) continue;
+            if (changed_ids.find(base.id) != changed_ids.end() ||
+                is_path_affected(base.id, 0)) {
+                refresh_path(promote(base.id));
+            }
+        }
+        for (auto& [id, record] : overlay_) {
+            if (changed_ids.find(id) != changed_ids.end() ||
+                is_path_affected(id, 0)) {
+                refresh_path(record);
+            }
+        }
+    } else {
+        for (const auto id : changed_ids) {
+            if (auto found = overlay_.find(id); found != overlay_.end()) {
+                refresh_path(found->second);
+            }
+        }
+    }
+
     if (auto_compaction_threshold_ != 0 &&
         overlay_.size() + removed_.size() >= auto_compaction_threshold_) {
         compact_locked();
@@ -1048,8 +1269,8 @@ void MetadataIndex::compact_locked() {
               [](const CompactRecord& a, const CompactRecord& b) {
                   return a.id < b.id;
               });
-    compact_base_paths(compacted, strings);
     auto name_accelerators = build_name_search_accelerators(compacted, strings);
+    compact_base_paths(compacted, strings);
     records_ = std::move(compacted);
     strings_ = std::move(strings);
     name_bigram_signatures_ = std::move(name_accelerators.bigram_signatures);
@@ -1137,26 +1358,43 @@ MetadataIndexStorageStats MetadataIndex::storage_stats() const {
 
 std::wstring_view MetadataIndex::path_view(
     const CompactRecord& record, std::wstring& scratch) const {
-    const std::wstring_view stored(strings_.data() + record.path_offset,
-                                   record.path_length);
-    if (!record.name_only_path) return stored;
+    const auto stored_path = [&](const CompactRecord& item) {
+        return std::wstring_view(strings_.data() + item.path_offset,
+                                 item.path_length);
+    };
+    if (!record.name_only_path) return stored_path(record);
 
-    const auto parent = std::lower_bound(
-        records_.begin(), records_.end(), record.parent_id,
-        [](const CompactRecord& candidate, std::uint64_t id) {
-            return candidate.id < id;
-        });
-    if (parent == records_.end() || parent->id != record.parent_id ||
-        parent->name_only_path) {
-        return stored;
+    // Componentized paths can include directory records too. Walk the parent
+    // chain to the nearest full-path anchor, then append names in forward
+    // order. A fixed stack keeps normal path reconstruction free of helper
+    // allocations; scratch owns only the final returned path.
+    constexpr std::size_t maximum_components = 512;
+    std::array<const CompactRecord*, maximum_components> components{};
+    std::size_t component_count = 0;
+    const CompactRecord* current = &record;
+    while (current->name_only_path && component_count < components.size()) {
+        components[component_count++] = current;
+        const auto parent = std::lower_bound(
+            records_.begin(), records_.end(), current->parent_id,
+            [](const CompactRecord& candidate, std::uint64_t id) {
+                return candidate.id < id;
+            });
+        if (parent == records_.end() || parent->id != current->parent_id ||
+            parent->id == current->id) {
+            return stored_path(record);
+        }
+        current = &*parent;
     }
-    const std::wstring_view parent_path(
-        strings_.data() + parent->path_offset, parent->path_length);
-    scratch.assign(parent_path);
-    if (!scratch.ends_with(L"\\") && !scratch.ends_with(L"/")) {
-        scratch.push_back(L'\\');
+    if (current->name_only_path) return stored_path(record);
+
+    scratch.assign(stored_path(*current));
+    while (component_count != 0) {
+        const auto* component = components[--component_count];
+        if (!scratch.ends_with(L"\\") && !scratch.ends_with(L"/")) {
+            scratch.push_back(L'\\');
+        }
+        scratch.append(name_view(*component));
     }
-    scratch.append(name_view(record));
     return scratch;
 }
 std::wstring_view MetadataIndex::name_view(const CompactRecord& record) const { return {strings_.data() + record.name_offset, record.name_length()}; }
@@ -1182,6 +1420,10 @@ std::vector<SearchResult> MetadataIndex::search(
         terms.push_back(compile_term(term, sensitive, options.match_diacritics));
         if (!terms.back().valid) return {};
     }
+    const bool query_reads_path = options.match_path ||
+        std::any_of(terms.begin(), terms.end(), [](const CompiledTerm& term) {
+            return term.target == MatchTarget::path;
+        });
 
     std::shared_lock lock(mutex_);
     std::vector<Candidate> candidates;
@@ -1589,7 +1831,8 @@ std::vector<SearchResult> MetadataIndex::search(
                 if (!path_signature_may_match(index)) continue;
                 const auto name = name_view(record);
                 std::wstring path_scratch;
-                const auto path = path_view(record, path_scratch);
+                const auto path = query_reads_path
+                    ? path_view(record, path_scratch) : std::wstring_view{};
                 if (!accepted(record.directory, name, path, record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
@@ -1723,7 +1966,8 @@ std::vector<SearchResult> MetadataIndex::search(
                 if (folded_only && in_raw_prefix_range(name)) continue;
                 if (!prefix_text_match(prefix_term, name, sensitive)) continue;
                 std::wstring path_scratch;
-                const auto path = path_view(record, path_scratch);
+                const auto path = query_reads_path
+                    ? path_view(record, path_scratch) : std::wstring_view{};
                 if (!accepted(record.directory, name, path, record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
@@ -1777,7 +2021,8 @@ std::vector<SearchResult> MetadataIndex::search(
             const auto name = name_view(record);
             if (!text_match(path_term, name, sensitive, whole_word)) continue;
             std::wstring path_scratch;
-            const auto path = path_view(record, path_scratch);
+            const auto path = query_reads_path
+                    ? path_view(record, path_scratch) : std::wstring_view{};
             if (!accepted(record.directory, name, path, record.size,
                           record.last_write_time, record.attributes)) {
                 continue;
@@ -1846,7 +2091,8 @@ std::vector<SearchResult> MetadataIndex::search(
                 return;
             }
             std::wstring path_scratch;
-            const auto path = path_view(record, path_scratch);
+            const auto path = query_reads_path
+                    ? path_view(record, path_scratch) : std::wstring_view{};
             if (accepted(record.directory, name, path, record.size,
                          record.last_write_time, record.attributes)) {
                 consider({rank_record(terms, name, path, options.match_path,

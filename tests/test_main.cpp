@@ -1,4 +1,4 @@
-﻿#include "esm/directory_scanner.hpp"
+#include "esm/directory_scanner.hpp"
 #include "esm/file_metadata.hpp"
 #include "esm/file_list.hpp"
 #include "esm/saved_search.hpp"
@@ -331,6 +331,15 @@ void test_diacritic_matching() {
     results = index.search(L"caf\u00e9", options);
     require(results.size() == 1 && results.front().record.id == 1,
             "diacritic-sensitive search accepts exact accent");
+
+    esm::MetadataIndex boundary_index;
+    boundary_index.replace({
+        record(2, L"cafe\u0301x.txt", L"D:\\cafe\u0301x.txt")
+    });
+    options.match_diacritics = false;
+    options.whole_word = true;
+    require(boundary_index.search(L"cafe", options).empty(),
+            "diacritic folding preserves whole-word boundaries");
 }
 
 void test_efu_round_trip() {
@@ -475,6 +484,188 @@ void test_simple_query_top_k() {
             "prefix accelerator preserves case-sensitive semantics");
 }
 
+void test_sorted_top_k_accelerators() {
+    esm::MetadataIndex index(0);
+    auto item10 = record(1, L"item10.txt", L"D:\\z\\item10.txt");
+    item10.size = 300;
+    auto item2 = record(2, L"item2.txt", L"D:\\b\\item2.txt");
+    item2.size = 100;
+    auto item2_case = record(3, L"Item2.txt", L"D:\\a\\Item2.txt");
+    item2_case.size = 200;
+    auto item02 = record(4, L"item02.txt", L"D:\\c\\item02.txt");
+    item02.size = 50;
+    auto contains = record(5, L"xitem1.txt", L"D:\\xitem1.txt");
+    contains.size = 400;
+    auto item20 = record(6, L"item20.txt", L"D:\\item20.txt");
+    item20.size = 250;
+    index.replace({item10, item2, item2_case, item02, contains, item20});
+
+    esm::SearchOptions options;
+    options.sort = esm::SortField::name;
+    options.limit = 3;
+    auto results = index.search(L"item", options);
+    require(results.size() == 3 && results[0].record.id == 3 &&
+                results[1].record.id == 2 && results[2].record.id == 4,
+            "bounded natural name sort uses name/path order");
+
+    options.descending = true;
+    results = index.search(L"item", options);
+    require(results.size() == 3 && results[0].record.id == 5 &&
+                results[1].record.id == 6 && results[2].record.id == 1,
+            "descending natural name order");
+
+    auto replacement = record(2, L"item3.txt", L"D:\\d\\item3.txt");
+    replacement.size = 125;
+    auto overlay = record(7, L"item1.txt", L"D:\\overlay\\item1.txt");
+    overlay.size = 25;
+    index.apply_delta({replacement, overlay}, {6});
+    options.descending = false;
+    options.limit = 4;
+    results = index.search(L"item", options);
+    require(results.size() == 4 && results[0].record.id == 7 &&
+                results[1].record.id == 3 && results[2].record.id == 4 &&
+                results[3].record.id == 2,
+            "name order merges overlay and suppresses replaced base record");
+
+    options.case_sensitive = true;
+    options.limit = 2;
+    results = index.search(L"regex:\".*\"", options);
+    require(results.size() == 2 && results[0].record.id == 3 &&
+                results[1].record.id == 7,
+            "case-sensitive name sort uses bounded fallback");
+
+    options.case_sensitive = false;
+    options.sort = esm::SortField::size;
+    options.limit = 2;
+    results = index.search(L"item", options);
+    require(results.size() == 2 && results[0].record.id == 7 &&
+                results[1].record.id == 4,
+            "bounded numeric sort keeps smallest values");
+    options.descending = true;
+    results = index.search(L"item", options);
+    require(results.size() == 2 && results[0].record.id == 5 &&
+                results[1].record.id == 1,
+            "bounded descending numeric sort keeps largest values");
+
+    esm::MetadataIndex duplicate_index(0);
+    duplicate_index.replace({
+        record(10, L"duplicate.txt", L"D:\\a\\duplicate.txt"),
+        record(11, L"duplicate.txt", L"D:\\b\\duplicate.txt"),
+        record(12, L"other-duplicate.txt",
+               L"D:\\c\\other-duplicate.txt")});
+    options.sort = esm::SortField::name;
+    options.descending = false;
+    options.limit = 1;
+    results = duplicate_index.search(L"duplicate dupe:name", options);
+    require(results.size() == 1 && results[0].record.name == L"duplicate.txt",
+            "duplicate queries bypass bounded collection until grouping");
+
+    std::vector<esm::FileRecord> generated;
+    generated.reserve(600);
+    for (std::uint64_t id = 1; id <= 600; ++id) {
+        std::wstring name;
+        switch (id % 6) {
+        case 0:
+            name = std::to_wstring((id * 37) % 1'000) + L"-start.txt";
+            break;
+        case 1:
+            name = L"file" + std::to_wstring((id * 91) % 10'000) + L".txt";
+            break;
+        case 2:
+            name = L"file00" + std::to_wstring((id * 13) % 1'000) + L".txt";
+            break;
+        case 3:
+            name = L"Alpha" + std::to_wstring((id * 17) % 500) + L".bin";
+            break;
+        case 4:
+            name = L"鎶ュ憡" + std::to_wstring((id * 19) % 700) + L".pdf";
+            break;
+        default:
+            name = L"prefix-" + std::to_wstring((id * 23) % 900) + L"-tail";
+            break;
+        }
+        generated.push_back(record(10'000 + id, name,
+            L"D:\\bucket" + std::to_wstring(id % 11) + L"\\" + name));
+    }
+    generated.push_back(record(20'001, L"佟digit.txt",
+                               L"D:\\unicode\\佟digit.txt"));
+    generated.push_back(record(20'002, L"2digit.txt",
+                               L"D:\\unicode\\2digit.txt"));
+    auto expected = generated;
+    std::sort(expected.begin(), expected.end(),
+              [](const esm::FileRecord& left, const esm::FileRecord& right) {
+                  int order = esm::natural_compare(left.name, right.name, false);
+                  if (!order) {
+                      order = esm::natural_compare(left.path, right.path, false);
+                  }
+                  if (!order) {
+                      order = left.id < right.id
+                          ? -1 : (left.id > right.id ? 1 : 0);
+                  }
+                  return order < 0;
+              });
+    esm::MetadataIndex generated_index(0);
+    std::reverse(generated.begin(), generated.end());
+    generated_index.replace(generated);
+    options.limit = 1'000;
+    options.case_sensitive = false;
+    options.sort = esm::SortField::name;
+    results = generated_index.search(L"regex:\".*\"", options);
+    require(results.size() == expected.size(),
+            "natural order accelerator returns every generated record");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        require(results[i].record.id == expected[i].id,
+                "radix natural order matches reference comparator");
+    }
+}
+
+void test_diacritic_insensitive_top_k() {
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> records;
+    for (std::uint64_t id = 1; id <= 20; ++id) {
+        const auto name = L"elan_prefix_" + std::to_wstring(id) + L".txt";
+        records.push_back(record(id, name, L"D:\\raw\\" + name));
+    }
+    records.push_back(record(500, L"\u00e9lan", L"D:\\accent\\\u00e9lan"));
+    records.push_back(record(501, L"\u00e9lan_notes.txt",
+                             L"D:\\accent\\\u00e9lan_notes.txt"));
+    index.replace(records);
+
+    esm::SearchOptions options;
+    options.limit = 3;
+    options.match_diacritics = false;
+    const auto results = index.search(L"elan", options);
+    require(results.size() == options.limit,
+            "ignore-diacritics prefix query fills top-k page");
+    require(results.front().record.id == 500,
+            "accent-folded exact name outranks raw prefix matches");
+    const auto folded_prefix = index.search(L"elan_notes", options);
+    require(folded_prefix.size() == 1 &&
+                folded_prefix.front().record.id == 501,
+            "accent-folded prefix entry remains searchable");
+}
+
+void test_path_query_top_k_early_exit() {
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> records;
+    for (std::uint64_t id = 1; id <= 200; ++id) {
+        const auto name = L"unrelated_" + std::to_wstring(id) + L".txt";
+        records.push_back(record(id, name, L"D:\\bucket\\" + name));
+    }
+    records.push_back(record(1000, L"bucket", L"D:\\elsewhere\\bucket"));
+    index.replace(records);
+
+    esm::SearchOptions options;
+    options.limit = 3;
+    options.match_diacritics = false;
+    const auto results = index.search(L"path:bucket", options);
+    require(results.size() == options.limit,
+            "path top-k query fills requested page");
+    require(results[0].record.id == 1000 &&
+                results[1].record.id == 1 && results[2].record.id == 2,
+            "path early exit keeps later high-relevance filename match");
+}
+
 void test_index_delta_overlay() {
     esm::MetadataIndex index;
     std::vector<esm::FileRecord> records;
@@ -511,6 +702,24 @@ void test_index_delta_overlay() {
             "recreated base id searchable");
     require(index.search(L"delta", options).empty(),
             "removed overlay record hidden");
+
+    // Trigram postings are in natural-name order rather than record-id order.
+    // A low-id removal that sorts after a high-id live match must still remain
+    // suppressed during relevance and non-name sorted searches.
+    esm::MetadataIndex posting_order_index(0);
+    posting_order_index.replace({
+        record(100, L"a-rareposting-key.txt",
+               L"D:\\a-rareposting-key.txt"),
+        record(1, L"z-rareposting-key.txt",
+               L"D:\\z-rareposting-key.txt")});
+    posting_order_index.apply_delta({}, {1});
+    esm::SearchOptions posting_options;
+    posting_options.limit = 10;
+    const auto posting_results =
+        posting_order_index.search(L"rareposting", posting_options);
+    require(posting_results.size() == 1 &&
+                posting_results.front().record.id == 100,
+            "trigram posting scan suppresses removals independent of id order");
 }
 
 
@@ -693,10 +902,9 @@ void test_named_pipe_search() {
     require(result.error == ERROR_SUCCESS, "named pipe client request");
     require(result.response.results.size() == 1 &&
                 result.response.results.front().record.id == 2 &&
-                result.response.results.front().record.size == 13 &&
-                result.response.results.front().record.last_write_time >
-                    116444736000000000ll,
-            "named pipe search hydrates file metadata");
+                result.response.results.front().record.size == 0 &&
+                result.response.results.front().record.last_write_time == 0,
+            "named pipe search avoids blocking filesystem metadata hydration");
     std::filesystem::remove_all(root);
 }
 
@@ -1745,7 +1953,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_simple_query_top_k(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {
@@ -1753,5 +1961,3 @@ int main() {
         return 1;
     }
 }
-
-

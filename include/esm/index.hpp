@@ -83,12 +83,30 @@ private:
         std::uint32_t begin{};
         std::uint32_t end{};
     };
+    struct NameTrigramPostingIndex {
+        std::vector<std::uint32_t> offsets;
+        std::vector<std::uint32_t> record_indices;
+    };
     struct NameSearchAccelerators {
         std::vector<NameGramSignature> bigram_signatures;
-        std::vector<NameGramSignature> trigram_signatures;
+        NameTrigramPostingIndex trigram_postings;
+        // Explicit path: queries are otherwise forced to touch every full
+        // path string. A single trigram Bloom signature per record keeps the
+        // common path-substring case on a contiguous, metadata-only scan.
+        std::vector<NameGramSignature> path_trigram_signatures;
+        // Base records in the exact case-insensitive natural name/path/id
+        // order used by the default GUI sort. Queries can walk this order and
+        // stop after one page instead of sorting every match.
+        std::vector<std::uint32_t> natural_name_order;
         std::vector<std::uint32_t> prefix_order;
         std::vector<NamePrefixRange> prefix_ranges;
         std::vector<NameFirstCharacterRange> first_character_ranges;
+        // Only names whose accent-folded form differs are included here.
+        // This preserves ignore-diacritics prefix semantics without forcing
+        // the common ASCII query path to normalize every catalog entry.
+        std::vector<std::uint32_t> folded_prefix_order;
+        std::vector<NamePrefixRange> folded_prefix_ranges;
+        std::vector<NameFirstCharacterRange> folded_first_character_ranges;
     };
 
     [[nodiscard]] static NameSearchAccelerators
@@ -102,10 +120,15 @@ private:
     std::vector<CompactRecord> records_;
     std::vector<wchar_t> strings_;
     std::vector<NameGramSignature> name_bigram_signatures_;
-    std::vector<NameGramSignature> name_trigram_signatures_;
+    NameTrigramPostingIndex name_trigram_postings_;
+    std::vector<NameGramSignature> path_trigram_signatures_;
+    std::vector<std::uint32_t> natural_name_order_;
     std::vector<std::uint32_t> name_prefix_order_;
     std::vector<NamePrefixRange> name_prefix_ranges_;
     std::vector<NameFirstCharacterRange> name_first_character_ranges_;
+    std::vector<std::uint32_t> folded_name_prefix_order_;
+    std::vector<NamePrefixRange> folded_name_prefix_ranges_;
+    std::vector<NameFirstCharacterRange> folded_name_first_character_ranges_;
     std::unordered_map<std::uint64_t, FileRecord> overlay_;
     std::unordered_set<std::uint64_t> removed_;
     std::vector<std::uint64_t> suppressed_base_ids_;

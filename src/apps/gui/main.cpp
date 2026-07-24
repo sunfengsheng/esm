@@ -41,9 +41,14 @@ constexpr UINT WM_ESM_QUERY_CHANGED = WM_APP + 3;
 constexpr UINT WM_ESM_COLUMN_MENU = WM_APP + 4;
 constexpr UINT WM_ESM_SAVE_SETTINGS = WM_APP + 5;
 constexpr UINT WM_ESM_APPLY_TOPMOST = WM_APP + 6;
+constexpr UINT WM_ESM_METADATA = WM_APP + 7;
 constexpr UINT_PTR SEARCH_TIMER = 1;
-constexpr UINT SEARCH_TIMER_INTERVAL_MS = 50;
-constexpr ULONGLONG SEARCH_DEBOUNCE_MS = 180;
+constexpr UINT SEARCH_TIMER_INTERVAL_MS = 10;
+constexpr ULONGLONG SEARCH_DEBOUNCE_MS = 15;
+constexpr ULONGLONG RESULT_REFINEMENT_DEBOUNCE_MS = 250;
+constexpr ULONGLONG HISTORY_DEBOUNCE_MS = 1000;
+constexpr ULONGLONG METADATA_DEBOUNCE_MS = 250;
+constexpr std::uint32_t INTERACTIVE_RESULT_LIMIT = 200;
 constexpr ULONGLONG SEARCH_RETRY_BASE_MS = 500;
 constexpr ULONGLONG SEARCH_RETRY_MAX_MS = 3000;
 constexpr int HOTKEY_ID = 1;
@@ -162,6 +167,13 @@ struct SearchPayload {
   std::uint64_t generation{};
   std::wstring query;
   esm::PipeSearchResult result;
+  std::uint32_t requested_limit{};
+  bool final_results{true};
+  bool needs_metadata_hydration{};
+};
+struct MetadataPayload {
+  std::uint64_t generation{};
+  std::vector<esm::SearchResult> results;
 };
 struct App {
   HINSTANCE instance{};
@@ -174,6 +186,7 @@ struct App {
   HACCEL accelerators{};
   std::wstring pipe{L"everything_sm_service"};
   std::wstring last_query;
+  std::wstring scheduled_query_text;
   std::vector<esm::SearchResult> results;
   std::vector<std::wstring> history;
   std::filesystem::path history_path;
@@ -196,12 +209,24 @@ struct App {
   bool descending{};
   bool show_preview{};
   bool query_pending{};
+  bool query_pending_final_results{true};
   ULONGLONG query_due_tick{};
+  bool refinement_pending{};
+  ULONGLONG refinement_due_tick{};
+  bool history_pending{};
+  ULONGLONG history_due_tick{};
+  std::wstring pending_history_query;
   bool service_query_in_flight{};
   HANDLE service_query_thread{};
+  bool metadata_pending{};
+  ULONGLONG metadata_due_tick{};
+  bool metadata_in_flight{};
+  HANDLE metadata_thread{};
+  std::shared_ptr<std::atomic_bool> metadata_cancel;
   unsigned service_retry_count{};
   bool closing{};
   HIMAGELIST small_images{}, large_images{}, extra_large_images{};
+  std::unordered_map<std::wstring, int> icon_cache;
   NOTIFYICONDATAW tray{};
 };
 App *app(HWND window) {
@@ -572,13 +597,29 @@ std::wstring type_text(const esm::FileRecord &r) {
   auto ext = std::filesystem::path(r.name).extension().wstring();
   return ext.empty() ? L"文件" : ext.substr(1) + L" 文件";
 }
-int icon(const esm::FileRecord &r) {
+int icon(App &a, const esm::FileRecord &r) {
+  std::wstring key;
+  if (r.directory) {
+    key = L"<folder>";
+  } else {
+    const auto separator = r.name.find_last_of(L".");
+    key = separator == std::wstring::npos ? L"<file>" : r.name.substr(separator);
+    if (!key.empty())
+      CharLowerBuffW(key.data(), static_cast<DWORD>(key.size()));
+  }
+  if (const auto found = a.icon_cache.find(key); found != a.icon_cache.end())
+    return found->second;
+
   SHFILEINFOW info{};
-  DWORD attr = r.directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-  auto value = SHGetFileInfoW(
-      r.directory ? L"folder" : r.name.c_str(), attr, &info, sizeof(info),
+  const DWORD attributes =
+      r.directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+  const wchar_t *lookup = r.directory ? L"folder" : key.c_str();
+  const auto value = SHGetFileInfoW(
+      lookup, attributes, &info, sizeof(info),
       SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
-  return value ? info.iIcon : 0;
+  const int index = value ? info.iIcon : 0;
+  a.icon_cache.emplace(std::move(key), index);
+  return index;
 }
 std::vector<std::size_t> selected(const App &a) {
   std::vector<std::size_t> out;
@@ -1109,9 +1150,10 @@ void resize_window(App &a, int mode) {
 }
 
 
-void search(App &a);
+void search(App &a, bool final_results = true);
 void refresh_menu_state(App &a);
 void apply_results(App &a, SearchPayload &p);
+void start_metadata_hydration(App &a);
 void sort_loaded_results(App &a);
 esm::SortField service_sort_field(esm::SortField field);
 
@@ -1574,10 +1616,29 @@ void cancel_service_query(App &a) {
 }
 
 void schedule_search(App &a) {
-  cancel_service_query(a);
+  // The edit control and its parent combo box can both report one user edit.
+  // Coalesce those notifications before changing the generation or timer.
+  auto current_text = search_text(a);
+  if (current_text == a.scheduled_query_text)
+    return;
+  a.scheduled_query_text = std::move(current_text);
+
+  // Do not cancel the synchronous named-pipe request on every keypress. The
+  // server may still be completing that abandoned request, and a burst of
+  // cancellations can temporarily occupy every pipe worker. Keep at most one
+  // request in flight and let WM_ESM_RESULTS immediately launch the newest
+  // coalesced query instead.
+  ++a.generation; // Invalidate search/metadata work for the previous text now.
+  a.metadata_pending = false;
+  if (a.metadata_cancel) a.metadata_cancel->store(true);
+  a.history_pending = false;
+  a.refinement_pending = false;
   a.service_retry_count = 0;
   a.query_pending = true;
-  a.query_due_tick = GetTickCount64() + SEARCH_DEBOUNCE_MS;
+  a.query_pending_final_results = false;
+  const auto now = GetTickCount64();
+  a.query_due_tick = now + SEARCH_DEBOUNCE_MS;
+  a.refinement_due_tick = now + RESULT_REFINEMENT_DEBOUNCE_MS;
 }
 
 bool retryable_pipe_error(DWORD error) {
@@ -1625,12 +1686,14 @@ std::wstring regex_expression(std::wstring query) {
   }
   return L"regex:\"" + escaped + L"\"";
 }
-void search(App &a) {
+void search(App &a, bool final_results) {
   if (!a.file_list_index && a.service_query_in_flight) {
     a.query_pending = true;
+    a.query_pending_final_results = final_results;
     return;
   }
   a.query_pending = false;
+  a.query_pending_final_results = true;
   auto q = search_text(a);
   const auto filter = filter_expression(a, a.settings.search_filter);
   std::wstring effective = q;
@@ -1638,15 +1701,31 @@ void search(App &a) {
     effective = regex_expression(std::move(effective));
   if (!filter.empty())
     effective = effective.empty() ? filter : L"(" + effective + L") AND " + filter;
-  const auto cache_key = q + L"\x1f" + std::to_wstring(a.settings.search_filter) +
-                         L"\x1f" + (a.settings.regex_mode ? L"1" : L"0") +
-                         L"\x1f" + (a.file_list_index ? a.file_list_path.wstring() : L"service");
+
+  const auto configured_limit = static_cast<std::uint32_t>(std::min(
+      a.settings.result_limit, static_cast<int>(esm::ipc_max_search_results)));
+  const bool partial_results = !final_results && !a.file_list_index &&
+                               configured_limit > INTERACTIVE_RESULT_LIMIT;
+  const bool is_final_results = !partial_results;
+  const auto limit = partial_results
+                         ? std::min(configured_limit, INTERACTIVE_RESULT_LIMIT)
+                         : configured_limit;
+  const auto cache_key =
+      q + L"\x1f" + std::to_wstring(a.settings.search_filter) + L"\x1f" +
+      (a.settings.regex_mode ? L"1" : L"0") + L"\x1f" +
+      (a.file_list_index ? a.file_list_path.wstring() : L"service") + L"\x1f" +
+      (is_final_results ? L"full" : L"interactive");
   if (cache_key == a.last_query)
     return;
   a.last_query = cache_key;
+  if (is_final_results)
+    a.refinement_pending = false;
   apply_topmost(a);
   auto generation = ++a.generation;
   if (effective.empty()) {
+    a.metadata_pending = false;
+    a.refinement_pending = false;
+    a.history_pending = false;
     a.results.clear();
     ListView_SetItemCountEx(a.list, 0, 0);
     status(a, L"\u8bf7\u8f93\u5165\u67e5\u8be2");
@@ -1660,17 +1739,26 @@ void search(App &a) {
   const bool whole_word = a.settings.whole_word;
   const bool match_path = a.settings.match_path;
   const bool match_diacritics = a.settings.match_diacritics;
-  const auto limit = static_cast<std::uint32_t>(std::min(a.settings.result_limit, static_cast<int>(esm::ipc_max_search_results)));
   if (a.file_list_index) {
     SearchPayload payload;
-    payload.query = q; payload.generation = generation;
-    esm::SearchOptions options; options.limit = limit; options.case_sensitive = case_sensitive;
-    options.whole_word = whole_word; options.match_path = match_path;
-    options.match_diacritics = match_diacritics; options.sort = sort; options.descending = descending;
+    payload.query = q;
+    payload.generation = generation;
+    payload.requested_limit = limit;
+    payload.final_results = true;
+    esm::SearchOptions options;
+    options.limit = limit;
+    options.case_sensitive = case_sensitive;
+    options.whole_word = whole_word;
+    options.match_path = match_path;
+    options.match_diacritics = match_diacritics;
+    options.sort = sort;
+    options.descending = descending;
     const auto started = std::chrono::steady_clock::now();
     payload.result.response.results = a.file_list_index->search(effective, options);
     payload.result.response.elapsed_microseconds = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count());
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
     apply_results(a, payload);
     return;
   }
@@ -1678,10 +1766,14 @@ void search(App &a) {
   HWND window = a.window;
   std::thread query_thread(
       [q, effective, pipe, sort, descending, case_sensitive, whole_word,
-       match_path, match_diacritics, limit, generation, window] {
+       match_path, match_diacritics, limit, generation, window,
+       is_final_results] {
         auto p = std::make_unique<SearchPayload>();
         p->query = q;
         p->generation = generation;
+        p->requested_limit = limit;
+        p->final_results = is_final_results;
+        p->needs_metadata_hydration = is_final_results;
         esm::IpcSearchRequest request;
         request.limit = limit;
         request.case_sensitive = case_sensitive;
@@ -1707,6 +1799,47 @@ void search(App &a) {
   }
   query_thread.detach();
 }
+
+void start_metadata_hydration(App &a) {
+  if (!a.metadata_pending || a.metadata_in_flight || a.query_pending ||
+      a.service_query_in_flight || a.closing || a.results.empty()) {
+    return;
+  }
+
+  const auto generation = a.generation.load();
+  auto results = a.results;
+  const HWND window = a.window;
+  auto cancel = std::make_shared<std::atomic_bool>(false);
+  a.metadata_cancel = cancel;
+  a.metadata_pending = false;
+  a.metadata_in_flight = true;
+  std::thread metadata_thread(
+      [generation, window, cancel, results = std::move(results)]() mutable {
+        for (auto &result : results) {
+          if (cancel->load()) break;
+          (void)esm::hydrate_file_metadata(result.record);
+        }
+        auto payload = std::make_unique<MetadataPayload>();
+        payload->generation = generation;
+        payload->results = std::move(results);
+        if (PostMessageW(window, WM_ESM_METADATA, 0,
+                         reinterpret_cast<LPARAM>(payload.get()))) {
+          payload.release();
+        }
+      });
+
+  HANDLE thread_handle = nullptr;
+  if (DuplicateHandle(GetCurrentProcess(),
+                      reinterpret_cast<HANDLE>(metadata_thread.native_handle()),
+                      GetCurrentProcess(), &thread_handle, 0, FALSE,
+                      DUPLICATE_SAME_ACCESS)) {
+    if (a.metadata_thread)
+      CloseHandle(a.metadata_thread);
+    a.metadata_thread = thread_handle;
+  }
+  metadata_thread.detach();
+}
+
 void apply_results(App &a, SearchPayload &p) {
   if (p.generation != a.generation.load())
     return;
@@ -1717,6 +1850,7 @@ void apply_results(App &a, SearchPayload &p) {
         const bool busy = p.result.error == ERROR_SEM_TIMEOUT ||
                           p.result.error == ERROR_PIPE_BUSY;
         a.service_connected = busy;
+        a.query_pending_final_results = p.final_results;
         schedule_service_retry(a);
         status(a, busy
                       ? L"\u641c\u7d22\u670d\u52a1\u7e41\u5fd9\uff0c"
@@ -1743,17 +1877,35 @@ void apply_results(App &a, SearchPayload &p) {
     for (auto &result : a.results)
       (void)esm::hydrate_file_metadata(result.record);
   }
+  a.metadata_pending = p.needs_metadata_hydration && !a.results.empty();
+  if (a.metadata_pending)
+    a.metadata_due_tick = GetTickCount64() + METADATA_DEBOUNCE_MS;
+
+  a.refinement_pending =
+      !p.final_results && p.requested_limit <
+                              static_cast<std::uint32_t>(a.settings.result_limit) &&
+      a.results.size() >= p.requested_limit;
+  if (p.final_results) {
+    a.pending_history_query = p.query;
+    a.history_pending = !p.query.empty();
+    a.history_due_tick = GetTickCount64() + HISTORY_DEBOUNCE_MS;
+  }
+
   sort_loaded_results(a);
-  ListView_SetItemCountEx(a.list, (int)a.results.size(),
+  ListView_SetItemCountEx(a.list, static_cast<int>(a.results.size()),
                           LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
   InvalidateRect(a.list, nullptr, FALSE);
-  std::wostringstream s;
-  s << a.results.size() << L" 个结果，" << std::fixed << std::setprecision(2)
-    << (double)p.result.response.elapsed_microseconds / 1000 << L" ms";
-  status(a, s.str());
-  remember(a, p.query);
+  std::wostringstream output;
+  output << a.results.size();
+  if (!p.final_results && a.results.size() >= p.requested_limit)
+    output << L"+";
+  output << L" \u4e2a\u7ed3\u679c\uff0c" << std::fixed << std::setprecision(2)
+         << static_cast<double>(p.result.response.elapsed_microseconds) / 1000
+         << L" ms";
+  status(a, output.str());
   refresh_menu_state(a);
 }
+
 void update_sort_arrows(App &a, int selected_column) {
   HWND header = ListView_GetHeader(a.list);
   int count = Header_GetItemCount(header);
@@ -2018,7 +2170,12 @@ RunHistoryEntry run_history_for(const App &a, const esm::FileRecord &record) {
 }
 
 void sort_loaded_results(App &a) {
-  if (a.sort == esm::SortField::relevance) return;
+  // Service results already arrive in the requested order. Re-sorting them on
+  // the UI thread for every keystroke adds work and delays edit painting.
+  if (!a.file_list_index && service_sort_field(a.sort) == a.sort)
+    return;
+  if (a.sort == esm::SortField::relevance)
+    return;
   const auto compare_text = [&](std::wstring_view left, std::wstring_view right) {
     return natural_compare_gui(left, right, a.settings.case_sensitive,
                                a.settings.match_diacritics);
@@ -2674,7 +2831,7 @@ LRESULT notify(App &a, NMHDR *h) {
     auto &r = a.results[i].record;
     static thread_local std::wstring value;
     if (d->item.mask & LVIF_IMAGE)
-      d->item.iImage = icon(r);
+      d->item.iImage = icon(a, r);
     if (!(d->item.mask & LVIF_TEXT))
       return 0;
     if (d->item.iSubItem < 0 ||
@@ -2987,19 +3144,33 @@ LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
       PostMessageW(w, WM_ESM_APPLY_TOPMOST, 0, 0);
     break;
   case WM_TIMER:
-    if (a && wp == SEARCH_TIMER && a->query_pending &&
-        GetTickCount64() >= a->query_due_tick)
-      search(*a);
+    if (a && wp == SEARCH_TIMER) {
+      const auto now = GetTickCount64();
+      if (a->query_pending && now >= a->query_due_tick)
+        search(*a, a->query_pending_final_results);
+      if (a->refinement_pending && now >= a->refinement_due_tick &&
+          !a->query_pending && !a->service_query_in_flight) {
+        a->refinement_pending = false;
+        search(*a, true);
+      }
+      if (a->metadata_pending && now >= a->metadata_due_tick)
+        start_metadata_hydration(*a);
+      if (a->history_pending && now >= a->history_due_tick &&
+          !a->query_pending && !a->service_query_in_flight &&
+          search_text(*a) == a->pending_history_query) {
+        auto query = std::move(a->pending_history_query);
+        a->history_pending = false;
+        remember(*a, query);
+      }
+    }
     return 0;
   case WM_HOTKEY:
     if (a)
       show(*a);
     return 0;
   case WM_ESM_QUERY_CHANGED:
-    if (a) {
-      a->last_query.clear();
+    if (a)
       schedule_search(*a);
-    }
     return 0;
   case WM_ESM_COLUMN_MENU:
     if (a)
@@ -3425,7 +3596,31 @@ LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
       if (!superseded)
         apply_results(*a, *p);
       if (a->query_pending && GetTickCount64() >= a->query_due_tick)
-        search(*a);
+        search(*a, a->query_pending_final_results);
+    }
+    return 0;
+  }
+  case WM_ESM_METADATA: {
+    std::unique_ptr<MetadataPayload> p((MetadataPayload *)lp);
+    if (a) {
+      a->metadata_in_flight = false;
+      if (a->metadata_thread) {
+        CloseHandle(a->metadata_thread);
+        a->metadata_thread = nullptr;
+      }
+      a->metadata_cancel.reset();
+      if (!a->closing && p->generation == a->generation.load() &&
+          !a->query_pending && !a->service_query_in_flight) {
+        a->results = std::move(p->results);
+        sort_loaded_results(*a);
+        ListView_SetItemCountEx(a->list, static_cast<int>(a->results.size()),
+                                LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+        InvalidateRect(a->list, nullptr, FALSE);
+      }
+      if (a->metadata_pending &&
+          GetTickCount64() >= a->metadata_due_tick) {
+        start_metadata_hydration(*a);
+      }
     }
     return 0;
   }
@@ -3458,10 +3653,15 @@ LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
       save_settings(*a, true, true);
       a->closing = true;
       ++a->generation;
+      if (a->metadata_cancel) a->metadata_cancel->store(true);
       cancel_service_query(*a);
       if (a->service_query_thread) {
         CloseHandle(a->service_query_thread);
         a->service_query_thread = nullptr;
+      }
+      if (a->metadata_thread) {
+        CloseHandle(a->metadata_thread);
+        a->metadata_thread = nullptr;
       }
       KillTimer(w, SEARCH_TIMER);
       UnregisterHotKey(w, HOTKEY_ID);

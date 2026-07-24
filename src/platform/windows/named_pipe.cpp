@@ -1,5 +1,4 @@
 #include "esm/named_pipe.hpp"
-#include "esm/file_metadata.hpp"
 
 #include <windows.h>
 #include <sddl.h>
@@ -210,12 +209,10 @@ std::uint32_t serve_named_pipe_search_once(std::wstring_view pipe_name,
             options.descending = request.descending;
             const auto started = std::chrono::steady_clock::now();
             response.results = index.search(request.query, options);
-            // The fast MFT name enumeration does not contain file size or the
-            // current last-write timestamp. Hydrate only returned rows so the
-            // GUI gets real metadata without stat-ing the complete catalog.
-            for (auto& result : response.results) {
-                (void)hydrate_file_metadata(result.record);
-            }
+            // Keep the query hot path metadata-only. Filesystem stat calls can
+            // block on sleeping disks, unavailable volumes, cloud placeholders,
+            // or antivirus and must not delay the first result batch. The GUI
+            // hydrates returned rows asynchronously after typing settles.
             response.elapsed_microseconds = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - started).count());

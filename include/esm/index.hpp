@@ -43,6 +43,8 @@ struct MetadataIndexStorageStats {
     std::size_t record_bytes{};
     std::size_t string_bytes{};
     std::size_t signature_bytes{};
+    std::size_t path_signature_count{};
+    std::size_t path_signature_owner_bytes{};
     std::size_t posting_entries{};
     std::size_t posting_bytes{};
     std::size_t ordering_bytes{};
@@ -120,7 +122,11 @@ private:
         // Explicit path: queries are otherwise forced to touch every full
         // path string. A single trigram Bloom signature per record keeps the
         // common path-substring case on a contiguous, metadata-only scan.
+        // Full directory path signatures are shared by all direct children.
+        // Each base record stores only a 32-bit owner index instead of a
+        // separate 256-bit full-path signature.
         std::vector<PathTrigramSignature> path_trigram_signatures;
+        std::vector<std::uint32_t> path_signature_owners;
         // Base records in the exact case-insensitive natural name/path/id
         // order used by the default GUI sort. Queries can walk this order and
         // stop after one page instead of sorting every match.
@@ -153,6 +159,7 @@ private:
     std::vector<NameBigramSignature> name_bigram_signatures_;
     NameTrigramPostingIndex name_trigram_postings_;
     std::vector<PathTrigramSignature> path_trigram_signatures_;
+    std::vector<std::uint32_t> path_signature_owners_;
     std::vector<std::uint32_t> natural_name_order_;
     std::vector<std::uint32_t> name_prefix_order_;
     std::vector<NamePrefixRange> name_prefix_ranges_;

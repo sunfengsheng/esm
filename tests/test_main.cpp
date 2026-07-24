@@ -356,6 +356,52 @@ void test_index_componentized_path_fallback_and_compaction() {
             "componentized path survives overlay compaction");
 }
 
+void test_shared_directory_path_signatures() {
+    esm::MetadataIndex index;
+    auto root = record(1, L"shared", L"D:\\shared");
+    root.directory = true;
+    root.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    auto branch = record(2, L"branch", L"D:\\shared\\branch");
+    branch.parent_id = 1;
+    branch.directory = true;
+    branch.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    auto needle = record(3, L"needle.txt",
+                         L"D:\\shared\\branch\\needle.txt");
+    needle.parent_id = 2;
+    auto other = record(4, L"other.log",
+                        L"D:\\shared\\branch\\other.log");
+    other.parent_id = 2;
+    std::vector<esm::FileRecord> records;
+    records.push_back(std::move(root));
+    records.push_back(std::move(branch));
+    records.push_back(std::move(needle));
+    records.push_back(std::move(other));
+    index.replace(std::move(records));
+
+    const auto stats = index.storage_stats();
+    require(stats.path_signature_count < stats.base_records,
+            "directory path signatures are shared by child files");
+    require(stats.path_signature_owner_bytes >=
+                stats.base_records * sizeof(std::uint32_t),
+            "each base record stores a compact path signature owner");
+
+    auto results = index.search(L"path:shared");
+    require(results.size() == 4,
+            "shared parent signature preserves ancestor path matches");
+    results = index.search(L"path:branch");
+    require(results.size() == 3,
+            "shared parent signature preserves direct directory matches");
+    results = index.search(L"path:needle");
+    require(results.size() == 1 && results.front().record.id == 3,
+            "name signature preserves filename path matches");
+    results = index.search(L"path:\"shared\\branch\"");
+    require(results.size() == 3,
+            "separator path query falls back without false negatives");
+    results = index.search(L"path:shared path:needle");
+    require(results.size() == 1 && results.front().record.id == 3,
+            "multiple mandatory path terms preserve mixed parent/name match");
+}
+
 void test_compressed_trigram_postings() {
     constexpr std::size_t record_count = 16'384;
     esm::MetadataIndex index;
@@ -2062,7 +2108,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

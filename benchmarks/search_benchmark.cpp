@@ -132,6 +132,11 @@ int main(int argc, char** argv) {
               << " base_string_mb="
               << static_cast<double>(base_stats.string_bytes) /
                      (1024.0 * 1024.0)
+              << " base_path_signature_count="
+              << base_stats.path_signature_count
+              << " base_path_signature_owner_mb="
+              << static_cast<double>(base_stats.path_signature_owner_bytes) /
+                     (1024.0 * 1024.0)
               << " base_posting_entries=" << base_stats.posting_entries
               << " base_posting_bytes_per_entry="
               << (base_stats.posting_entries == 0

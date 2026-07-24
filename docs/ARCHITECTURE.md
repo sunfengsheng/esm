@@ -114,9 +114,13 @@ v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视�
 - 父记录缺失、父记录不是目录或路径形状不匹配时保留完整路径作为正确性回退；
 - 增量 overlay 暂时保留完整 `FileRecord`，compaction 后重新执行路径组件化。
 
-rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 通过打包目录、路径模式和属性标志保持约 48 字节/记录；名称 bigram Bloom 使用 128 位/记录，路径 trigram Bloom 使用 256 位/记录。
+rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 通过打包目录、路径模式和属性标志保持约 48 字节/记录；名称 bigram Bloom 使用 128 位/记录。
 
-Catalog 与 MetadataIndex 尚未完全共享名称和节点元数据；posting、签名和两套基础节点仍是后续 memory-map/压缩重点。
+完整路径 Bloom 不再按记录重复保存。每个目录拥有一份 256 位完整目录路径 trigram 签名，每条基础记录保存一个 32 位 `path_signature_owner`：普通文件指向父目录签名，目录指向父目录签名；无法可靠关联父目录的 orphan/异常路径保存独立回退签名。对于不含路径分隔符的 mandatory `path:` 词，候选必须满足“文件名签名可能命中，或父路径签名可能命中”；含 `\`、`/`、`:` 的词跳过共享签名过滤，最终始终由完整 evaluator 校验，避免跨组件 false negative。
+
+名称 trigram posting 使用两遍直接编码：第一遍统计每个 bucket 的 entry 数和 delta/varint 字节数，计算最终 byte offsets；第二遍直接写入最终 `encoded_positions`。构建过程不再保留一份完整的临时 `uint32_t posting_positions`。
+
+Catalog 与 MetadataIndex 尚未完全共享名称和节点元数据；当前 snapshot 加载也仍先物化完整 `vector<FileRecord>`。两套基础节点、UTF-16 arena、构建峰值和搜索结构持久化仍是后续 memory-map/压缩重点。
 
 ## 6. 名称 trigram 倒排索引
 

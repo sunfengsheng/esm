@@ -108,19 +108,22 @@ v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视�
 
 `MetadataIndex` 提供可搜索记录和查询执行。基础层不再为每个条目都保存完整路径：
 
-- 能验证父节点为目录且路径关系一致的普通目录和文件，都只保存名称、`parent_id` 和紧凑元数据；
+- 能验证父节点为目录且路径关系一致的普通目录和文件，都只保存名称、31 位 `parent_index` 和紧凑元数据；
+- `parent_index` 直接指向按 ID 排序的基础记录，父链遍历为 O(1)/层；父记录缺失时使用按记录 ID 排序的稀疏 `ParentIdAnchor` 保存原始 64 位父 ID；
 - 卷根、父记录缺失、父记录不是目录、循环或路径形状不匹配的记录保留完整路径锚点；
 - 查询、排序和结果物化时沿最多 512 层父链回溯到完整路径锚点，再顺序拼接目录/文件名；
 - 纯名称查询不读取完整路径，只有 `match_path` 或显式 `path:` 条件才执行父链重建；
-- 增量 overlay 暂时保留完整 `FileRecord`，compaction 后重新执行路径组件化。
+- 增量 overlay 暂时保留完整 `FileRecord`，compaction 后重新排序基础记录、重建父索引并执行路径组件化。
 
-rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 通过打包目录、路径模式和属性标志保持约 48 字节/记录；名称 bigram Bloom 使用 128 位/记录。
+rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 固定为 40 字节：包含 64 位 ID、大小和修改时间，32 位属性和字符串 offset，16 位路径/名称长度，以及打包在 32 位中的 31 位父记录索引和 1 位 name-only 标志。目录状态直接从 Windows 属性位推导；名称 bigram Bloom 使用 128 位/记录。
 
-完整路径 Bloom 不再按记录重复保存。每个目录拥有一份 256 位完整目录路径 trigram 签名，每条基础记录保存一个 32 位 `path_signature_owner`：普通文件指向父目录签名，目录指向父目录签名；无法可靠关联父目录的 orphan/异常路径保存独立回退签名。对于不含路径分隔符的 mandatory `path:` 词，候选必须满足“文件名签名可能命中，或父路径签名可能命中”；含 `\`、`/`、`:` 的词跳过共享签名过滤，最终始终由完整 evaluator 校验，避免跨组件 false negative。
+完整路径 Bloom 不再按记录重复保存。每个目录拥有一份 256 位完整目录路径 trigram 签名；`directory_signature_bits` 标记目录记录，`directory_signature_rank_prefix` 通过 rank 把目录记录索引映射到签名索引。普通文件直接通过 `parent_index` 推导共享的父目录签名，不再保存每记录 32 位 owner；只有 orphan、父项异常或完整路径不能由父目录加名称表达的文件才保存稀疏 `PathSignatureFallback`。该 owner 元数据从 O(4N) 数组变为 bitset/rank + sparse fallback。对于不含路径分隔符的 mandatory `path:` 词，候选必须满足“文件名签名可能命中，或共享路径签名可能命中”；含 `\`、`/`、`:` 的词跳过共享签名过滤，最终始终由完整 evaluator 校验，避免跨组件 false negative。
 
 名称 trigram posting 使用两遍直接编码：第一遍统计每个 bucket 的 entry 数和 delta/varint 字节数，计算最终 byte offsets；第二遍直接写入最终 `encoded_positions`。构建过程不再保留一份完整的临时 `uint32_t posting_positions`。
 
-默认多卷 `mft-auto` 路径不再长期保留每卷 `NtfsCatalog`：初始 MFT 记录命名空间化后直接构建全局 `MetadataIndex`，后续 `MetadataIndex::apply_ntfs_changes` 直接处理 raw USN create/update/rename/delete，并在目录重命名时刷新受影响后代。单卷 live/snapshot/WAL 路径仍使用 `NtfsCatalog`。当前 snapshot 加载仍先物化完整 `vector<FileRecord>`；UTF-16 arena、构建峰值、紧凑记录布局和搜索结构持久化仍是后续 memory-map/压缩重点。
+默认多卷 `mft-auto` 路径不再长期保留每卷 `NtfsCatalog`：初始 MFT 记录命名空间化后直接构建全局 `MetadataIndex`，后续 `MetadataIndex::apply_ntfs_changes` 直接处理 raw USN create/update/rename/delete，并在目录重命名时刷新受影响后代。单卷 live/snapshot/WAL 路径仍使用 `NtfsCatalog`。当前 snapshot 加载仍先物化完整 `vector<FileRecord>`；UTF-16 arena、约 2.30 GiB 构建峰值、排序索引和搜索结构持久化仍是后续 memory-map/压缩重点。
+
+多卷全量 reconciliation 并行枚举各卷，但不再把结果逐卷直接追加到未预留容量的总 vector。协调器先持有已完成的每卷结果，求和得到最终记录数，对统一 `vector<FileRecord>` 一次性 `reserve`，再移动合并，并在每卷 move-insert 后立即释放源记录 buffer，从而消除 C:/D:/E: 追加过程中的大块中间 buffer。索引替换和 snapshot 阶段结束后调用 `_heapmin` 释放 CRT heap 中完全空闲的 region，再调用 `HeapCompact`；该路径降低 Private Bytes，不执行 Working Set trim。
 
 ## 6. 名称 trigram 倒排索引
 

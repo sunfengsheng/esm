@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cwctype>
 #include <functional>
 #include <limits>
@@ -242,28 +243,39 @@ MetadataIndex::build_name_search_accelerators(
 
     const auto record_path = [&](std::size_t index,
                                  std::wstring& scratch) -> std::wstring_view {
+        const auto stored_path = [&](const CompactRecord& item) {
+            return std::wstring_view(strings.data() + item.path_offset,
+                                     item.path_length);
+        };
         const auto& record = records[index];
-        const std::wstring_view stored(strings.data() + record.path_offset,
-                                       record.path_length);
-        if (!record.name_only_path) return stored;
+        if (!record.name_only_path) return stored_path(record);
 
-        const auto parent = std::lower_bound(
-            records.begin(), records.end(), record.parent_id,
-            [](const CompactRecord& candidate, std::uint64_t id) {
-                return candidate.id < id;
-            });
-        if (parent == records.end() || parent->id != record.parent_id ||
-            parent->name_only_path) {
-            return stored;
+        constexpr std::size_t maximum_components = 512;
+        std::array<std::size_t, maximum_components> components{};
+        std::size_t component_count = 0;
+        std::size_t current_index = index;
+        while (records[current_index].name_only_path &&
+               component_count < components.size()) {
+            components[component_count++] = current_index;
+            const auto parent_index = records[current_index].parent_index;
+            if (parent_index == missing_parent_index ||
+                parent_index >= records.size() ||
+                parent_index == current_index) {
+                return stored_path(record);
+            }
+            current_index = parent_index;
         }
-        const std::wstring_view parent_path(
-            strings.data() + parent->path_offset, parent->path_length);
-        scratch.assign(parent_path);
-        if (!scratch.ends_with(L"\\") && !scratch.ends_with(L"/")) {
-            scratch.push_back(L'\\');
+        if (records[current_index].name_only_path) return stored_path(record);
+
+        scratch.assign(stored_path(records[current_index]));
+        while (component_count != 0) {
+            const auto& component = records[components[--component_count]];
+            if (!scratch.ends_with(L"\\") && !scratch.ends_with(L"/")) {
+                scratch.push_back(L'\\');
+            }
+            scratch.append(strings.data() + component.name_offset(),
+                           component.name_length());
         }
-        scratch.append(strings.data() + record.name_offset,
-                       record.name_length());
         return scratch;
     };
 
@@ -285,7 +297,7 @@ MetadataIndex::build_name_search_accelerators(
     for (std::size_t record_index = 0; record_index < records.size();
          ++record_index) {
         const auto& record = records[record_index];
-        const std::wstring_view name(strings.data() + record.name_offset,
+        const std::wstring_view name(strings.data() + record.name_offset(),
                                      record.name_length());
         if (!name.empty()) {
             const auto key = name_prefix_key(name);
@@ -329,20 +341,18 @@ MetadataIndex::build_name_search_accelerators(
     }
 
     // A path term without a separator must be contained either in the
-    // record name or in its parent directory path. Share one 256-bit path
-    // signature per directory and keep only a 32-bit owner per record. This
-    // avoids a separate full-path signature for every file while preserving
-    // the no-false-negative property used by the query evaluator.
+    // record name or in its parent directory path. Keep one 256-bit signature
+    // per directory. A compact directory bitset plus prefix ranks derives the
+    // signature index for directories and ordinary children; only unusual
+    // full-path file anchors need a sparse explicit owner.
     constexpr auto invalid_signature_owner =
         std::numeric_limits<std::uint32_t>::max();
-    std::vector<std::uint32_t> directory_signature_indices(
-        records.size(), invalid_signature_owner);
-    accelerators.path_signature_owners.resize(
-        records.size(), invalid_signature_owner);
-    accelerators.path_trigram_signatures.reserve(
-        static_cast<std::size_t>(std::count_if(
-            records.begin(), records.end(),
-            [](const CompactRecord& record) { return record.directory; })));
+    const auto directory_count = static_cast<std::size_t>(std::count_if(
+        records.begin(), records.end(),
+        [](const CompactRecord& record) { return record.directory(); }));
+    accelerators.directory_signature_bits.assign(
+        (records.size() + 63U) / 64U, 0);
+    accelerators.path_trigram_signatures.reserve(directory_count);
 
     const auto make_path_signature = [&](std::wstring_view path) {
         PathTrigramSignature signature{};
@@ -359,45 +369,39 @@ MetadataIndex::build_name_search_accelerators(
         if (std::any_of(path.begin(), path.end(),
                         [](wchar_t ch) { return ch >= 0x80; })) {
             const auto folded = normalize_match_text(path, false, false);
-            bool differs = folded.size() != path.size();
-            if (!differs) {
-                for (std::size_t offset = 0; offset < path.size(); ++offset) {
-                    if (folded[offset] != normalize_char(path[offset], false)) {
-                        differs = true;
-                        break;
-                    }
-                }
-            }
-            if (differs) add_path_trigrams(folded);
+            add_path_trigrams(folded);
         }
         return signature;
     };
 
     for (std::size_t record_index = 0; record_index < records.size();
          ++record_index) {
-        if (!records[record_index].directory) continue;
+        const auto& record = records[record_index];
+        if (!record.directory()) continue;
+        accelerators.directory_signature_bits[record_index >> 6U] |=
+            std::uint64_t{1} << (record_index & 63U);
         std::wstring path_scratch;
-        const auto path = record_path(record_index, path_scratch);
-        if (accelerators.path_trigram_signatures.size() >=
-            invalid_signature_owner) {
-            throw std::length_error("path signature index exceeds 32 bits");
-        }
-        directory_signature_indices[record_index] =
-            static_cast<std::uint32_t>(
-                accelerators.path_trigram_signatures.size());
         accelerators.path_trigram_signatures.push_back(
-            make_path_signature(path));
+            make_path_signature(record_path(record_index, path_scratch)));
+    }
+    accelerators.directory_signature_rank_prefix.resize(
+        accelerators.directory_signature_bits.size() + 1U);
+    for (std::size_t word = 0;
+         word < accelerators.directory_signature_bits.size(); ++word) {
+        accelerators.directory_signature_rank_prefix[word + 1U] =
+            accelerators.directory_signature_rank_prefix[word] +
+            static_cast<std::uint32_t>(std::popcount(
+                accelerators.directory_signature_bits[word]));
     }
 
     const auto path_uses_parent = [&](std::size_t record_index,
                                       std::size_t parent_index) {
         const auto& record = records[record_index];
-        if (record.name_only_path) return true;
         std::wstring parent_scratch;
         std::wstring record_scratch;
         const auto parent_path = record_path(parent_index, parent_scratch);
         const auto path = record_path(record_index, record_scratch);
-        const std::wstring_view name(strings.data() + record.name_offset,
+        const std::wstring_view name(strings.data() + record.name_offset(),
                                      record.name_length());
         if (path.size() < name.size() || !path.ends_with(name)) return false;
         const auto prefix_length = path.size() - name.size();
@@ -414,46 +418,24 @@ MetadataIndex::build_name_search_accelerators(
     for (std::size_t record_index = 0; record_index < records.size();
          ++record_index) {
         const auto& record = records[record_index];
-        if (record.parent_id != 0) {
-            const auto parent = std::lower_bound(
-                records.begin(), records.end(), record.parent_id,
-                [](const CompactRecord& candidate, std::uint64_t id) {
-                    return candidate.id < id;
-                });
-            if (parent != records.end() && parent->id == record.parent_id &&
-                parent->directory) {
-                const auto parent_index = static_cast<std::size_t>(
-                    std::distance(records.begin(), parent));
-                const auto signature_index =
-                    directory_signature_indices[parent_index];
-                if (signature_index != invalid_signature_owner &&
-                    path_uses_parent(record_index, parent_index)) {
-                    accelerators.path_signature_owners[record_index] =
-                        signature_index;
-                    continue;
-                }
-            }
-        }
-
-        if (record.directory &&
-            directory_signature_indices[record_index] !=
-                invalid_signature_owner) {
-            accelerators.path_signature_owners[record_index] =
-                directory_signature_indices[record_index];
+        if (record.directory()) continue;
+        if (record.parent_index != missing_parent_index &&
+            record.parent_index < records.size() &&
+            records[record.parent_index].directory() &&
+            path_uses_parent(record_index, record.parent_index)) {
             continue;
         }
-
-        std::wstring path_scratch;
-        const auto path = record_path(record_index, path_scratch);
         if (accelerators.path_trigram_signatures.size() >=
             invalid_signature_owner) {
             throw std::length_error("path signature index exceeds 32 bits");
         }
-        accelerators.path_signature_owners[record_index] =
-            static_cast<std::uint32_t>(
-                accelerators.path_trigram_signatures.size());
+        std::wstring path_scratch;
+        const auto signature_index = static_cast<std::uint32_t>(
+            accelerators.path_trigram_signatures.size());
         accelerators.path_trigram_signatures.push_back(
-            make_path_signature(path));
+            make_path_signature(record_path(record_index, path_scratch)));
+        accelerators.path_signature_fallbacks.push_back({
+            static_cast<std::uint32_t>(record_index), signature_index});
     }
     accelerators.path_trigram_signatures.shrink_to_fit();
 
@@ -510,7 +492,7 @@ MetadataIndex::build_name_search_accelerators(
     for (std::size_t index = 0; index < records.size(); ++index) {
         const auto& record = records[index];
         natural_name_prefixes[index] = natural_name_sort_prefix(
-            std::wstring_view(strings.data() + record.name_offset,
+            std::wstring_view(strings.data() + record.name_offset(),
                               record.name_length()));
     }
     const auto natural_name_before =
@@ -524,9 +506,9 @@ MetadataIndex::build_name_search_accelerators(
             const auto& left = records[left_index];
             const auto& right = records[right_index];
             const std::wstring_view left_name(
-                strings.data() + left.name_offset, left.name_length());
+                strings.data() + left.name_offset(), left.name_length());
             const std::wstring_view right_name(
-                strings.data() + right.name_offset, right.name_length());
+                strings.data() + right.name_offset(), right.name_length());
             int order = natural_compare(left_name, right_name, false);
             if (!order) {
                 std::wstring left_path_scratch;
@@ -668,7 +650,7 @@ MetadataIndex::build_name_search_accelerators(
             };
 
             const auto& record = records[record_index];
-            const std::wstring_view name(strings.data() + record.name_offset,
+            const std::wstring_view name(strings.data() + record.name_offset(),
                                          record.name_length());
             visit_value(name);
             if (std::any_of(name.begin(), name.end(),
@@ -779,21 +761,18 @@ void MetadataIndex::compact_base_paths(
                                  record.path_length);
     };
     const auto stored_name = [&](const CompactRecord& record) {
-        return std::wstring_view(strings.data() + record.name_offset,
+        return std::wstring_view(strings.data() + record.name_offset(),
                                  record.name_length());
     };
     for (std::size_t index = 0; index < records.size(); ++index) {
         const auto& record = records[index];
         bool can_store_name_only = false;
-        if (record.parent_id != 0 && record.parent_id != record.id) {
-            const auto parent = std::lower_bound(
-                records.begin(), records.end(), record.parent_id,
-                [](const CompactRecord& candidate, std::uint64_t id) {
-                    return candidate.id < id;
-                });
-            if (parent != records.end() && parent->id == record.parent_id &&
-                parent->directory) {
-                const auto parent_path = stored_path(*parent);
+        if (record.parent_index != missing_parent_index &&
+            record.parent_index < records.size() &&
+            record.parent_index != index) {
+            const auto& parent = records[record.parent_index];
+            if (parent.directory()) {
+                const auto parent_path = stored_path(parent);
                 const auto path = stored_path(record);
                 const auto name = stored_name(record);
                 if (path.size() >= name.size() && path.ends_with(name)) {
@@ -833,19 +812,51 @@ void MetadataIndex::compact_base_paths(
                                    name.end());
             record.path_offset = offset;
             record.path_length = static_cast<std::uint32_t>(name.size());
-            record.name_offset = offset;
             record.name_only_path = true;
         } else {
-            const auto relative_name = record.name_offset - record.path_offset;
             compact_strings.insert(compact_strings.end(), path.begin(),
                                    path.end());
             record.path_offset = offset;
             record.path_length = static_cast<std::uint32_t>(path.size());
-            record.name_offset = offset + relative_name;
             record.name_only_path = false;
         }
     }
     strings.swap(compact_strings);
+}
+
+void MetadataIndex::finalize_pending_records(
+    std::vector<PendingCompactRecord>& pending,
+    std::vector<CompactRecord>& records,
+    std::vector<ParentIdAnchor>& parent_id_anchors) {
+    if (pending.size() >= missing_parent_index) {
+        throw std::length_error("compact parent index exceeds 31 bits");
+    }
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingCompactRecord& a,
+                 const PendingCompactRecord& b) {
+                  return a.record.id < b.record.id;
+              });
+    records.clear();
+    records.reserve(pending.size());
+    parent_id_anchors.clear();
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        auto& item = pending[index];
+        const auto parent = std::lower_bound(
+            pending.begin(), pending.end(), item.parent_id,
+            [](const PendingCompactRecord& candidate, std::uint64_t id) {
+                return candidate.record.id < id;
+            });
+        if (parent != pending.end() && parent->record.id == item.parent_id) {
+            item.record.parent_index = static_cast<std::uint32_t>(
+                std::distance(pending.begin(), parent));
+        } else {
+            item.record.parent_index = missing_parent_index;
+            if (item.parent_id != 0) {
+                parent_id_anchors.push_back({item.record.id, item.parent_id});
+            }
+        }
+        records.push_back(item.record);
+    }
 }
 
 void MetadataIndex::replace(const std::vector<FileRecord>& source) {
@@ -861,26 +872,46 @@ void MetadataIndex::replace_impl(
     std::vector<FileRecord>* consumable_source) {
     std::size_t total_chars = 0;
     for (const auto& item : source) total_chars += item.path.size();
-    if (total_chars > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("string arena exceeds 32-bit offsets");
+    if (total_chars > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("string arena exceeds 32-bit offsets");
+    }
+    std::vector<PendingCompactRecord> pending;
     std::vector<CompactRecord> records;
+    std::vector<ParentIdAnchor> parent_id_anchors;
     std::vector<wchar_t> strings;
-    records.reserve(source.size()); strings.reserve(total_chars);
+    pending.reserve(source.size());
+    strings.reserve(total_chars);
     for (const auto& item : source) {
-        CompactRecord record;
-        record.id = item.id; record.parent_id = item.parent_id; record.size = item.size; record.last_write_time = item.last_write_time;
-        record.attributes = item.attributes; record.directory = item.directory;
-        record.path_offset = static_cast<std::uint32_t>(strings.size()); record.path_length = static_cast<std::uint32_t>(item.path.size());
+        if (item.path.size() > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::length_error("path exceeds compact 16-bit length");
+        }
+        PendingCompactRecord pending_record;
+        auto& record = pending_record.record;
+        record.id = item.id;
+        pending_record.parent_id = item.parent_id;
+        record.size = item.size;
+        record.last_write_time = item.last_write_time;
+        record.attributes = item.directory
+            ? item.attributes | 0x10U : item.attributes & ~0x10U;
+        record.path_offset = static_cast<std::uint32_t>(strings.size());
+        record.path_length = static_cast<std::uint32_t>(item.path.size());
         strings.insert(strings.end(), item.path.begin(), item.path.end());
         std::size_t relative_name = item.path.size();
-        if (!item.name.empty() && item.path.size() >= item.name.size() && item.path.ends_with(item.name)) relative_name = item.path.size() - item.name.size();
-        else { const auto slash = item.path.find_last_of(L"\\/"); relative_name = slash == std::wstring::npos ? 0 : slash + 1; }
-        record.name_offset = record.path_offset + static_cast<std::uint32_t>(relative_name);
-        records.push_back(record);
+        if (!item.name.empty() && item.path.size() >= item.name.size() &&
+            item.path.ends_with(item.name)) {
+            relative_name = item.path.size() - item.name.size();
+        } else {
+            const auto slash = item.path.find_last_of(L"\\/");
+            relative_name = slash == std::wstring::npos ? 0 : slash + 1;
+        }
+        const auto name_length = item.path.size() - relative_name;
+        if (name_length > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::length_error("name exceeds compact 16-bit length");
+        }
+        record.name_length_value = static_cast<std::uint32_t>(name_length);
+        pending.push_back(pending_record);
     }
-    std::sort(records.begin(), records.end(),
-              [](const CompactRecord& a, const CompactRecord& b) {
-                  return a.id < b.id;
-              });
+    finalize_pending_records(pending, records, parent_id_anchors);
     if (consumable_source != nullptr) {
         // The compact records and path arena now contain everything needed by
         // the index. Release millions of source wstrings before allocating the
@@ -888,9 +919,8 @@ void MetadataIndex::replace_impl(
         // memory peak or remain alive for the lifetime of the service.
         std::vector<FileRecord>().swap(*consumable_source);
     }
-    // Build accelerators while every record still has its complete path. The
-    // final compact arena can then store both files and directories as parent
-    // linked names without making construction perform recursive path walks.
+    // Build accelerators from complete paths, then componentize the resident
+    // arena. The owner metadata records only exceptional non-parent paths.
     auto name_accelerators = build_name_search_accelerators(records, strings);
     compact_base_paths(records, strings);
     std::unordered_map<std::uint64_t, FileRecord> old_overlay;
@@ -901,13 +931,18 @@ void MetadataIndex::replace_impl(
         // Swap in the fully-built index while holding the lock, then destroy
         // the previous multi-million-record buffers after readers can resume.
         records_.swap(records);
+        parent_id_anchors_.swap(parent_id_anchors);
         strings_.swap(strings);
         name_bigram_signatures_.swap(name_accelerators.bigram_signatures);
         std::swap(name_trigram_postings_, name_accelerators.trigram_postings);
         path_trigram_signatures_.swap(
             name_accelerators.path_trigram_signatures);
-        path_signature_owners_.swap(
-            name_accelerators.path_signature_owners);
+        directory_signature_bits_.swap(
+            name_accelerators.directory_signature_bits);
+        directory_signature_rank_prefix_.swap(
+            name_accelerators.directory_signature_rank_prefix);
+        path_signature_fallbacks_.swap(
+            name_accelerators.path_signature_fallbacks);
         natural_name_order_.swap(name_accelerators.natural_name_order);
         name_prefix_order_.swap(name_accelerators.prefix_order);
         name_prefix_ranges_.swap(name_accelerators.prefix_ranges);
@@ -933,6 +968,48 @@ bool MetadataIndex::base_contains(std::uint64_t id) const {
             return record.id < value;
         });
     return found != records_.end() && found->id == id;
+}
+
+std::uint32_t MetadataIndex::directory_signature_index(
+    std::size_t record_index) const noexcept {
+    constexpr auto invalid = std::numeric_limits<std::uint32_t>::max();
+    const auto word_index = record_index >> 6U;
+    if (word_index >= directory_signature_bits_.size() ||
+        word_index >= directory_signature_rank_prefix_.size()) {
+        return invalid;
+    }
+    const auto bit_index = static_cast<unsigned>(record_index & 63U);
+    const auto word = directory_signature_bits_[word_index];
+    const auto bit = std::uint64_t{1} << bit_index;
+    if ((word & bit) == 0) return invalid;
+    const auto lower_mask = bit_index == 0 ? std::uint64_t{} : bit - 1U;
+    return directory_signature_rank_prefix_[word_index] +
+        static_cast<std::uint32_t>(std::popcount(word & lower_mask));
+}
+
+std::uint32_t MetadataIndex::path_signature_owner(
+    std::size_t record_index) const noexcept {
+    constexpr auto invalid = std::numeric_limits<std::uint32_t>::max();
+    if (record_index >= records_.size()) return invalid;
+    const auto& record = records_[record_index];
+    if (record.directory()) {
+        return directory_signature_index(record_index);
+    }
+    if (record.name_only_path &&
+        record.parent_index != missing_parent_index &&
+        record.parent_index < records_.size() &&
+        records_[record.parent_index].directory()) {
+        return directory_signature_index(record.parent_index);
+    }
+    const auto found = std::lower_bound(
+        path_signature_fallbacks_.begin(), path_signature_fallbacks_.end(),
+        static_cast<std::uint32_t>(record_index),
+        [](const PathSignatureFallback& fallback, std::uint32_t index) {
+            return fallback.record_index < index;
+        });
+    return found != path_signature_fallbacks_.end() &&
+           found->record_index == record_index
+        ? found->signature_index : invalid;
 }
 
 void MetadataIndex::apply_delta(
@@ -1005,7 +1082,7 @@ void MetadataIndex::apply_ntfs_changes(
         if (removed_.find(id) != removed_.end()) return false;
         const auto* base = base_record(id);
         if (base == nullptr) return false;
-        parent_id = base->parent_id;
+        parent_id = this->parent_id(*base);
         return true;
     };
     const auto promote = [&](std::uint64_t id) -> FileRecord& {
@@ -1218,9 +1295,11 @@ void MetadataIndex::compact_locked() {
         throw std::length_error("string arena exceeds 32-bit offsets");
     }
 
+    std::vector<PendingCompactRecord> pending;
     std::vector<CompactRecord> compacted;
+    std::vector<ParentIdAnchor> compacted_parent_id_anchors;
     std::vector<wchar_t> strings;
-    compacted.reserve(live_size_);
+    pending.reserve(live_size_);
     strings.reserve(total_chars);
 
     for (const auto& source : records_) {
@@ -1228,27 +1307,35 @@ void MetadataIndex::compact_locked() {
             overlay_.find(source.id) != overlay_.end()) {
             continue;
         }
-        CompactRecord record = source;
         const auto path = path_view(source, path_scratch);
-        const auto relative_name = path.size() - source.name_length();
+        if (path.size() > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::length_error("path exceeds compact 16-bit length");
+        }
+        PendingCompactRecord pending_record;
+        pending_record.record = source;
+        pending_record.parent_id = parent_id(source);
+        auto& record = pending_record.record;
         record.path_offset = static_cast<std::uint32_t>(strings.size());
         record.path_length = static_cast<std::uint32_t>(path.size());
-        record.name_offset = record.path_offset +
-                             static_cast<std::uint32_t>(relative_name);
+        record.name_length_value = source.name_length();
         record.name_only_path = false;
         strings.insert(strings.end(), path.begin(), path.end());
-        compacted.push_back(record);
+        pending.push_back(pending_record);
     }
 
     for (const auto& [id, source] : overlay_) {
         (void)id;
-        CompactRecord record;
+        if (source.path.size() > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::length_error("path exceeds compact 16-bit length");
+        }
+        PendingCompactRecord pending_record;
+        auto& record = pending_record.record;
         record.id = source.id;
-        record.parent_id = source.parent_id;
+        pending_record.parent_id = source.parent_id;
         record.size = source.size;
         record.last_write_time = source.last_write_time;
-        record.attributes = source.attributes;
-        record.directory = source.directory;
+        record.attributes = source.directory
+            ? source.attributes | 0x10U : source.attributes & ~0x10U;
         record.path_offset = static_cast<std::uint32_t>(strings.size());
         record.path_length = static_cast<std::uint32_t>(source.path.size());
         strings.insert(strings.end(), source.path.begin(), source.path.end());
@@ -1260,25 +1347,31 @@ void MetadataIndex::compact_locked() {
             const auto slash = source.path.find_last_of(L"\\/");
             relative_name = slash == std::wstring::npos ? 0 : slash + 1;
         }
-        record.name_offset = record.path_offset +
-                             static_cast<std::uint32_t>(relative_name);
-        compacted.push_back(record);
+        const auto name_length = source.path.size() - relative_name;
+        if (name_length > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::length_error("name exceeds compact 16-bit length");
+        }
+        record.name_length_value = static_cast<std::uint32_t>(name_length);
+        pending.push_back(pending_record);
     }
 
-    std::sort(compacted.begin(), compacted.end(),
-              [](const CompactRecord& a, const CompactRecord& b) {
-                  return a.id < b.id;
-              });
-    auto name_accelerators = build_name_search_accelerators(compacted, strings);
+    finalize_pending_records(pending, compacted,
+                             compacted_parent_id_anchors);
     compact_base_paths(compacted, strings);
+    auto name_accelerators = build_name_search_accelerators(compacted, strings);
     records_ = std::move(compacted);
+    parent_id_anchors_ = std::move(compacted_parent_id_anchors);
     strings_ = std::move(strings);
     name_bigram_signatures_ = std::move(name_accelerators.bigram_signatures);
     name_trigram_postings_ = std::move(name_accelerators.trigram_postings);
     path_trigram_signatures_ =
         std::move(name_accelerators.path_trigram_signatures);
-    path_signature_owners_ =
-        std::move(name_accelerators.path_signature_owners);
+    directory_signature_bits_ =
+        std::move(name_accelerators.directory_signature_bits);
+    directory_signature_rank_prefix_ =
+        std::move(name_accelerators.directory_signature_rank_prefix);
+    path_signature_fallbacks_ =
+        std::move(name_accelerators.path_signature_fallbacks);
     natural_name_order_ = std::move(name_accelerators.natural_name_order);
     name_prefix_order_ = std::move(name_accelerators.prefix_order);
     name_prefix_ranges_ = std::move(name_accelerators.prefix_ranges);
@@ -1325,11 +1418,14 @@ MetadataIndexStorageStats MetadataIndex::storage_stats() const {
         records_.begin(), records_.end(),
         [](const CompactRecord& record) { return record.name_only_path; }));
     stats.string_characters = strings_.size();
-    stats.record_bytes = records_.capacity() * sizeof(CompactRecord);
+    stats.record_bytes = records_.capacity() * sizeof(CompactRecord) +
+        parent_id_anchors_.capacity() * sizeof(ParentIdAnchor);
     stats.string_bytes = strings_.capacity() * sizeof(wchar_t);
     stats.path_signature_count = path_trigram_signatures_.size();
     stats.path_signature_owner_bytes =
-        path_signature_owners_.capacity() * sizeof(std::uint32_t);
+        directory_signature_bits_.capacity() * sizeof(std::uint64_t) +
+        directory_signature_rank_prefix_.capacity() * sizeof(std::uint32_t) +
+        path_signature_fallbacks_.capacity() * sizeof(PathSignatureFallback);
     stats.signature_bytes =
         name_bigram_signatures_.capacity() * sizeof(NameBigramSignature) +
         path_trigram_signatures_.capacity() * sizeof(PathTrigramSignature) +
@@ -1364,26 +1460,23 @@ std::wstring_view MetadataIndex::path_view(
     };
     if (!record.name_only_path) return stored_path(record);
 
-    // Componentized paths can include directory records too. Walk the parent
-    // chain to the nearest full-path anchor, then append names in forward
-    // order. A fixed stack keeps normal path reconstruction free of helper
-    // allocations; scratch owns only the final returned path.
+    // Componentized paths can include directory records too. Walk direct
+    // parent indices to the nearest full-path anchor, then append names in
+    // forward order. A fixed stack keeps normal path reconstruction free of
+    // helper allocations; scratch owns only the final returned path.
     constexpr std::size_t maximum_components = 512;
     std::array<const CompactRecord*, maximum_components> components{};
     std::size_t component_count = 0;
     const CompactRecord* current = &record;
     while (current->name_only_path && component_count < components.size()) {
         components[component_count++] = current;
-        const auto parent = std::lower_bound(
-            records_.begin(), records_.end(), current->parent_id,
-            [](const CompactRecord& candidate, std::uint64_t id) {
-                return candidate.id < id;
-            });
-        if (parent == records_.end() || parent->id != current->parent_id ||
-            parent->id == current->id) {
+        if (current->parent_index == missing_parent_index ||
+            current->parent_index >= records_.size()) {
             return stored_path(record);
         }
-        current = &*parent;
+        const auto* parent = &records_[current->parent_index];
+        if (parent == current) return stored_path(record);
+        current = parent;
     }
     if (current->name_only_path) return stored_path(record);
 
@@ -1397,14 +1490,40 @@ std::wstring_view MetadataIndex::path_view(
     }
     return scratch;
 }
-std::wstring_view MetadataIndex::name_view(const CompactRecord& record) const { return {strings_.data() + record.name_offset, record.name_length()}; }
+
+std::wstring_view MetadataIndex::name_view(
+    const CompactRecord& record) const {
+    return {strings_.data() + record.name_offset(), record.name_length()};
+}
+
+std::uint64_t MetadataIndex::parent_id(const CompactRecord& record) const {
+    if (record.parent_index != missing_parent_index &&
+        record.parent_index < records_.size()) {
+        return records_[record.parent_index].id;
+    }
+    const auto found = std::lower_bound(
+        parent_id_anchors_.begin(), parent_id_anchors_.end(), record.id,
+        [](const ParentIdAnchor& anchor, std::uint64_t id) {
+            return anchor.id < id;
+        });
+    return found != parent_id_anchors_.end() && found->id == record.id
+        ? found->parent_id : 0;
+}
+
 FileRecord MetadataIndex::materialize(const CompactRecord& item) const {
     FileRecord result;
     std::wstring path_scratch;
-    result.id = item.id; result.parent_id = item.parent_id; result.size = item.size; result.last_write_time = item.last_write_time;
-    result.attributes = item.attributes; result.directory = item.directory; result.path.assign(path_view(item, path_scratch)); result.name.assign(name_view(item));
+    result.id = item.id;
+    result.parent_id = parent_id(item);
+    result.size = item.size;
+    result.last_write_time = item.last_write_time;
+    result.attributes = item.attributes;
+    result.directory = item.directory();
+    result.path.assign(path_view(item, path_scratch));
+    result.name.assign(name_view(item));
     return result;
 }
+
 std::vector<SearchResult> MetadataIndex::search(
     std::wstring_view text, const SearchOptions& options) const {
     if (options.limit == 0) return {};
@@ -1471,7 +1590,7 @@ std::vector<SearchResult> MetadataIndex::search(
         view.size = record.size;
         view.last_write_time = record.last_write_time;
         view.attributes = record.attributes;
-        view.directory = record.directory;
+        view.directory = record.directory();
         return view;
     };
     const auto candidate_order = [&](const Candidate& left_candidate,
@@ -1651,7 +1770,9 @@ std::vector<SearchResult> MetadataIndex::search(
 
     use_path_trigram_signature =
         !required_path_signatures.empty() &&
-        path_signature_owners_.size() == records_.size();
+        directory_signature_bits_.size() == (records_.size() + 63U) / 64U &&
+        directory_signature_rank_prefix_.size() ==
+            directory_signature_bits_.size() + 1U;
 
     const bool relevance_bounded = options.sort == SortField::relevance &&
         !options.descending && query.duplicate_mode == DuplicateMode::none;
@@ -1708,11 +1829,11 @@ std::vector<SearchResult> MetadataIndex::search(
     };
     const auto path_signature_may_match = [&](std::size_t index) {
         if (!use_path_trigram_signature) return true;
-        if (index >= path_signature_owners_.size() ||
+        if (index >= records_.size() ||
             index >= name_bigram_signatures_.size()) {
             return true;
         }
-        const auto owner = path_signature_owners_[index];
+        const auto owner = path_signature_owner(index);
         if (owner >= path_trigram_signatures_.size()) return true;
         for (const auto& required : required_path_signatures) {
             if (!signature_contains(path_trigram_signatures_[owner],
@@ -1833,7 +1954,7 @@ std::vector<SearchResult> MetadataIndex::search(
                 std::wstring path_scratch;
                 const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-                if (!accepted(record.directory, name, path, record.size,
+                if (!accepted(record.directory(), name, path, record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
                 }
@@ -1968,7 +2089,7 @@ std::vector<SearchResult> MetadataIndex::search(
                 std::wstring path_scratch;
                 const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-                if (!accepted(record.directory, name, path, record.size,
+                if (!accepted(record.directory(), name, path, record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
                 }
@@ -2023,7 +2144,7 @@ std::vector<SearchResult> MetadataIndex::search(
             std::wstring path_scratch;
             const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-            if (!accepted(record.directory, name, path, record.size,
+            if (!accepted(record.directory(), name, path, record.size,
                           record.last_write_time, record.attributes)) {
                 continue;
             }
@@ -2093,7 +2214,7 @@ std::vector<SearchResult> MetadataIndex::search(
             std::wstring path_scratch;
             const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-            if (accepted(record.directory, name, path, record.size,
+            if (accepted(record.directory(), name, path, record.size,
                          record.last_write_time, record.attributes)) {
                 consider({rank_record(terms, name, path, options.match_path,
                                       sensitive),

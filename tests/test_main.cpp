@@ -327,8 +327,9 @@ void test_index_componentized_path_fallback_and_compaction() {
             "orphan path keeps the complete fallback string");
     const auto orphan_results = orphan_index.search(L"path:lost orphan");
     require(orphan_results.size() == 1 &&
+                orphan_results.front().record.parent_id == 999 &&
                 orphan_results.front().record.path == L"D:\\lost\\orphan.txt",
-            "orphan fallback path remains searchable");
+            "orphan parent ID and fallback path remain searchable");
 
     esm::MetadataIndex compacted_index(0);
     auto directory = record(30, L"folder", L"D:\\folder");
@@ -351,6 +352,7 @@ void test_index_componentized_path_fallback_and_compaction() {
             "compaction restores name-only child paths");
     const auto renamed_results = compacted_index.search(L"path:folder after");
     require(renamed_results.size() == 1 &&
+                renamed_results.front().record.parent_id == 30 &&
                 renamed_results.front().record.path ==
                     L"D:\\folder\\after.txt",
             "componentized path survives overlay compaction");
@@ -460,9 +462,9 @@ void test_shared_directory_path_signatures() {
             "nested directories and files share parent-linked path components");
     require(stats.path_signature_count < stats.base_records,
             "directory path signatures are shared by child files");
-    require(stats.path_signature_owner_bytes >=
+    require(stats.path_signature_owner_bytes <=
                 stats.base_records * sizeof(std::uint32_t),
-            "each base record stores a compact path signature owner");
+            "path signature ownership is no larger than one uint32 per record");
 
     auto results = index.search(L"path:shared");
     require(results.size() == 4,

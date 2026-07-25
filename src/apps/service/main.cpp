@@ -15,6 +15,8 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
+#include <malloc.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -69,9 +71,10 @@ ServiceConfiguration configuration;
 
 void release_transient_process_memory() {
     // Full MFT reconciliation and snapshot generation temporarily allocate
-    // multi-million-record vectors alongside the live catalog and search
-    // index. Return released heap pages to Windows after those phases so the
-    // service does not retain its startup peak as resident working set.
+    // multi-million-record vectors alongside the live search index. _heapmin
+    // asks the CRT allocator to decommit completely free regions, reducing
+    // Private Bytes rather than merely trimming the process working set.
+    (void)_heapmin();
     if (const auto heap = GetProcessHeap(); heap != nullptr) {
         (void)HeapCompact(heap, 0);
     }
@@ -253,6 +256,14 @@ MultiVolumeBuildResult build_all_ntfs_volumes() {
                        })});
     }
 
+    // Collect completed volume vectors first so the combined vector can reserve
+    // its exact final size. Appending C:, D:, E: directly caused several
+    // hundred MiB reallocations; the freed intermediate buffers fragmented the
+    // long-lived service heap and made Private Bytes grow after each periodic
+    // reconciliation.
+    std::vector<VolumeBuildResult> completed;
+    completed.reserve(pending.size());
+    std::size_t total_records = 0;
     for (auto& item : pending) {
         try {
             auto built = item.future.get();
@@ -263,12 +274,14 @@ MultiVolumeBuildResult build_all_ntfs_volumes() {
                               L"; keeping the previous complete index");
                 continue;
             }
-            result.volumes.push_back(item.root);
-            result.records.insert(
-                result.records.end(),
-                std::make_move_iterator(built.records.begin()),
-                std::make_move_iterator(built.records.end()));
-            result.states.push_back(std::move(built.state));
+            if (built.records.size() >
+                std::numeric_limits<std::size_t>::max() - total_records) {
+                result.error = ERROR_ARITHMETIC_OVERFLOW;
+                ++result.failures;
+                continue;
+            }
+            total_records += built.records.size();
+            completed.push_back(std::move(built));
         } catch (const std::exception&) {
             ++result.failures;
             log_event(EVENTLOG_WARNING_TYPE,
@@ -276,7 +289,25 @@ MultiVolumeBuildResult build_all_ntfs_volumes() {
                           item.root);
         }
     }
-    if (result.volumes.empty()) result.error = ERROR_READ_FAULT;
+
+    result.records.reserve(total_records);
+    result.volumes.reserve(completed.size());
+    result.states.reserve(completed.size());
+    for (auto& built : completed) {
+        result.volumes.push_back(built.state.volume.root);
+        result.records.insert(
+            result.records.end(),
+            std::make_move_iterator(built.records.begin()),
+            std::make_move_iterator(built.records.end()));
+        // Move-insert leaves the source vector's FileRecord storage allocated.
+        // Release each per-volume buffer before merging the next one so the
+        // exact-size destination does not coexist with all source buffers.
+        std::vector<esm::FileRecord>().swap(built.records);
+        result.states.push_back(std::move(built.state));
+    }
+    if (result.volumes.empty() && result.error == ERROR_SUCCESS) {
+        result.error = ERROR_READ_FAULT;
+    }
     return result;
 }
 

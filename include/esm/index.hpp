@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "esm/file_record.hpp"
 #include "esm/query.hpp"
 #include "esm/usn_journal.hpp"
@@ -81,26 +81,42 @@ public:
     [[nodiscard]] std::size_t compaction_count() const;
     [[nodiscard]] MetadataIndexStorageStats storage_stats() const;
 private:
+    static constexpr std::uint32_t missing_parent_index = 0x7fffffffU;
     struct CompactRecord {
         std::uint64_t id{};
-        std::uint64_t parent_id{};
         std::uint64_t size{};
         std::int64_t last_write_time{};
-        std::uint32_t attributes : 31 {};
-        std::uint32_t directory : 1 {};
+        std::uint32_t attributes{};
         std::uint32_t path_offset{};
-        std::uint32_t path_length : 31 {};
+        std::uint32_t path_length : 16 {};
+        std::uint32_t name_length_value : 16 {};
+        std::uint32_t parent_index : 31 {missing_parent_index};
         std::uint32_t name_only_path : 1 {};
-        std::uint32_t name_offset{};
 
         [[nodiscard]] std::uint32_t name_length() const noexcept {
-            return path_offset + path_length - name_offset;
+            return name_length_value;
         }
+        [[nodiscard]] bool directory() const noexcept {
+            return (attributes & 0x10U) != 0;
+        }
+        [[nodiscard]] std::uint32_t name_offset() const noexcept {
+            return path_offset + path_length - name_length_value;
+        }
+    };
+    static_assert(sizeof(CompactRecord) == 40);
+    struct ParentIdAnchor {
+        std::uint64_t id{};
+        std::uint64_t parent_id{};
+    };
+    struct PendingCompactRecord {
+        CompactRecord record;
+        std::uint64_t parent_id{};
     };
     [[nodiscard]] std::wstring_view path_view(
         const CompactRecord& record, std::wstring& scratch) const;
     [[nodiscard]] std::wstring_view name_view(const CompactRecord& record) const;
     [[nodiscard]] FileRecord materialize(const CompactRecord& record) const;
+    [[nodiscard]] std::uint64_t parent_id(const CompactRecord& record) const;
     struct NameBigramSignature {
         std::array<std::uint64_t, 2> words{};
     };
@@ -124,6 +140,10 @@ private:
         std::vector<std::uint32_t> counts;
         std::vector<std::uint8_t> encoded_positions;
     };
+    struct PathSignatureFallback {
+        std::uint32_t record_index{};
+        std::uint32_t signature_index{};
+    };
     struct NameSearchAccelerators {
         std::vector<NameBigramSignature> bigram_signatures;
         NameTrigramPostingIndex trigram_postings;
@@ -131,10 +151,13 @@ private:
         // path string. A single trigram Bloom signature per record keeps the
         // common path-substring case on a contiguous, metadata-only scan.
         // Full directory path signatures are shared by all direct children.
-        // Each base record stores only a 32-bit owner index instead of a
-        // separate 256-bit full-path signature.
+        // Directory membership plus a prefix-rank table derives the common
+        // owner without storing one uint32 per record. Only unusual full-path
+        // file anchors need a sparse explicit mapping.
         std::vector<PathTrigramSignature> path_trigram_signatures;
-        std::vector<std::uint32_t> path_signature_owners;
+        std::vector<std::uint64_t> directory_signature_bits;
+        std::vector<std::uint32_t> directory_signature_rank_prefix;
+        std::vector<PathSignatureFallback> path_signature_fallbacks;
         // Base records in the exact case-insensitive natural name/path/id
         // order used by the default GUI sort. Queries can walk this order and
         // stop after one page instead of sorting every match.
@@ -154,20 +177,31 @@ private:
                       std::vector<FileRecord>* consumable_records);
     static void compact_base_paths(std::vector<CompactRecord>& records,
                                    std::vector<wchar_t>& strings);
+    static void finalize_pending_records(
+        std::vector<PendingCompactRecord>& pending,
+        std::vector<CompactRecord>& records,
+        std::vector<ParentIdAnchor>& parent_id_anchors);
     [[nodiscard]] static NameSearchAccelerators
     build_name_search_accelerators(
         const std::vector<CompactRecord>& records,
         const std::vector<wchar_t>& strings);
     [[nodiscard]] bool base_contains(std::uint64_t id) const;
+    [[nodiscard]] std::uint32_t directory_signature_index(
+        std::size_t record_index) const noexcept;
+    [[nodiscard]] std::uint32_t path_signature_owner(
+        std::size_t record_index) const noexcept;
     void compact_locked();
     void rebuild_suppressed_base_ids_locked();
     mutable std::shared_mutex mutex_;
     std::vector<CompactRecord> records_;
+    std::vector<ParentIdAnchor> parent_id_anchors_;
     std::vector<wchar_t> strings_;
     std::vector<NameBigramSignature> name_bigram_signatures_;
     NameTrigramPostingIndex name_trigram_postings_;
     std::vector<PathTrigramSignature> path_trigram_signatures_;
-    std::vector<std::uint32_t> path_signature_owners_;
+    std::vector<std::uint64_t> directory_signature_bits_;
+    std::vector<std::uint32_t> directory_signature_rank_prefix_;
+    std::vector<PathSignatureFallback> path_signature_fallbacks_;
     std::vector<std::uint32_t> natural_name_order_;
     std::vector<std::uint32_t> name_prefix_order_;
     std::vector<NamePrefixRange> name_prefix_ranges_;

@@ -20,6 +20,12 @@
 
 ### Performance
 
+- `CompactRecord` 从 48 字节压缩到固定 40 字节：正常父关系保存 31 位记录索引，只有父记录缺失时才保存稀疏 64 位 `ParentIdAnchor`；真实 3,264,188 条单索引记录容量由约 149.42 MiB 降到约 124.52 MiB。
+- 路径签名 owner 从“每记录一个 32 位索引”改为目录 bitset + rank prefix + 稀疏异常路径回退，owner 元数据由约 12.45 MiB 降到约 0.58 MiB。
+- 当前代码在真实 snapshot 独立基准中的稳定 Private Bytes 中位数由约 473.04 MiB 降到约 436.32 MiB，基础结构容量由约 466.16 MiB 降到约 429.41 MiB；同机 Everything 合计约 316.77 MiB，粗略约为其 1.38 倍，记录集和格式不同，仍不能声称达到 Everything。
+- 本轮单进程索引构建中位数约 21.972 秒，纯名称查询 p50 约 0.03–4.59 ms，`path:test1` 约 41.40 ms；构建峰值仍约 2279.45 MiB Working Set / 2299.08 MiB Private Bytes。
+- 已安装服务仍运行上一版二进制，稳定 Private Bytes 约 479 MiB；两次 UAC 提升均被取消，因此约 436 MiB 仅代表最新代码的独立真实 snapshot 基准，尚未完成新二进制的服务级验证。
+- 复测发现已安装旧服务在多次 30 分钟全量 reconciliation 后并非持续稳定在 479 MiB：2026-07-25 08:49 完成第三次协调后稳定约 953.48 MiB Private Bytes。多卷聚合现在先收集各卷结果、计算总记录数并一次性 reserve，避免 C:/D:/E: 逐卷追加产生数百 MiB 中间 vector；协调结束同时调用 `_heapmin` 归还完全空闲的 CRT heap region。新服务级效果仍待管理员权限安装验证。
 - 默认多卷 `mft-auto` 服务不再长期保留每卷 `NtfsCatalog`；USN create/update/rename/delete 现在直接命名空间化并应用到全局 `MetadataIndex`，完整服务稳定 Private Bytes 从约 958 MiB 降到约 479 MiB。
 - 基础索引把正常目录和文件都压缩为“名称 + parent ID”；仅卷根、orphan 或路径关系异常记录保留完整路径锚点。真实 326 万条单索引字符 arena 从约 223.56 MiB 降到约 141.16 MiB，Private Bytes 从约 556 MiB 降到约 473 MiB。
 - 同机实测 Everything 1.4 主进程和辅助进程合计约 316.77 MiB Private Bytes；当前 ESM 稳定约 479.33 MiB，约为其 1.51 倍，尚未达到 Everything。

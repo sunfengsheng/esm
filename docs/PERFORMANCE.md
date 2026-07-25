@@ -142,11 +142,13 @@ Everything 的同机样本为 1.4.1.1030：主进程约 312.78 MiB Private Bytes
 
 当前最新代码的独立真实 snapshot 单索引 Private Bytes 中位数约 436.32 MiB，粗略为 Everything 合计值的 1.38 倍。ESM 约 326.4 万条、snapshot 约 966.69 MiB；Everything 约 369.9 万条、数据库约 146.20 MiB。两者不是相同记录集、文件格式或实现，不能直接当作严格同条件基准，也不能声称 ESM 已达到 Everything。
 
-当前已安装服务仍是上一版二进制：`C:\Program Files\everything_sm\esm_service.exe` 的 SHA-256 为 `2AC18ACBC17744D7C9B31B51671BF87A0050F04670D3997FBB02C86DE7383171`。它在 2026-07-25 07:46 启动、07:47 完成首次协调后曾稳定约 479 MiB Private Bytes；但后续每 30 分钟全量 reconciliation 会继续抬高堆提交量。08:49 完成第三次协调时，5 秒间隔采样观察到约 2501.88 MiB 构建中峰值，协调完成后连续 5 次稳定在约 953.48 MiB Private Bytes / 935.32 MiB Working Set。这一结果复现了用户看到的约 900 MiB，说明 479 MiB 不能再表述为长期稳定值。
+旧安装服务在 2026-07-25 07:46 启动、07:47 完成首次协调后曾稳定约 479 MiB Private Bytes；但后续每 30 分钟全量 reconciliation 会继续抬高堆提交量。08:49 完成第三次协调时，5 秒间隔采样观察到约 2501.88 MiB 构建中峰值，协调完成后连续 5 次稳定在约 953.48 MiB Private Bytes / 935.32 MiB Working Set。这一结果复现了用户看到的约 900 MiB，说明旧版的 479 MiB 不能表述为长期稳定值。
 
-代码审查定位到多卷合并阶段逐卷 `vector<FileRecord>::insert` 未预留最终容量。对当前 3,264,195 条 snapshot 的诊断计数为 C: 2,031,861、D: 674,176、E: 558,158，`sizeof(FileRecord) == 128`；旧追加顺序在加入 D: 时把容量从 2,031,861 扩到 4,063,722，释放约 248.03 MiB 的旧 buffer，并使最终 vector 比实际记录多保留约 97.60 MiB 容量。该模式会产生大块中间 buffer，是长期 CRT heap 碎片/保留的主要可疑点。本轮改为先收集每卷结果、计算总记录数并一次性 `reserve`，协调结束调用 `_heapmin` 归还完全空闲的 CRT heap region，再调用 `HeapCompact`。这是真正针对 Private Bytes 的堆回收，不使用 `EmptyWorkingSet` 或 `SetProcessWorkingSetSize(-1, -1)`。本地重复 snapshot replace 诊断中，第二次替换后 `_heapmin` 可把 Private Bytes 从约 437.22 MiB 降到约 433.88 MiB，但该诊断没有覆盖 SYSTEM 服务中的并行 MFT 枚举，不能替代安装服务验证。
+代码审查定位到多卷合并阶段逐卷 `vector<FileRecord>::insert` 未预留最终容量。对当前 3,264,195 条 snapshot 的诊断计数为 C: 2,031,861、D: 674,176、E: 558,158，`sizeof(FileRecord) == 128`；旧追加顺序在加入 D: 时把容量从 2,031,861 扩到 4,063,722，释放约 248.03 MiB 的旧 buffer，并使最终 vector 比实际记录多保留约 97.60 MiB 容量。修复版先收集各卷结果、计算总记录数并一次性 `reserve`，协调结束调用 `_heapmin` 归还完全空闲的 CRT heap region，再调用 `HeapCompact`。这是真正针对 Private Bytes 的堆回收，不使用 `EmptyWorkingSet` 或 `SetProcessWorkingSetSize(-1, -1)`。
 
-本轮最新 Release 服务 SHA-256 为 `66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B`。两次 UAC 提升均被取消，尚未把新二进制替换到 Program Files，也没有完成“启动、立即全量协调、稳定采样、第二次 30 分钟协调、IPC 查询”的服务级复测。因此 436.32 MiB 只能作为最新代码的单索引基准；新合并策略是否能把长期服务维持在接近该数值，仍需管理员权限实测。
+2026-07-25 10:25 已通过 UAC 把最新 Release 服务安装到 `C:\Program Files\everything_sm\esm_service.exe`，安装源和目标 SHA-256 均为 `66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B`。Event Log 显示 10:25:25 从 3,264,387 条多卷 snapshot 启动，10:26:06 完成 C:/D:/E: 首次全量协调并得到 3,264,391 条；服务 PID 38636 在 10:27:16–10:28:11 的 12 次、5 秒间隔采样中，Working Set 为 441.24–441.29 MiB、中位数 441.27 MiB，Private Bytes 为 436.97–437.03 MiB、中位数 437.00 MiB。完整服务首轮稳定值粗略为同机 Everything 316.77 MiB 合计样本的 1.38 倍，但记录集和格式不同，不能视为严格同条件对比。
+
+IPC 正确返回 `D:\test1\123456789.txt`。首次 `123456789.txt` 冷查询出现 1765.96 ms 服务端异常样本，紧接着 6 次重复查询为 0.333–0.449 ms；`windows` 查询为 5.678 ms。该结果说明热查询恢复到毫秒级，但仍需单独分析首次冷查询延迟。本次安装发生在首次协调开始前，没有同步采到协调过程峰值；第二次 30 分钟完整协调也尚未发生。因此目前可以确认“新服务首轮协调后未停留在 900 MiB”，但还不能确认长期多轮协调完全不再增长。
 
 没有保留 `EmptyWorkingSet`/`SetProcessWorkingSetSize(-1, -1)` 方案：它只能改变任务管理器 Working Set，并会增加冷页缺页和首次宽泛查询延迟。当前只在大阶段结束后调用 `_heapmin` 归还完全空闲的 CRT heap region，并调用 `HeapCompact` 整理进程堆。
 
@@ -177,7 +179,7 @@ Everything 的同机样本为 1.4.1.1030：主进程约 312.78 MiB Private Bytes
 
 ## 8. 下一步
 
-- 将最新搜索索引二进制安装到服务环境，完成启动、索引替换、稳定采样和 IPC 回归，确认单索引收益能反映到完整服务；
+- 等待并采样第二次及后续 30 分钟完整协调，确认 Private Bytes 不会再次从约 437 MiB 增长到约 900 MiB；
 - 将 snapshot 直接流式读入紧凑索引，降低当前约 2.30 GiB 的单进程构建峰值；
 - 减少完整路径重复和 UTF-16 字符串对象开销；
 - 将名称索引直接持久化或并行/增量构建；

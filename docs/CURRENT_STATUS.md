@@ -112,17 +112,17 @@
 
 用户观察到的旧安装服务稳定内存约为 1.85–2 GiB；更早的开发版本曾达到 Working Set 约 3589 MB、Private Bytes 约 3662 MB。第一阶段通过释放 rvalue 源记录、普通文件路径组件化、128 位名称 Bloom、delta/varint posting 和 48 字节 `CompactRecord`，把真实 326 万条单搜索索引降到约 628.79 MiB Working Set。
 
-随后通过目录级共享路径签名、正常目录/文件全父链组件化以及多卷服务移除常驻 `NtfsCatalog`，上一正式基线的单索引降到约 474.66 MiB Working Set / 473.04 MiB Private Bytes，已安装服务稳定约 479.33 MiB Private Bytes。
+随后通过目录级共享路径签名、正常目录/文件全父链组件化以及多卷服务移除常驻 `NtfsCatalog`，上一正式基线的单索引降到约 474.66 MiB Working Set / 473.04 MiB Private Bytes，旧安装服务首次协调后曾约 479.33 MiB Private Bytes。
 
 2026-07-25 的最新代码进一步把 `CompactRecord` 从 48 字节压到固定 40 字节：正常父关系保存 31 位记录索引，缺失父项才使用稀疏 `ParentIdAnchor`。路径签名 owner 从每记录 32 位数组改为目录 bitset + rank prefix + 稀疏 `PathSignatureFallback`，owner 元数据由约 12.45 MiB 降到约 0.58 MiB。真实 3,264,188 条单索引稳定值为约 437.89 MiB Working Set / 436.32 MiB Private Bytes，基础结构容量约 429.41 MiB；`path:test1` p50 约 41.40 ms，纯名称查询约 0.03–4.59 ms。
 
-同机 Everything 1.4.1.1030 主进程和辅助进程合计约 316.77 MiB Private Bytes。最新 ESM 单索引基准粗略约为其 1.38 倍；已安装旧服务首次协调后曾约 479 MiB（约 1.51 倍），但第三次协调后已升到约 953.48 MiB（约 3.01 倍）。ESM 约 326.4 万条、snapshot 约 966.69 MiB；Everything 约 369.9 万条、数据库约 146.20 MiB，两者不是相同记录集或存储格式，不能声称已经达到 Everything。
+同机 Everything 1.4.1.1030 主进程和辅助进程合计约 316.77 MiB Private Bytes。最新 ESM 单索引基准约 436.32 MiB，修复后的完整安装服务首轮协调后中位数约 437.00 MiB，均粗略为其 1.38 倍。ESM 约 326.4 万条、snapshot 约 966.69 MiB；Everything 约 369.9 万条、数据库约 146.20 MiB，两者不是相同记录集或存储格式，不能声称已经达到 Everything。
 
-已安装旧服务在 2026-07-25 07:46 启动并完成首次协调后曾约为 479 MiB，但后续 30 分钟全量 reconciliation 继续抬高提交量；08:49 第三次协调完成后连续采样稳定约 953.48 MiB Private Bytes / 935.32 MiB Working Set，构建中观察到约 2501.88 MiB Private Bytes。这复现了用户看到的约 900 MiB，也说明旧版服务仍存在多轮重建后的堆碎片/保留问题。
+旧安装服务在 2026-07-25 08:49 第三次协调完成后曾稳定约 953.48 MiB Private Bytes / 935.32 MiB Working Set，构建中观察到约 2501.88 MiB Private Bytes。本轮已把多卷聚合改为“先收集各卷结果、计算总记录数、一次性 reserve、再移动合并”，避免逐卷追加产生大块中间 `vector<FileRecord>`；协调后调用 `_heapmin` 归还完全空闲的 CRT heap region，并保留 `HeapCompact`。
 
-本轮已把多卷聚合改为“先收集各卷结果、计算总记录数、一次性 reserve、再移动合并”，避免逐卷追加产生大块中间 `vector<FileRecord>`；协调后调用 `_heapmin` 归还完全空闲的 CRT heap region，并保留 `HeapCompact`。最新 Release 服务 SHA-256 为 `66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B`，尚未替换到 Program Files，因此不能声称已解决服务级 900 MiB 问题。
+2026-07-25 10:25 已通过 UAC 安装 SHA-256 为 `66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B` 的最新服务。Event Log 显示 10:26:06 完成 C:/D:/E: 首次全量协调；随后 12 次采样的 Private Bytes 为 436.97–437.03 MiB、中位数 437.00 MiB，Working Set 为 441.24–441.29 MiB、中位数 441.27 MiB。D 盘 `D:\test1\123456789.txt` 可正常返回，热查询为 0.333–0.449 ms；首次冷查询曾出现 1765.96 ms 异常样本，仍需继续分析。
 
-单进程真实 snapshot 构建采用 10 ms 采样时，峰值仍约 2279.45 MiB Working Set / 2299.08 MiB Private Bytes；旧安装服务完整 reconciliation 的本轮峰值约 2501.88 MiB，既有更高样本约 2.57 GiB。下一阶段优先完成新二进制的两轮服务协调验证，并继续避免完整 `vector<FileRecord>` 物化、压缩 UTF-16 字符 arena 和排序索引、把稳定搜索结构持久化或 mmap。
+单进程真实 snapshot 构建采用 10 ms 采样时，峰值仍约 2279.45 MiB Working Set / 2299.08 MiB Private Bytes；旧安装服务完整 reconciliation 的本轮峰值约 2501.88 MiB，既有更高样本约 2.57 GiB。新服务首次协调的过程峰值未被同步采集，第二次 30 分钟完整协调尚未验证，因此目前只能确认首轮协调后的稳定占用已从旧版约 900 MiB 回落，不能提前声称长期多轮协调问题已经彻底解决。下一阶段继续验证多轮协调，并减少完整 `vector<FileRecord>` 物化、压缩 UTF-16 字符 arena 和排序索引、把稳定搜索结构持久化或 mmap。
 
 ## 6. 发布判断
 

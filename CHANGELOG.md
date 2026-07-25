@@ -24,11 +24,11 @@
 - 路径签名 owner 从“每记录一个 32 位索引”改为目录 bitset + rank prefix + 稀疏异常路径回退，owner 元数据由约 12.45 MiB 降到约 0.58 MiB。
 - 当前代码在真实 snapshot 独立基准中的稳定 Private Bytes 中位数由约 473.04 MiB 降到约 436.32 MiB，基础结构容量由约 466.16 MiB 降到约 429.41 MiB；同机 Everything 合计约 316.77 MiB，粗略约为其 1.38 倍，记录集和格式不同，仍不能声称达到 Everything。
 - 本轮单进程索引构建中位数约 21.972 秒，纯名称查询 p50 约 0.03–4.59 ms，`path:test1` 约 41.40 ms；构建峰值仍约 2279.45 MiB Working Set / 2299.08 MiB Private Bytes。
-- 已安装服务仍运行上一版二进制，稳定 Private Bytes 约 479 MiB；两次 UAC 提升均被取消，因此约 436 MiB 仅代表最新代码的独立真实 snapshot 基准，尚未完成新二进制的服务级验证。
-- 复测发现已安装旧服务在多次 30 分钟全量 reconciliation 后并非持续稳定在 479 MiB：2026-07-25 08:49 完成第三次协调后稳定约 953.48 MiB Private Bytes。多卷聚合现在先收集各卷结果、计算总记录数并一次性 reserve，避免 C:/D:/E: 逐卷追加产生数百 MiB 中间 vector；协调结束同时调用 `_heapmin` 归还完全空闲的 CRT heap region。新服务级效果仍待管理员权限安装验证。
-- 默认多卷 `mft-auto` 服务不再长期保留每卷 `NtfsCatalog`；USN create/update/rename/delete 现在直接命名空间化并应用到全局 `MetadataIndex`，完整服务稳定 Private Bytes 从约 958 MiB 降到约 479 MiB。
+- 2026-07-25 10:25 已通过 UAC 把最新 Release 服务安装到 `C:\Program Files\everything_sm\esm_service.exe`；安装源与目标 SHA-256 均为 `66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B`。服务 PID 38636 在 10:26:06 完成 C:/D:/E: 首次全量协调后，12 次、5 秒间隔采样稳定在约 436.97–437.03 MiB Private Bytes / 441.24–441.29 MiB Working Set。
+- 旧安装服务在第三次 30 分钟全量 reconciliation 后曾稳定约 953.48 MiB Private Bytes。修复后的首轮服务协调已回落到约 437.00 MiB，证明新二进制已生效；但本次没有捕获启动协调峰值，第二次 30 分钟完整协调仍待验证，暂不能把首轮结果表述为长期稳定结论。IPC 已确认返回 `D:\test1\123456789.txt`；首次冷查询异常为 1765.96 ms，随后 6 次服务端查询为 0.333–0.449 ms。
+- 默认多卷 `mft-auto` 服务不再长期保留每卷 `NtfsCatalog`；USN create/update/rename/delete 现在直接命名空间化并应用到全局 `MetadataIndex`，该阶段曾把完整服务首次协调后的 Private Bytes 从约 958 MiB 降到约 479 MiB。
 - 基础索引把正常目录和文件都压缩为“名称 + parent ID”；仅卷根、orphan 或路径关系异常记录保留完整路径锚点。真实 326 万条单索引字符 arena 从约 223.56 MiB 降到约 141.16 MiB，Private Bytes 从约 556 MiB 降到约 473 MiB。
-- 同机实测 Everything 1.4 主进程和辅助进程合计约 316.77 MiB Private Bytes；当前 ESM 稳定约 479.33 MiB，约为其 1.51 倍，尚未达到 Everything。
+- 同机实测 Everything 1.4 主进程和辅助进程合计约 316.77 MiB Private Bytes；上一阶段 ESM 首轮稳定约 479.33 MiB，约为其 1.51 倍，最新修复版首轮约为 437.00 MiB，仍不能声称达到 Everything。
 - 当前启动 reconciliation 仍会短时达到约 2.57 GiB Private Bytes，单进程 snapshot 构建峰值约 2.17 GiB；完整 `vector<FileRecord>` 物化和约 966.69 MiB snapshot 仍是下一阶段重点。
 - 路径 trigram Bloom 从“每条记录一份 256 位完整路径签名”改为“每个目录一份共享路径签名 + 每条记录一个 32 位 owner”；真实 326 万条单索引签名容量从约 149.41 MiB 降到约 78.62 MiB，Working Set 中位数从约 628.79 MiB 降到约 557.69 MiB。
 - posting 构建改为两遍统计并直接写最终 delta/varint byte span，不再分配约 255 MiB 的临时 `uint32_t posting_positions`；同机真实索引构建中位数从约 27.041 秒降到约 22.528 秒。

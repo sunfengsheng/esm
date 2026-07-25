@@ -20,6 +20,14 @@
 - 每 5 分钟或累计约 100,000 个变化后异步刷新 snapshot；
 - 完整协调会短时显著增加内存；2026-07-25 修复版会一次性预留多卷合并 vector，并在协调后归还空闲 CRT heap region。判断是否回归时应同时观察 Private Bytes 和协调完成后的稳定值，不能只看 Working Set。
 
+2026-07-25 10:25 的本机安装验证：
+
+- `C:\Program Files\everything_sm\esm_service.exe` SHA-256：`66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B`；
+- Event Log 于 10:26:06 记录 `Reconciled C:, D:, E: with 3264391 entries`；
+- PID 38636 在首次协调完成后的 12 次采样中稳定约 437.00 MiB Private Bytes / 441.27 MiB Working Set；
+- `esm_cli query everything_sm_service "123456789.txt"` 可返回 `D:\test1\123456789.txt`；
+- 首次协调过程峰值和第二次 30 分钟协调尚未验证，运维判断不能只引用上述首轮稳定值。
+
 ### 单卷 MFT 服务
 
 ```powershell

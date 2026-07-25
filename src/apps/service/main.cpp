@@ -9,6 +9,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -32,7 +33,6 @@ constexpr DWORD service_wait_timeout_ms = 120'000;
 constexpr auto snapshot_refresh_interval = std::chrono::minutes(5);
 constexpr std::size_t snapshot_refresh_changes = 100'000;
 constexpr auto mft_reconciliation_interval = std::chrono::minutes(1);
-constexpr auto mft_full_reconciliation_interval = std::chrono::minutes(30);
 constexpr auto mft_live_poll_interval = std::chrono::milliseconds(250);
 constexpr wchar_t mft_auto_snapshot_name[] = L"mft-index.snapshot";
 constexpr wchar_t mft_auto_snapshot_marker[] =
@@ -173,6 +173,20 @@ std::wstring join_volumes(const std::vector<std::wstring>& volumes) {
         result += volume;
     }
     return result.empty() ? L"(none)" : result;
+}
+
+bool same_mounted_volumes(
+    const std::vector<VolumeLiveState>& states,
+    const std::vector<esm::NtfsVolumeInfo>& discovered) {
+    if (states.size() != discovered.size()) return false;
+    for (const auto& volume : discovered) {
+        const auto found = std::find_if(
+            states.begin(), states.end(), [&](const VolumeLiveState& state) {
+                return state.volume.identity == volume.identity;
+            });
+        if (found == states.end()) return false;
+    }
+    return true;
 }
 
 DWORD catch_up_volume(VolumeLiveState& state,
@@ -416,11 +430,13 @@ void run_mft_auto_service() {
         [&, states = std::move(initial_states), loaded_snapshot]
         (std::stop_token token) mutable {
         bool rebuild_required = loaded_snapshot || states.empty();
-        auto next_full_reconciliation = std::chrono::steady_clock::now();
+        auto next_reconciliation_attempt = std::chrono::steady_clock::now();
+        auto next_volume_discovery = std::chrono::steady_clock::now() +
+                                     mft_reconciliation_interval;
         while (!token.stop_requested() &&
                !runtime.stop.load(std::memory_order_relaxed)) {
             const auto now = std::chrono::steady_clock::now();
-            if (rebuild_required || now >= next_full_reconciliation) {
+            if (rebuild_required && now >= next_reconciliation_attempt) {
                 auto built = build_all_ntfs_volumes();
                 if (built.error == ERROR_SUCCESS && built.failures == 0 &&
                     !built.records.empty()) {
@@ -440,15 +456,14 @@ void run_mft_auto_service() {
                     index.replace(std::move(built.records));
                     states = std::move(built.states);
                     rebuild_required = false;
-                    next_full_reconciliation =
-                        std::chrono::steady_clock::now() +
-                        mft_full_reconciliation_interval;
+                    next_volume_discovery = std::chrono::steady_clock::now() +
+                                            mft_reconciliation_interval;
                     log_event(EVENTLOG_INFORMATION_TYPE,
                               L"Reconciled " + volumes + L" with " +
                                   std::to_wstring(count) + L" entries");
                     release_transient_process_memory();
                 } else {
-                    next_full_reconciliation =
+                    next_reconciliation_attempt =
                         std::chrono::steady_clock::now() +
                         mft_reconciliation_interval;
                     log_event(EVENTLOG_WARNING_TYPE,
@@ -460,8 +475,7 @@ void run_mft_auto_service() {
             if (!rebuild_required) {
                 for (auto& state : states) {
                     if (!state.live) {
-                        rebuild_required = true;
-                        break;
+                        continue;
                     }
                     const auto error = catch_up_volume(state, index);
                     if (error != ERROR_SUCCESS) {
@@ -471,8 +485,32 @@ void run_mft_auto_service() {
                                       std::to_wstring(error) +
                                       L"; scheduling an MFT reconciliation");
                         rebuild_required = true;
+                        next_reconciliation_attempt =
+                            std::chrono::steady_clock::now();
                         break;
                     }
+                }
+
+                if (!rebuild_required && now >= next_volume_discovery) {
+                    const auto discovery =
+                        esm::discover_mounted_ntfs_volumes();
+                    if (discovery.error == ERROR_SUCCESS &&
+                        !same_mounted_volumes(states, discovery.volumes)) {
+                        log_event(EVENTLOG_INFORMATION_TYPE,
+                                  L"Mounted NTFS volume set changed; "
+                                  L"scheduling an MFT reconciliation");
+                        rebuild_required = true;
+                        next_reconciliation_attempt =
+                            std::chrono::steady_clock::now();
+                    } else if (discovery.error != ERROR_SUCCESS) {
+                        log_event(EVENTLOG_WARNING_TYPE,
+                                  L"Mounted NTFS volume discovery failed, "
+                                  L"error=" +
+                                      std::to_wstring(discovery.error));
+                    }
+                    next_volume_discovery =
+                        std::chrono::steady_clock::now() +
+                        mft_reconciliation_interval;
                 }
             }
 

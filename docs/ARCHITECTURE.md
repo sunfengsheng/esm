@@ -85,8 +85,8 @@ NTFS 路径重建以文件引用号和父引用号连接 MFT 节点。多卷模�
 3. 重建路径并加卷命名空间；
 4. 合并进 MetadataIndex；
 5. 启动每卷 live 更新；
-6. 常规协调约每分钟，完整协调约每 30 分钟；
-7. 周期性保存机器级 snapshot。
+6. 约每 250 ms 读取各卷 USN Journal，并约每分钟重新发现挂载卷；
+7. 仅在 snapshot 启动后建立 live 边界、USN checkpoint 失效/读取失败或挂载卷集合变化时执行完整 MFT reconciliation，并在该时点刷新机器级 snapshot。
 
 ### 4.2 单卷 live provider
 
@@ -123,7 +123,7 @@ rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `
 
 默认多卷 `mft-auto` 路径不再长期保留每卷 `NtfsCatalog`：初始 MFT 记录命名空间化后直接构建全局 `MetadataIndex`，后续 `MetadataIndex::apply_ntfs_changes` 直接处理 raw USN create/update/rename/delete，并在目录重命名时刷新受影响后代。单卷 live/snapshot/WAL 路径仍使用 `NtfsCatalog`。当前 snapshot 加载仍先物化完整 `vector<FileRecord>`；UTF-16 arena、约 2.30 GiB 构建峰值、排序索引和搜索结构持久化仍是后续 memory-map/压缩重点。
 
-多卷全量 reconciliation 并行枚举各卷，但不再把结果逐卷直接追加到未预留容量的总 vector。协调器先持有已完成的每卷结果，求和得到最终记录数，对统一 `vector<FileRecord>` 一次性 `reserve`，再移动合并，并在每卷 move-insert 后立即释放源记录 buffer，从而消除 C:/D:/E: 追加过程中的大块中间 buffer。索引替换和 snapshot 阶段结束后调用 `_heapmin` 释放 CRT heap 中完全空闲的 region，再调用 `HeapCompact`；该路径降低 Private Bytes，不执行 Working Set trim。
+多卷全量 reconciliation 并行枚举各卷，但不再把结果逐卷直接追加到未预留容量的总 vector。协调器先持有已完成的每卷结果，求和得到最终记录数，对统一 `vector<FileRecord>` 一次性 `reserve`，再移动合并，并在每卷 move-insert 后立即释放源记录 buffer。2026-07-25 的长期服务复测进一步确认：即使调用 `_heapmin`/`HeapCompact`，每 30 分钟重建时产生的数百万独立路径字符串和新旧索引重叠仍会让 CRT heap 保留约一代索引容量。默认多卷服务因此改为 USN 驱动、异常触发完整修复，不再按固定 30 分钟无条件替换整个索引；完整修复后仍执行堆整理，但不使用 Working Set trim。
 
 ## 6. 名称 trigram 倒排索引
 

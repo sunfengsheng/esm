@@ -16,9 +16,9 @@
 - 默认 Pipe 为 `everything_sm_service`；
 - 使用 `mft-index.snapshot` 加速重启；
 - 约每 250 ms 轮询 live 更新；
-- 约每分钟执行常规协调，每 30 分钟执行完整协调；
-- 每 5 分钟或累计约 100,000 个变化后异步刷新 snapshot；
-- 完整协调会短时显著增加内存；2026-07-25 修复版会一次性预留多卷合并 vector，并在协调后归还空闲 CRT heap region。判断是否回归时应同时观察 Private Bytes 和协调完成后的稳定值，不能只看 Working Set。
+- 约每 250 ms 读取 USN 增量，约每分钟重新发现挂载的本地 NTFS 卷；
+- 不再每 30 分钟无条件重建完整索引；只在 snapshot 启动后、USN checkpoint 失效/读取失败或卷集合变化时执行完整 reconciliation 并刷新 snapshot；
+- 完整修复仍会短时显著增加内存；修复版会精确预留多卷合并 vector，并在协调后归还空闲 CRT heap region。判断回归时应观察 Private Bytes，不能只看 Working Set。
 
 2026-07-25 10:25 的本机安装验证：
 
@@ -26,7 +26,7 @@
 - Event Log 于 10:26:06 记录 `Reconciled C:, D:, E: with 3264391 entries`；
 - PID 38636 在首次协调完成后的 12 次采样中稳定约 437.00 MiB Private Bytes / 441.27 MiB Working Set；
 - `esm_cli query everything_sm_service "123456789.txt"` 可返回 `D:\test1\123456789.txt`；
-- 首次协调过程峰值和第二次 30 分钟协调尚未验证，运维判断不能只引用上述首轮稳定值。
+- 18:12 再次检查发现，固定 30 分钟重建多轮执行后已升到约 901.44 MiB Private Bytes / 886.39 MiB Working Set，峰值约 3426.80 MiB；因此上述 437 MiB 仅是首轮值。最新代码已移除无条件周期重建，并于 18:20 完成提升安装；18:21:36 首次 repair 后回落到约 436.50 MiB Private Bytes / 439.54 MiB Working Set。应在 18:51 之后检查 Event Log，确认没有健康状态下的新周期 `Reconciled` 事件。
 
 ### 单卷 MFT 服务
 

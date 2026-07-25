@@ -20,6 +20,8 @@
 
 ### Performance
 
+- 2026-07-25 18:12 复测确认，修复版安装服务在多轮固定 30 分钟 reconciliation 后仍升到约 901.44 MiB Private Bytes / 886.39 MiB Working Set，峰值约 3426.80 MiB；原因是完整 MFT 路径字符串和新旧搜索索引每轮重叠，释放后仍被 CRT heap 保留。
+- 默认多卷服务改为 USN Journal 驱动：每 250 ms 增量跟随、每分钟轻量检查挂载卷，只在启动建立 live 边界、USN checkpoint 失效/读取失败或卷集合变化时执行完整 MFT repair，取消固定 30 分钟全量替换。新的 Release 服务 SHA-256 为 `B808B460467F32BC0567EBD9A2EB28853EABF05B71FD570012E911D0C56CCBB1`；已于 18:20 通过 UAC 安装，18:21:36 完成首次 C:/D:/E: repair 后为约 436.50 MiB Private Bytes / 439.54 MiB Working Set。需运行超过原 30 分钟边界，确认不再出现健康状态下的周期 `Reconciled` 事件。
 - `CompactRecord` 从 48 字节压缩到固定 40 字节：正常父关系保存 31 位记录索引，只有父记录缺失时才保存稀疏 64 位 `ParentIdAnchor`；真实 3,264,188 条单索引记录容量由约 149.42 MiB 降到约 124.52 MiB。
 - 路径签名 owner 从“每记录一个 32 位索引”改为目录 bitset + rank prefix + 稀疏异常路径回退，owner 元数据由约 12.45 MiB 降到约 0.58 MiB。
 - 当前代码在真实 snapshot 独立基准中的稳定 Private Bytes 中位数由约 473.04 MiB 降到约 436.32 MiB，基础结构容量由约 466.16 MiB 降到约 429.41 MiB；同机 Everything 合计约 316.77 MiB，粗略约为其 1.38 倍，记录集和格式不同，仍不能声称达到 Everything。

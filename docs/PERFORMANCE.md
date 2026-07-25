@@ -150,6 +150,10 @@ Everything 的同机样本为 1.4.1.1030：主进程约 312.78 MiB Private Bytes
 
 IPC 正确返回 `D:\test1\123456789.txt`。首次 `123456789.txt` 冷查询出现 1765.96 ms 服务端异常样本，紧接着 6 次重复查询为 0.333–0.449 ms；`windows` 查询为 5.678 ms。该结果说明热查询恢复到毫秒级，但仍需单独分析首次冷查询延迟。本次安装发生在首次协调开始前，没有同步采到协调过程峰值；第二次 30 分钟完整协调也尚未发生。因此目前可以确认“新服务首轮协调后未停留在 900 MiB”，但还不能确认长期多轮协调完全不再增长。
 
+后续在 18:12 的长期复查推翻了首轮稳定假设：PID 38636 在 18:04:41 又完成一次固定周期 reconciliation 后为 901.44 MiB Private Bytes / 886.39 MiB Working Set，进程历史峰值为 3426.80 MiB Private Bytes / 3372.33 MiB Working Set。15:31、16:02、16:32、17:03、17:34、18:04 均有完整协调事件，说明增长与无条件全量替换直接相关。精确 reserve 只消除了总 vector 扩容，无法消除数百万 `std::wstring` 路径分配以及新旧完整搜索索引重叠后造成的 CRT heap 保留。
+
+最新策略取消固定 30 分钟完整替换，稳定期只读取 USN 增量并每分钟轻量发现挂载卷；完整 MFT repair 仅在 snapshot 启动、USN checkpoint 失效/读取失败或卷集合变化时触发。这样避免健康服务反复制造多 GiB 构建峰值和约一代索引的堆保留，同时保留 journal gap 和新卷恢复路径。该策略的 Release 服务 SHA-256 为 `B808B460467F32BC0567EBD9A2EB28853EABF05B71FD570012E911D0C56CCBB1`，已于 18:20 通过 UAC 安装。新 PID 33288 在 18:21:36 首次 repair 后为约 436.50 MiB Private Bytes / 439.54 MiB Working Set；`123456789.txt`、`windows`、`path:test1` 服务端查询分别约 0.922 ms、7.061 ms、4.089 ms。尚需在 18:51 之后确认没有固定周期 reconciliation，并继续采样稳定内存。
+
 没有保留 `EmptyWorkingSet`/`SetProcessWorkingSetSize(-1, -1)` 方案：它只能改变任务管理器 Working Set，并会增加冷页缺页和首次宽泛查询延迟。当前只在大阶段结束后调用 `_heapmin` 归还完全空闲的 CRT heap region，并调用 `HeapCompact` 整理进程堆。
 
 ## 6. 已知慢路径
@@ -179,7 +183,7 @@ IPC 正确返回 `D:\test1\123456789.txt`。首次 `123456789.txt` 冷查询出�
 
 ## 8. 下一步
 
-- 等待并采样第二次及后续 30 分钟完整协调，确认 Private Bytes 不会再次从约 437 MiB 增长到约 900 MiB；
+- 安装 USN 驱动修复版并连续运行超过原 30 分钟周期，确认没有新的无条件 reconciliation 事件且 Private Bytes 保持接近首轮基线；
 - 将 snapshot 直接流式读入紧凑索引，降低当前约 2.30 GiB 的单进程构建峰值；
 - 减少完整路径重复和 UTF-16 字符串对象开销；
 - 将名称索引直接持久化或并行/增量构建；

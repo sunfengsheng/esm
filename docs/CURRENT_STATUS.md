@@ -10,7 +10,7 @@
 - 读取 NTFS MFT，重建父子关系和完整路径。
 - 多卷记录命名空间合并。
 - USN Journal 增量创建、删除、重命名和更新处理。
-- 约每分钟协调、约每 30 分钟完整协调。
+- 约每 250 ms 跟随 USN Journal，并约每分钟检查挂载卷集合；完整 MFT reconciliation 只在启动建立 live 边界、USN checkpoint 失效/读取失败或卷集合变化时触发。
 - 普通目录递归扫描，以及 `ReadDirectoryChangesW` 触发后的树级重新扫描回退。
 
 ### 持久化
@@ -122,7 +122,9 @@
 
 2026-07-25 10:25 已通过 UAC 安装 SHA-256 为 `66DA638E502E33DE06D2F4CE93F1C37220369D2B121CC29F3C5F3C645077A72B` 的最新服务。Event Log 显示 10:26:06 完成 C:/D:/E: 首次全量协调；随后 12 次采样的 Private Bytes 为 436.97–437.03 MiB、中位数 437.00 MiB，Working Set 为 441.24–441.29 MiB、中位数 441.27 MiB。D 盘 `D:\test1\123456789.txt` 可正常返回，热查询为 0.333–0.449 ms；首次冷查询曾出现 1765.96 ms 异常样本，仍需继续分析。
 
-单进程真实 snapshot 构建采用 10 ms 采样时，峰值仍约 2279.45 MiB Working Set / 2299.08 MiB Private Bytes；旧安装服务完整 reconciliation 的本轮峰值约 2501.88 MiB，既有更高样本约 2.57 GiB。新服务首次协调的过程峰值未被同步采集，第二次 30 分钟完整协调尚未验证，因此目前只能确认首轮协调后的稳定占用已从旧版约 900 MiB 回落，不能提前声称长期多轮协调问题已经彻底解决。下一阶段继续验证多轮协调，并减少完整 `vector<FileRecord>` 物化、压缩 UTF-16 字符 arena 和排序索引、把稳定搜索结构持久化或 mmap。
+18:12 的长期复查确认固定周期问题仍存在：服务在 18:04:41 完整协调后为约 901.44 MiB Private Bytes / 886.39 MiB Working Set，历史峰值约 3426.80 MiB Private Bytes。精确 reserve 没有解决数百万独立路径字符串和新旧索引重叠造成的 CRT heap 保留。最新工作区已取消健康状态下每 30 分钟无条件全量替换，改为 USN 增量跟随、每分钟轻量卷发现，并只在启动、journal gap/错误或卷集合变化时完整修复。Release SHA-256 为 `B808B460467F32BC0567EBD9A2EB28853EABF05B71FD570012E911D0C56CCBB1`，已于 18:20 通过 UAC 安装；18:21:36 首次 repair 后为约 436.50 MiB Private Bytes / 439.54 MiB Working Set。仍需跨过原 30 分钟边界验证没有周期性全量替换。
+
+单进程真实 snapshot 构建采用 10 ms 采样时，峰值仍约 2279.45 MiB Working Set / 2299.08 MiB Private Bytes；完整 repair 仍可能达到多 GiB。下一阶段先验证新调度在超过原 30 分钟周期后保持约 437 MiB，再继续减少完整 `vector<FileRecord>` 物化、压缩 UTF-16 字符 arena 和排序索引、把稳定搜索结构持久化或 mmap。
 
 ## 6. 发布判断
 

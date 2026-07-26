@@ -228,6 +228,20 @@ std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
             response_type = ContentIpcMessageType::status_response;
             response_payload = encode_content_status_response(response);
         }
+    } catch (...) {
+        if (request_frame.header.type == ContentIpcMessageType::search_request) {
+            ContentIpcSearchResponse response;
+            response.error = ERROR_INTERNAL_ERROR;
+            response.message = L"\u5185\u5bb9\u670d\u52a1\u53d1\u751f\u672a\u8bc6\u522b\u7684\u5185\u90e8\u9519\u8bef";
+            response_type = ContentIpcMessageType::search_response;
+            response_payload = encode_content_search_response(response);
+        } else {
+            ContentIpcStatusResponse response;
+            response.error = ERROR_INTERNAL_ERROR;
+            response.status.message = L"\u5185\u5bb9\u670d\u52a1\u53d1\u751f\u672a\u8bc6\u522b\u7684\u5185\u90e8\u9519\u8bef";
+            response_type = ContentIpcMessageType::status_response;
+            response_payload = encode_content_status_response(response);
+        }
     }
 
     try {

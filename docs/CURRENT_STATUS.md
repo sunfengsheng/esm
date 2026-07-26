@@ -134,13 +134,15 @@
 
 已完成第一阶段可运行原型：
 
-- `esm_content_service.exe`：单根目录启动扫描、Xapian 持久数据库、目录 watcher 增量 upsert/delete、独立 `everything_sm_content` Pipe；
+- `esm_content_service.exe`：单根或多根后台启动扫描、显式 `--all-fixed` 固定卷发现、每根 Xapian 持久分片数据库和递归 watcher、全局聚合查询、独立 `everything_sm_content` Pipe；
 - `esm_content_lab.exe`：180 ms debounce、后台查询、过期响应丢弃、名称/路径/内容摘要/相关度列、黄色匹配高亮、双击打开；
 - `esm_content_cli.exe`：status/search 真实 IPC 诊断；
 - 纯文本扩展名白名单、UTF-8/UTF-16 BOM/本地 ANSI 解码、二进制 NUL 检测和 4 MiB 默认上限；
 - Xapian 默认 AND、phrase/boolean/love-hate/wildcard 和 CJK n-gram；
 - 仓库固定包含 Xapian Core 1.4.31 官方发布源码，MinGW 默认从 `third_party/xapian-core` 构建静态库，CI 不依赖预编译 Xapian 包；
-- 协议、提取器、英文/中文查询、摘要高亮、upsert、delete 自动测试；
-- 本机真实 E2E 已验证英文、中文和 watcher 修改后增量命中。
+- 协议、提取器、英文/中文查询、摘要高亮、upsert、delete、分片聚合、路径过滤、root key，以及查询与 60 次 commit 交错的并发自动测试；
+- 本机真实 E2E 已验证英文、中文、两个临时根聚合查询、第二根 watcher 新增文件命中、两个分片目录和停止后重启查询；真实约 26.47 万文档数据库在修复后连续完成多轮查询且服务保持存活。
 
-仍属于实验状态：没有 SCM 注册、NSIS 集成、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、PDF/Office/OCR、ACL impersonation、多 root/provider、内容容量/延迟/长期内存基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+真实内容查询速度目前不快：2026-07-26 使用约 264,692～264,693 个文档、约 4.63 GiB Xapian 数据库，在后台仍扫描时，`limit=100` 的不同查询单次 Named Pipe 往返为 671.9～5807.3 ms；`limit=10` 的重复样本约 237.8～756.9 ms。样本数不足以形成发布级 p50/p95，但足以否定“已经达到 Everything 式即时匹配”。摘要生成会读取 document data 中的完整正文，是当前最明显的查询慢路径。
+
+仍属于实验状态：没有 SCM 注册、NSIS 集成、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、PDF/Office/OCR、ACL impersonation、网络/云盘/可移动卷 provider、持久任务队列、首次建库吞吐/长期内存/真实 GUI 端到端基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

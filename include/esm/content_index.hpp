@@ -72,6 +72,37 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+struct ContentIndexShardSpec {
+    std::filesystem::path root;
+    std::filesystem::path database_path;
+};
+
+class ShardedContentIndex final : public ContentIndex {
+public:
+    explicit ShardedContentIndex(std::vector<ContentIndexShardSpec> shards);
+    ~ShardedContentIndex() override;
+    ShardedContentIndex(const ShardedContentIndex&) = delete;
+    ShardedContentIndex& operator=(const ShardedContentIndex&) = delete;
+
+    void upsert(const ContentDocument& document) override;
+    void remove(const std::filesystem::path& path) override;
+    void commit() override;
+    [[nodiscard]] ContentSearchResponse search(
+        std::wstring_view query, std::size_t limit) const override;
+    [[nodiscard]] ContentIndexStatus status() const override;
+    void set_indexing(bool indexing, std::wstring message = {}) override;
+
+    [[nodiscard]] std::size_t shard_count() const noexcept;
+    [[nodiscard]] ContentIndex& shard(std::size_t index);
+    [[nodiscard]] const ContentIndex& shard(std::size_t index) const;
+    [[nodiscard]] const std::filesystem::path& shard_root(
+        std::size_t index) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 [[nodiscard]] bool is_supported_content_path(
     const std::filesystem::path& path);
 [[nodiscard]] bool extract_plain_text_file(

@@ -6,6 +6,7 @@
 
 ### Added
 
+- 内容服务新增整机内容索引第一阶段：显式 `--all-fixed` 固定卷发现、可重复 `--root`、每根独立 Xapian 分片数据库、全局结果聚合、默认系统/缓存目录排除与多根自动测试。
 - 新增独立 Xapian 文件内容搜索原型：`esm_content_service.exe`、`esm_content_lab.exe`、`esm_content_cli.exe`、独立 Named Pipe、纯文本提取、CJK n-gram、摘要与 UTF-16 高亮。
 - 新增内容协议、Named Pipe、文本提取和 Xapian 生命周期自动测试；仓库固定包含 Xapian Core 1.4.31 上游源码，Windows CI 从源码构建静态库、运行测试并检查三个实验程序的动态依赖。
 
@@ -14,6 +15,7 @@
 
 ### Changed
 
+- 内容服务初次扫描改为每根后台工作线程，Named Pipe 在扫描开始后立即可用；每个根拥有独立递归 watcher，单根 `--db` 模式保持兼容，多根使用 `--db-root\volumes\<root-key>\xapian`。
 - 文件内容索引保持为独立进程和独立数据库，现有 `esm_service.exe`、`MetadataIndex` 与文件名查询路径不链接 Xapian；内容原型改为显式 opt-in，启用后默认通过 `third_party/xapian-core` 可复现构建静态 Xapian，并保留 `SYSTEM` 开发回退。
 
 - 重构根 `README.md`，使其作为项目入口而不是把所有实现细节堆在单一章节中。
@@ -21,12 +23,14 @@
 
 ### Fixed
 
+- 修复内容服务在后台 watcher/初次扫描提交新 Xapian revision 时，并发查询可能抛出不继承 `std::exception` 的 `Xapian::DatabaseModifiedError` 并终止进程的问题：提交与查询快照使用共享/独占 revision 锁协调，数据库变化查询最多重新打开重试 3 次，Pipe、工作线程和服务入口增加非标准异常边界。
 - 修复内容 Pipe 客户端 HANDLE 返回时被局部析构关闭的问题，并修正实验 UI 读取搜索框文本时的终止字符缓冲区越界；真实 status/search IPC、中文查询和 watcher 增量更新恢复可用。
 
 - 文档明确多卷 NTFS 服务、数据存放位置、管理员权限要求和“只能搜索 C 盘”等常见问题的排查步骤。
 
 ### Performance
 
+- 建立首个真实整机内容数据库查询基线：约 264,692～264,693 个文档、4.63 GiB Xapian 数据库、后台仍在扫描时，UI 等价 `limit=100` 的 10 个不同查询单次 IPC 延迟为 671.9～5807.3 ms；`limit=10` 的重复样本约 237.8～756.9 ms。当前内容匹配不能评价为“秒搜”，主要慢路径是读取完整 document data 并为每个返回项生成摘要。
 - 2026-07-25 18:12 复测确认，修复版安装服务在多轮固定 30 分钟 reconciliation 后仍升到约 901.44 MiB Private Bytes / 886.39 MiB Working Set，峰值约 3426.80 MiB；原因是完整 MFT 路径字符串和新旧搜索索引每轮重叠，释放后仍被 CRT heap 保留。
 - 默认多卷服务改为 USN Journal 驱动：每 250 ms 增量跟随、每分钟轻量检查挂载卷，只在启动建立 live 边界、USN checkpoint 失效/读取失败或卷集合变化时执行完整 MFT repair，取消固定 30 分钟全量替换。新的 Release 服务 SHA-256 为 `B808B460467F32BC0567EBD9A2EB28853EABF05B71FD570012E911D0C56CCBB1`；已于 18:20 通过 UAC 安装，18:21:36 完成首次 C:/D:/E: repair 后为约 436.50 MiB Private Bytes / 439.54 MiB Working Set。需运行超过原 30 分钟边界，确认不再出现健康状态下的周期 `Reconciled` 事件。
 - `CompactRecord` 从 48 字节压缩到固定 40 字节：正常父关系保存 31 位记录索引，只有父记录缺失时才保存稀疏 64 位 `ParentIdAnchor`；真实 3,264,188 条单索引记录容量由约 149.42 MiB 降到约 124.52 MiB。

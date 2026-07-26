@@ -181,4 +181,4 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 
 实验 UI 的“内容匹配”列显示 Xapian 摘要，黄色/橙色区域表示命中词；双击可打开文件。内容服务不可用时，状态栏会明确提示“独立内容服务不可用；现有文件名搜索不受影响”。
 
-当前只索引白名单中的纯文本文件，默认跳过大于 4 MiB 的文件，不支持 PDF、Office 和 OCR。首次启动会递归扫描指定根目录；如果 watcher 报告通知溢出，当前需要重启内容服务重新扫描。完整命令、格式列表和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+当前只索引白名单中的纯文本文件，默认跳过大于 4 MiB 的文件，不支持 PDF、Office 和 OCR。可重复使用 `--root`，或显式使用 `--all-fixed` 索引当前可访问的固定盘；多根应指定 `--db-root`，服务会为每根创建独立 Xapian 数据库并聚合查询。`--all-fixed` 不会由安装程序自动开启。默认跳过系统目录和 `.git`、`node_modules` 等缓存/依赖目录，可用 `--exclude` 增补。首次扫描在后台执行；如果 watcher 报告通知溢出，当前需要重启内容服务重新扫描。完整命令、格式列表和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

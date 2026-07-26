@@ -44,7 +44,7 @@ ctest --test-dir build --output-on-failure
 | `esm_service.exe` | Windows SCM 索引服务及服务管理命令 |
 | `esm_server.exe` | 前台扫描、MFT 或 live 索引服务器 |
 | `esm_cli.exe` | 命令行搜索、诊断和服务查询 |
-| `esm_content_service.exe` | 独立 Xapian 文件内容索引服务原型 |
+| `esm_content_service.exe` | 独立 Xapian 文件内容索引服务原型，支持显式固定卷发现和多根分片聚合 |
 | `esm_content_lab.exe` | 独立内容搜索实验 UI，显示摘要和匹配高亮 |
 | `esm_content_cli.exe` | 内容服务状态与 IPC 查询诊断 |
 
@@ -98,7 +98,8 @@ flowchart LR
     ContentLab["esm_content_lab"] --> ContentPipe["everything_sm_content"]
     ContentCLI["esm_content_cli"] --> ContentPipe
     ContentPipe --> ContentService["esm_content_service"]
-    ContentService --> Xapian["独立 Xapian DB"]
+    ContentService --> Shards["按内容根分片"]
+    Shards --> Xapian["独立 Xapian DBs"]
 ```
 
 详细设计见 [架构文档](docs/ARCHITECTURE.md)。

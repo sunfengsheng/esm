@@ -192,6 +192,6 @@ ctest --test-dir build-content --output-on-failure
 
 第一次构建会在构建目录的 `_deps/xapian-1.4.31-build` 中配置并编译静态库。`ESM_XAPIAN_BUILD_JOBS` 只控制 Xapian 子构建并行度。若开发机已经有 ABI 匹配的静态库，可使用 `-DESM_XAPIAN_PROVIDER=SYSTEM`；非 MinGW 编译器目前也必须使用该模式。
 
-`esm_content_tests` 覆盖协议 round-trip、UTF-16 高亮范围、文本编码/大小/二进制过滤以及 Xapian upsert/search/delete 生命周期。CI 的 UCRT64 job 从仓库内源码冷构建 Xapian，测试三个实验程序，并检查内容服务没有动态依赖 Xapian DLL。portable ZIP 和 NSIS 包暂不分发内容搜索二进制，待 Xapian 许可证兼容和分发材料审查完成后再决定发布方式。
+`esm_content_tests` 覆盖协议 round-trip、UTF-16 高亮范围、文本编码/大小/二进制过滤、Xapian upsert/search/delete 生命周期、多 shard 聚合路由、全局 limit、状态汇总、路径排除和数据库 root key。CI 的 UCRT64 job 从仓库内源码冷构建 Xapian，测试三个实验程序，并检查内容服务没有动态依赖 Xapian DLL。开发时可用两个临时 `--root` 配合唯一 `--pipe` 做多根 E2E；不要在自动测试或普通开发启动中使用 `--all-fixed`，避免未经确认触发整机扫描。portable ZIP 和 NSIS 包暂不分发内容搜索二进制，待 Xapian 许可证兼容和分发材料审查完成后再决定发布方式。
 
 由于 Xapian 使用 GPL-2.0-or-later，发布负责人在把该原型纳入正式安装包前必须完成许可证兼容、对应源码、许可证文本和构建材料审查。仅把源码放入 `third_party` 不等于已经完成二进制分发合规。

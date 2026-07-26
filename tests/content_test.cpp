@@ -1,5 +1,6 @@
-﻿#include "esm/content_index.hpp"
+#include "esm/content_index.hpp"
 #include "esm/content_named_pipe.hpp"
+#include "esm/content_roots.hpp"
 #include "esm/content_protocol.hpp"
 
 #include <windows.h>
@@ -255,6 +256,139 @@ void test_plain_text_extraction() {
             "supported content extensions should be case-insensitive and explicit");
 }
 
+void test_content_path_filter_and_root_keys() {
+    TemporaryDirectory directory(L"everything-sm-content-filter");
+    const auto root = directory.path() / L"root";
+    std::filesystem::create_directories(root / L"docs");
+
+    esm::ContentPathFilter defaults(root);
+    require(!defaults.excluded(root / L"docs" / L"notes.txt"),
+            "ordinary content paths should be included");
+    require(defaults.excluded(root / L"Windows" / L"system.log"),
+            "top-level Windows should be excluded by default");
+    require(defaults.excluded(root / L"project" / L".git" / L"config"),
+            ".git directories should be excluded at any depth");
+    require(defaults.excluded(root / L"project" / L"node_modules" / L"x.js"),
+            "node_modules should be excluded at any depth");
+    require(defaults.excluded(directory.path() / L"outside.txt"),
+            "paths outside the configured root should be excluded");
+
+    esm::ContentPathFilter custom(
+        root, false,
+        {std::filesystem::path(L"private"), root / L"docs" / L"generated"});
+    require(!custom.excluded(root / L"Windows" / L"user-created.txt"),
+            "default exclusions should be disableable");
+    require(custom.excluded(root / L"private" / L"secret.txt") &&
+                custom.excluded(root / L"docs" / L"generated" / L"out.txt"),
+            "relative and absolute custom exclusions should be honored");
+
+    const auto first = esm::content_root_database_key(root);
+    const auto repeat = esm::content_root_database_key(root);
+    const auto other = esm::content_root_database_key(directory.path() / L"other");
+    require(!first.empty() && first == repeat && first != other,
+            "content root database keys should be stable and path-specific");
+}
+
+void test_sharded_xapian_index() {
+    TemporaryDirectory directory(L"everything-sm-content-shards");
+    const auto root_a = directory.path() / L"root-a";
+    const auto root_b = directory.path() / L"root-b";
+    std::filesystem::create_directories(root_a);
+    std::filesystem::create_directories(root_b);
+
+    esm::ShardedContentIndex index({
+        {root_a, directory.path() / L"db-a"},
+        {root_b, directory.path() / L"db-b"},
+    });
+    require(index.shard_count() == 2 && index.shard_root(0) == root_a &&
+                index.shard_root(1) == root_b,
+            "sharded index should retain root-to-database mapping");
+
+    const auto path_a = root_a / L"alpha.txt";
+    const auto path_b = root_b / L"beta.txt";
+    index.upsert({path_a, "shared marker alpha", 19, 10});
+    index.upsert({path_b, "shared marker beta", 18, 20});
+    index.commit();
+
+    auto results = index.search(L"shared marker", 10);
+    require(results.estimated_matches == 2 && results.hits.size() == 2,
+            "global content queries should merge matches from all shards");
+    results = index.search(L"shared marker", 1);
+    require(results.estimated_matches == 2 && results.hits.size() == 1,
+            "global content query limits should apply after shard merge");
+
+    index.shard(0).set_indexing(true, L"root a indexing");
+    index.shard(1).set_indexing(false, L"root b ready");
+    auto status = index.status();
+    require(status.documents == 2 && status.ready && status.indexing,
+            "sharded status should sum documents and aggregate indexing state");
+
+    index.remove(path_b);
+    index.commit();
+    require(index.search(L"beta", 10).hits.empty() &&
+                index.status().documents == 1,
+            "remove should route to the shard that owns the path");
+
+    bool outside_rejected = false;
+    try {
+        index.remove(directory.path() / L"outside.txt");
+    } catch (const std::invalid_argument&) {
+        outside_rejected = true;
+    }
+    require(outside_rejected,
+            "documents outside all configured roots should be rejected");
+}
+
+void test_xapian_search_during_commits() {
+    TemporaryDirectory directory(L"everything-sm-content-concurrency");
+    esm::XapianContentIndex index(directory.path() / L"db");
+    const auto path = directory.path() / L"changing.txt";
+    index.upsert({path, "stable marker revision 0", 24, 0});
+    index.commit();
+
+    std::atomic_bool start{false};
+    std::atomic_bool writer_done{false};
+    std::atomic_bool writer_failed{false};
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        try {
+            for (std::int64_t revision = 1; revision <= 60; ++revision) {
+                const auto text =
+                    "stable marker revision " + std::to_string(revision);
+                index.upsert({path, text, text.size(), revision});
+                index.commit();
+                std::this_thread::yield();
+            }
+        } catch (...) {
+            writer_failed.store(true, std::memory_order_release);
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    start.store(true, std::memory_order_release);
+    std::size_t searches = 0;
+    bool search_failed = false;
+    while (!writer_done.load(std::memory_order_acquire) || searches < 120) {
+        try {
+            const auto response = index.search(L"stable marker", 10);
+            if (response.hits.size() != 1 || response.hits.front().path != path) {
+                search_failed = true;
+                break;
+            }
+        } catch (...) {
+            search_failed = true;
+            break;
+        }
+        ++searches;
+    }
+    writer.join();
+
+    require(!writer_failed.load(std::memory_order_acquire),
+            "content writer should survive concurrent searches");
+    require(!search_failed && searches >= 120,
+            "content search should survive concurrent commits");
+}
+
 void test_xapian_index_lifecycle() {
     TemporaryDirectory directory(L"everything-sm-content-xapian");
     const auto database_path = directory.path() / L"db";
@@ -330,6 +464,9 @@ int main() {
         test_protocol_round_trip();
         test_named_pipe_round_trip();
         test_plain_text_extraction();
+        test_content_path_filter_and_root_keys();
+        test_sharded_xapian_index();
+        test_xapian_search_during_commits();
         test_xapian_index_lifecycle();
         std::cout << "all content tests passed\n";
         return 0;

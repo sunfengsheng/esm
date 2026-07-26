@@ -1,4 +1,4 @@
-﻿#include "esm/content_index.hpp"
+#include "esm/content_index.hpp"
 
 #include <xapian.h>
 #include <windows.h>
@@ -8,7 +8,9 @@
 #include <cctype>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -70,6 +72,17 @@ std::wstring invariant_lower(std::wstring_view value) {
         return std::wstring(value);
     }
     return result;
+}
+
+bool path_is_within(const std::filesystem::path& path,
+                    const std::filesystem::path& root) {
+    const auto normalized = invariant_lower(normalized_path(path).wstring());
+    auto prefix = invariant_lower(normalized_path(root).wstring());
+    if (normalized == prefix) return true;
+    if (!prefix.empty() && prefix.back() != L'\\' && prefix.back() != L'/')
+        prefix.push_back(L'\\');
+    return normalized.size() > prefix.size() &&
+           normalized.compare(0, prefix.size(), prefix) == 0;
 }
 
 std::string unique_path_term(const std::filesystem::path& path) {
@@ -239,6 +252,7 @@ struct XapianContentIndex::Impl {
 
     std::filesystem::path database_path;
     mutable std::mutex mutex;
+    mutable std::shared_mutex committed_revision_mutex;
     std::unique_ptr<Xapian::WritableDatabase> database;
     bool ready{};
     bool indexing{};
@@ -274,58 +288,83 @@ void XapianContentIndex::remove(const std::filesystem::path& path) {
 }
 
 void XapianContentIndex::commit() {
+    std::unique_lock revision_lock(impl_->committed_revision_mutex);
     std::scoped_lock lock(impl_->mutex);
     impl_->database->commit();
 }
 
 ContentSearchResponse XapianContentIndex::search(
     std::wstring_view query_text, std::size_t limit) const {
-    ContentSearchResponse response;
-    if (query_text.empty() || limit == 0) return response;
+    ContentSearchResponse empty_response;
+    if (query_text.empty() || limit == 0) return empty_response;
 
     std::filesystem::path database_path;
     {
         std::scoped_lock lock(impl_->mutex);
         database_path = impl_->database_path;
     }
-    Xapian::Database database(path_to_utf8(database_path));
-    Xapian::QueryParser parser;
-    parser.set_database(database);
-    parser.set_default_op(Xapian::Query::OP_AND);
-    parser.set_stemming_strategy(Xapian::QueryParser::STEM_NONE);
-    const unsigned flags = Xapian::QueryParser::FLAG_DEFAULT |
-                           Xapian::QueryParser::FLAG_PHRASE |
-                           Xapian::QueryParser::FLAG_BOOLEAN |
-                           Xapian::QueryParser::FLAG_LOVEHATE |
-                           Xapian::QueryParser::FLAG_WILDCARD |
-                           Xapian::QueryParser::FLAG_NGRAMS;
-    const auto query = parser.parse_query(wide_to_utf8(query_text), flags);
-    Xapian::Enquire enquire(database);
-    enquire.set_query(query);
-    const auto bounded_limit = static_cast<Xapian::doccount>(
-        (std::min<std::size_t>)(limit, 500));
-    const auto matches = enquire.get_mset(0, bounded_limit);
-    response.estimated_matches = matches.get_matches_estimated();
-    response.hits.reserve(matches.size());
 
-    for (auto iterator = matches.begin(); iterator != matches.end(); ++iterator) {
-        std::filesystem::path path;
-        std::string text;
-        if (!unpack_document_data(iterator.get_document().get_data(), path,
-                                  text)) continue;
-        ContentSearchHit hit;
-        hit.path = std::move(path);
-        hit.relevance_percent = iterator.get_percent();
-        const unsigned snippet_flags = Xapian::MSet::SNIPPET_BACKGROUND_MODEL |
-                                       Xapian::MSet::SNIPPET_EXHAUSTIVE |
-                                       Xapian::MSet::SNIPPET_NGRAMS;
-        const auto marked = matches.snippet(text, 260, Xapian::Stem(),
-                                            snippet_flags, "\x01", "\x02",
-                                            "...");
-        decode_snippet(marked, hit.snippet, hit.highlights);
-        response.hits.push_back(std::move(hit));
+    // Keep this read snapshot stable while the service publishes a writer
+    // revision. Multiple searches may still run concurrently.
+    std::shared_lock revision_lock(impl_->committed_revision_mutex);
+
+    constexpr unsigned maximum_attempts = 3;
+    for (unsigned attempt = 0; attempt < maximum_attempts; ++attempt) {
+        try {
+            ContentSearchResponse response;
+            Xapian::Database database(path_to_utf8(database_path));
+            Xapian::QueryParser parser;
+            parser.set_database(database);
+            parser.set_default_op(Xapian::Query::OP_AND);
+            parser.set_stemming_strategy(Xapian::QueryParser::STEM_NONE);
+            const unsigned flags = Xapian::QueryParser::FLAG_DEFAULT |
+                                   Xapian::QueryParser::FLAG_PHRASE |
+                                   Xapian::QueryParser::FLAG_BOOLEAN |
+                                   Xapian::QueryParser::FLAG_LOVEHATE |
+                                   Xapian::QueryParser::FLAG_WILDCARD |
+                                   Xapian::QueryParser::FLAG_NGRAMS;
+            const auto query =
+                parser.parse_query(wide_to_utf8(query_text), flags);
+            Xapian::Enquire enquire(database);
+            enquire.set_query(query);
+            const auto bounded_limit = static_cast<Xapian::doccount>(
+                (std::min<std::size_t>)(limit, 500));
+            const auto matches = enquire.get_mset(0, bounded_limit);
+            response.estimated_matches = matches.get_matches_estimated();
+            response.hits.reserve(matches.size());
+
+            for (auto iterator = matches.begin(); iterator != matches.end();
+                 ++iterator) {
+                std::filesystem::path path;
+                std::string text;
+                if (!unpack_document_data(iterator.get_document().get_data(),
+                                          path, text)) continue;
+                ContentSearchHit hit;
+                hit.path = std::move(path);
+                hit.relevance_percent = iterator.get_percent();
+                const unsigned snippet_flags =
+                    Xapian::MSet::SNIPPET_BACKGROUND_MODEL |
+                    Xapian::MSet::SNIPPET_EXHAUSTIVE |
+                    Xapian::MSet::SNIPPET_NGRAMS;
+                const auto marked = matches.snippet(
+                    text, 260, Xapian::Stem(), snippet_flags, "\x01", "\x02",
+                    "...");
+                decode_snippet(marked, hit.snippet, hit.highlights);
+                response.hits.push_back(std::move(hit));
+            }
+            return response;
+        } catch (const Xapian::DatabaseModifiedError& error) {
+            if (attempt + 1 == maximum_attempts) {
+                throw std::runtime_error(
+                    "content database kept changing during query: " +
+                    error.get_description());
+            }
+        } catch (const Xapian::Error& error) {
+            throw std::runtime_error("Xapian content query failed: " +
+                                     error.get_description());
+        }
     }
-    return response;
+    return empty_response;
 }
 
 ContentIndexStatus XapianContentIndex::status() const {
@@ -343,6 +382,136 @@ void XapianContentIndex::set_indexing(bool indexing, std::wstring message) {
     impl_->indexing = indexing;
     impl_->message = std::move(message);
     impl_->ready = true;
+}
+
+struct ShardedContentIndex::Impl {
+    struct Shard {
+        std::filesystem::path root;
+        std::unique_ptr<XapianContentIndex> index;
+    };
+
+    explicit Impl(std::vector<ContentIndexShardSpec> specs) {
+        if (specs.empty())
+            throw std::invalid_argument("at least one content index shard is required");
+        shards.reserve(specs.size());
+        for (auto& spec : specs) {
+            if (spec.root.empty() || spec.database_path.empty())
+                throw std::invalid_argument("content shard root and database path are required");
+            auto root = normalized_path(spec.root);
+            for (const auto& existing : shards) {
+                if (path_is_within(root, existing.root) ||
+                    path_is_within(existing.root, root)) {
+                    throw std::invalid_argument("content shard roots must not overlap");
+                }
+            }
+            shards.push_back(
+                {std::move(root),
+                 std::make_unique<XapianContentIndex>(
+                     normalized_path(spec.database_path))});
+        }
+    }
+
+    std::size_t route(const std::filesystem::path& path) const {
+        for (std::size_t index = 0; index < shards.size(); ++index) {
+            if (path_is_within(path, shards[index].root)) return index;
+        }
+        throw std::invalid_argument("content document is outside configured roots");
+    }
+
+    std::vector<Shard> shards;
+};
+
+ShardedContentIndex::ShardedContentIndex(
+    std::vector<ContentIndexShardSpec> shards)
+    : impl_(std::make_unique<Impl>(std::move(shards))) {}
+
+ShardedContentIndex::~ShardedContentIndex() = default;
+
+void ShardedContentIndex::upsert(const ContentDocument& document) {
+    impl_->shards[impl_->route(document.path)].index->upsert(document);
+}
+
+void ShardedContentIndex::remove(const std::filesystem::path& path) {
+    impl_->shards[impl_->route(path)].index->remove(path);
+}
+
+void ShardedContentIndex::commit() {
+    for (auto& shard : impl_->shards) shard.index->commit();
+}
+
+ContentSearchResponse ShardedContentIndex::search(
+    std::wstring_view query, std::size_t limit) const {
+    ContentSearchResponse response;
+    if (query.empty() || limit == 0) return response;
+    for (const auto& shard : impl_->shards) {
+        auto partial = shard.index->search(query, limit);
+        const auto remaining =
+            (std::numeric_limits<std::uint64_t>::max)() -
+            response.estimated_matches;
+        response.estimated_matches +=
+            (std::min)(remaining, partial.estimated_matches);
+        response.hits.insert(response.hits.end(),
+                             std::make_move_iterator(partial.hits.begin()),
+                             std::make_move_iterator(partial.hits.end()));
+    }
+    std::stable_sort(response.hits.begin(), response.hits.end(),
+                     [](const ContentSearchHit& left,
+                        const ContentSearchHit& right) {
+                         if (left.relevance_percent != right.relevance_percent)
+                             return left.relevance_percent >
+                                    right.relevance_percent;
+                         return invariant_lower(left.path.wstring()) <
+                                invariant_lower(right.path.wstring());
+                     });
+    if (response.hits.size() > limit) response.hits.resize(limit);
+    return response;
+}
+
+ContentIndexStatus ShardedContentIndex::status() const {
+    ContentIndexStatus aggregate;
+    aggregate.ready = true;
+    std::vector<std::wstring> messages;
+    for (const auto& shard : impl_->shards) {
+        const auto current = shard.index->status();
+        const auto remaining =
+            (std::numeric_limits<std::uint64_t>::max)() - aggregate.documents;
+        aggregate.documents += (std::min)(remaining, current.documents);
+        aggregate.ready = aggregate.ready && current.ready;
+        aggregate.indexing = aggregate.indexing || current.indexing;
+        if (!current.message.empty()) messages.push_back(current.message);
+    }
+    if (aggregate.indexing) {
+        aggregate.message = L"正在建立多卷内容索引（" +
+                            std::to_wstring(impl_->shards.size()) + L" 个根）";
+    } else if (aggregate.ready) {
+        aggregate.message = L"多卷内容索引已就绪（" +
+                            std::to_wstring(impl_->shards.size()) + L" 个根）";
+    } else if (!messages.empty()) {
+        aggregate.message = messages.front();
+    }
+    return aggregate;
+}
+
+void ShardedContentIndex::set_indexing(bool indexing, std::wstring message) {
+    for (auto& shard : impl_->shards)
+        shard.index->set_indexing(indexing, message);
+}
+
+std::size_t ShardedContentIndex::shard_count() const noexcept {
+    return impl_->shards.size();
+}
+
+ContentIndex& ShardedContentIndex::shard(std::size_t index) {
+    return *impl_->shards.at(index).index;
+}
+
+const ContentIndex& ShardedContentIndex::shard(std::size_t index) const {
+    return *impl_->shards.at(index).index;
+}
+
+const std::filesystem::path& ShardedContentIndex::shard_root(
+    std::size_t index) const {
+    return impl_->shards.at(index).root;
 }
 
 bool is_supported_content_path(const std::filesystem::path& path) {

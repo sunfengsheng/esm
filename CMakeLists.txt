@@ -76,6 +76,7 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   add_library(esm_xapian_content
       src/content/xapian_content_index.cpp
+      src/platform/windows/content_roots.cpp
   )
   target_include_directories(esm_xapian_content PUBLIC include)
   target_link_libraries(esm_xapian_content

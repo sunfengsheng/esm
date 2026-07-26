@@ -210,7 +210,7 @@ NSIS 安装程序在覆盖二进制前会停止并卸载旧服务，再安装新
 
 ## 9. 实验内容服务运行说明
 
-`esm_content_service.exe` 当前是控制台服务进程原型，不是 SCM 服务。启动示例：
+`esm_content_service.exe` 当前是控制台服务进程原型，不是 SCM 服务。单根启动示例：
 
 ```powershell
 .\esm_content_service.exe `
@@ -220,6 +220,18 @@ NSIS 安装程序在覆盖二进制前会停止并卸载旧服务，再安装新
   --max-mib 4
 ```
 
-停止时使用 `Ctrl+C`，不要把它注册成正式系统服务。默认 `%PROGRAMDATA%\everything_sm\content\xapian` 与主文件名 snapshot/WAL 无关；开发环境建议显式使用独立 `--db`，避免不同 root 共用数据库。
+多根使用数据库根目录，由服务为每个根创建独立 shard：
 
-当前恢复方式是停止进程、保留或移走独立 Xapian 数据库后重新启动扫描。服务停止期间删除的文件可能形成 stale 文档，目录通知溢出也需要重启校准；正式运维前必须实现自动 reconciliation、日志、SCM recovery、配置和卸载数据策略。
+```powershell
+.\esm_content_service.exe `
+  --root D:\work `
+  --root E:\documents `
+  --db-root D:\everything-sm-content `
+  --exclude D:\work\generated
+```
+
+整机固定盘索引必须由操作者显式传入 `--all-fixed`。该操作会产生明显的首次扫描 CPU、磁盘读取和数据库写入负载，运行前应确认数据库盘空间、排除目录和单文件上限；安装程序不会自动执行。默认排除系统目录和常见缓存目录，`--no-default-excludes` 会扩大扫描范围，应谨慎使用。
+
+停止时使用 `Ctrl+C`，不要把它注册成正式系统服务。单根默认 `%PROGRAMDATA%\everything_sm\content\xapian`；多根布局为 `<db-root>\volumes\<root-key>\xapian`，均与主文件名 snapshot/WAL 无关。初次扫描在后台运行，Pipe 可立即返回状态和已经提交的结果。
+
+当前恢复方式是停止进程、保留或移走对应 shard 数据库后重新启动扫描。服务停止期间删除的文件可能形成 stale 文档，目录通知溢出也需要重启校准；当前没有持久任务队列、自动 reconciliation、日志轮转、SCM recovery、权限模拟、配置和卸载数据策略。

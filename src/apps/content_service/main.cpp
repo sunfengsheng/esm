@@ -1,15 +1,19 @@
 #include "esm/content_index.hpp"
 #include "esm/content_named_pipe.hpp"
+#include "esm/content_roots.hpp"
 #include "esm/directory_watcher.hpp"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 std::atomic_bool stop_requested{false};
@@ -23,22 +27,76 @@ BOOL WINAPI console_handler(DWORD signal) {
     return FALSE;
 }
 
-std::filesystem::path default_database_path() {
+std::filesystem::path default_database_root() {
     wchar_t buffer[32768]{};
     const DWORD length = GetEnvironmentVariableW(
         L"PROGRAMDATA", buffer, static_cast<DWORD>(std::size(buffer)));
     if (length != 0 && length < std::size(buffer)) {
-        return std::filesystem::path(buffer) / L"everything_sm" / L"content" /
-               L"xapian";
+        return std::filesystem::path(buffer) / L"everything_sm" / L"content";
     }
-    return std::filesystem::temp_directory_path() / L"everything_sm-content" /
-           L"xapian";
+    return std::filesystem::temp_directory_path() / L"everything_sm-content";
 }
 
-bool index_path(esm::ContentIndex& index, const std::filesystem::path& path,
+std::filesystem::path normalize_path(const std::filesystem::path& path) {
+    std::error_code error;
+    auto absolute = std::filesystem::absolute(path, error);
+    if (error) absolute = path;
+    return absolute.lexically_normal();
+}
+
+std::wstring lower_path(std::wstring value) {
+    if (value.empty()) return value;
+    const int required = LCMapStringEx(
+        LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, value.data(),
+        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (required <= 0) return value;
+    std::wstring result(static_cast<std::size_t>(required), L'\0');
+    if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, value.data(),
+                      static_cast<int>(value.size()), result.data(), required,
+                      nullptr, nullptr, 0) != required) return value;
+    return result;
+}
+
+bool path_is_within(const std::filesystem::path& path,
+                    const std::filesystem::path& root) {
+    const auto normalized = lower_path(normalize_path(path).wstring());
+    auto prefix = lower_path(normalize_path(root).wstring());
+    if (normalized == prefix) return true;
+    if (!prefix.empty() && prefix.back() != L'\\' && prefix.back() != L'/')
+        prefix.push_back(L'\\');
+    return normalized.size() > prefix.size() &&
+           normalized.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::vector<std::filesystem::path> normalize_roots(
+    std::vector<std::filesystem::path> roots) {
+    for (auto& root : roots) root = normalize_path(root);
+    std::sort(roots.begin(), roots.end(), [](const auto& left, const auto& right) {
+        const auto left_text = lower_path(left.wstring());
+        const auto right_text = lower_path(right.wstring());
+        if (left_text.size() != right_text.size())
+            return left_text.size() < right_text.size();
+        return left_text < right_text;
+    });
+    std::vector<std::filesystem::path> result;
+    for (auto& root : roots) {
+        bool covered = false;
+        for (const auto& existing : result) {
+            if (path_is_within(root, existing)) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) result.push_back(std::move(root));
+    }
+    return result;
+}
+
+bool index_path(esm::ContentIndex& index, const esm::ContentPathFilter& filter,
+                const std::filesystem::path& path,
                 std::size_t maximum_bytes, std::size_t& indexed,
                 std::size_t& skipped) {
-    if (!esm::is_supported_content_path(path)) {
+    if (filter.excluded(path) || !esm::is_supported_content_path(path)) {
         ++skipped;
         return false;
     }
@@ -53,9 +111,10 @@ bool index_path(esm::ContentIndex& index, const std::filesystem::path& path,
     return true;
 }
 
-void initial_scan(esm::ContentIndex& index, const std::filesystem::path& root,
+bool initial_scan(esm::ContentIndex& index, const std::filesystem::path& root,
+                  const esm::ContentPathFilter& filter,
                   std::size_t maximum_bytes) {
-    index.set_indexing(true, L"正在建立纯文本内容索引");
+    index.set_indexing(true, L"正在扫描 " + root.wstring());
     std::size_t indexed{};
     std::size_t skipped{};
     std::size_t pending_commit{};
@@ -70,35 +129,46 @@ void initial_scan(esm::ContentIndex& index, const std::filesystem::path& root,
             error.clear();
             continue;
         }
+        const auto path = iterator->path();
+        if (filter.excluded(path)) {
+            if (iterator->is_directory(error)) iterator.disable_recursion_pending();
+            error.clear();
+            ++skipped;
+            continue;
+        }
         if (!iterator->is_regular_file(error)) {
             error.clear();
             continue;
         }
-        if (index_path(index, iterator->path(), maximum_bytes, indexed, skipped)) {
+        if (index_path(index, filter, path, maximum_bytes, indexed, skipped)) {
             ++pending_commit;
             if (pending_commit >= 500) {
                 index.commit();
                 pending_commit = 0;
                 index.set_indexing(
-                    true, L"正在建立内容索引，已处理 " +
+                    true, L"正在扫描 " + root.wstring() + L"，已索引 " +
                               std::to_wstring(indexed) + L" 个文件");
             }
         }
     }
     index.commit();
+    if (stop_requested.load(std::memory_order_relaxed)) return false;
     index.set_indexing(false,
                        L"内容索引就绪：" + std::to_wstring(indexed) +
                            L" 个文件，跳过 " + std::to_wstring(skipped));
-    std::wcout << L"Initial content scan: indexed=" << indexed
-               << L", skipped=" << skipped << L"\n";
+    std::wcout << L"Initial content scan: root=" << root
+               << L", indexed=" << indexed << L", skipped=" << skipped
+               << L"\n";
+    return true;
 }
 
 void watch_root(esm::ContentIndex& index, const std::filesystem::path& root,
+                const esm::ContentPathFilter& filter,
                 std::size_t maximum_bytes, std::stop_token stop_token) {
     esm::DirectoryWatcher watcher(root);
     if (!watcher.ready()) {
         index.set_indexing(false,
-                           L"内容索引就绪，但目录监视启动失败，错误码 " +
+                           L"内容索引可查询，但目录监视启动失败，错误码 " +
                                std::to_wstring(watcher.error()));
         return;
     }
@@ -119,6 +189,7 @@ void watch_root(esm::ContentIndex& index, const std::filesystem::path& root,
         std::size_t skipped{};
         bool changed = false;
         for (const auto& change : result.changes) {
+            if (filter.excluded(change.path)) continue;
             try {
                 if (change.action == esm::DirectoryChangeAction::removed ||
                     change.action ==
@@ -131,8 +202,8 @@ void watch_root(esm::ContentIndex& index, const std::filesystem::path& root,
                            change.action == esm::DirectoryChangeAction::modified ||
                            change.action ==
                                esm::DirectoryChangeAction::renamed_new_name) {
-                    if (index_path(index, change.path, maximum_bytes, indexed,
-                                   skipped)) changed = true;
+                    if (index_path(index, filter, change.path, maximum_bytes,
+                                   indexed, skipped)) changed = true;
                 }
             } catch (const std::exception&) {
                 ++skipped;
@@ -141,39 +212,81 @@ void watch_root(esm::ContentIndex& index, const std::filesystem::path& root,
         if (changed) index.commit();
         if (result.overflowed) {
             index.set_indexing(false,
-                               L"目录通知溢出；当前原型需要重启服务进行校准");
+                               L"目录通知溢出；当前版本需要重启内容服务校准");
         }
+    }
+}
+
+void scan_and_watch(esm::ContentIndex& index,
+                    const std::filesystem::path& root,
+                    esm::ContentPathFilter filter,
+                    std::size_t maximum_bytes, std::stop_token stop_token) {
+    try {
+        if (!initial_scan(index, root, filter, maximum_bytes)) return;
+        watch_root(index, root, filter, maximum_bytes, stop_token);
+    } catch (const std::exception& exception) {
+        std::cerr << "Content worker failed for " << root.string() << ": "
+                  << exception.what() << "\n";
+        index.set_indexing(false, L"内容索引工作线程失败，请查看服务日志");
+    } catch (...) {
+        std::cerr << "Content worker failed for " << root.string()
+                  << ": unknown non-standard exception\n";
+        index.set_indexing(
+            false,
+            L"\u5185\u5bb9\u7d22\u5f15\u5de5\u4f5c\u7ebf\u7a0b\u53d1\u751f\u672a\u8bc6\u522b\u9519\u8bef\uff0c\u8bf7\u67e5\u770b\u670d\u52a1\u65e5\u5fd7");
     }
 }
 
 void print_usage() {
     std::wcout
         << L"Usage:\n"
-        << L"  esm_content_service --root <directory> [--db <directory>]\n"
-        << L"                      [--pipe <name>] [--max-mib <1-64>]\n\n"
-        << L"Example:\n"
-        << L"  esm_content_service --root D:\\work --pipe "
-           L"everything_sm_content\n";
+        << L"  esm_content_service --root <directory> [--root <directory> ...]\n"
+        << L"  esm_content_service --all-fixed\n"
+        << L"      [--db <directory> | --db-root <directory>]\n"
+        << L"      [--exclude <path> ...] [--no-default-excludes]\n"
+        << L"      [--pipe <name>] [--max-mib <1-64>]\n\n"
+        << L"Notes:\n"
+        << L"  --db is only valid for one root. Multi-root mode creates one\n"
+        << L"  Xapian database per root below --db-root\\volumes.\n\n"
+        << L"Examples:\n"
+        << L"  esm_content_service --root D:\\work\n"
+        << L"  esm_content_service --all-fixed --db-root D:\\esm-content\n";
 }
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::filesystem::path root;
-    auto database = default_database_path();
+    std::vector<std::filesystem::path> roots;
+    std::vector<std::filesystem::path> excluded_paths;
+    std::filesystem::path direct_database;
+    auto database_root = default_database_root();
+    bool direct_database_set = false;
+    bool database_root_set = false;
+    bool all_fixed = false;
+    bool use_default_excludes = true;
     std::wstring pipe = L"everything_sm_content";
     std::size_t maximum_bytes = 4 * 1024 * 1024;
 
-    for (int index = 1; index < argc; ++index) {
-        const std::wstring argument = argv[index];
-        if (argument == L"--root" && index + 1 < argc) {
-            root = argv[++index];
-        } else if (argument == L"--db" && index + 1 < argc) {
-            database = argv[++index];
-        } else if (argument == L"--pipe" && index + 1 < argc) {
-            pipe = argv[++index];
-        } else if (argument == L"--max-mib" && index + 1 < argc) {
+    for (int argument_index = 1; argument_index < argc; ++argument_index) {
+        const std::wstring argument = argv[argument_index];
+        if (argument == L"--root" && argument_index + 1 < argc) {
+            roots.emplace_back(argv[++argument_index]);
+        } else if (argument == L"--all-fixed") {
+            all_fixed = true;
+        } else if (argument == L"--db" && argument_index + 1 < argc) {
+            direct_database = argv[++argument_index];
+            direct_database_set = true;
+        } else if (argument == L"--db-root" && argument_index + 1 < argc) {
+            database_root = argv[++argument_index];
+            database_root_set = true;
+        } else if (argument == L"--exclude" && argument_index + 1 < argc) {
+            excluded_paths.emplace_back(argv[++argument_index]);
+        } else if (argument == L"--no-default-excludes") {
+            use_default_excludes = false;
+        } else if (argument == L"--pipe" && argument_index + 1 < argc) {
+            pipe = argv[++argument_index];
+        } else if (argument == L"--max-mib" && argument_index + 1 < argc) {
             try {
-                const auto mib = std::stoull(argv[++index]);
+                const auto mib = std::stoull(argv[++argument_index]);
                 if (mib == 0 || mib > 64) {
                     print_usage();
                     return 2;
@@ -191,37 +304,95 @@ int wmain(int argc, wchar_t** argv) {
             return 2;
         }
     }
-    if (root.empty()) {
+
+    if (direct_database_set && database_root_set) {
+        std::wcerr << L"--db and --db-root cannot be used together\n";
+        return 2;
+    }
+    if (all_fixed) {
+        auto discovered = esm::discover_fixed_content_roots();
+        roots.insert(roots.end(), discovered.begin(), discovered.end());
+    }
+    roots = normalize_roots(std::move(roots));
+    if (roots.empty()) {
         print_usage();
         return 2;
     }
-
-    std::error_code error;
-    root = std::filesystem::absolute(root, error).lexically_normal();
-    if (error || !std::filesystem::is_directory(root, error)) {
-        std::wcerr << L"Invalid content root: " << root << L"\n";
+    if (roots.size() > 1 && direct_database_set) {
+        std::wcerr << L"--db is only valid when exactly one root is indexed\n";
         return 2;
+    }
+
+    for (const auto& root : roots) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(root, error) || error) {
+            std::wcerr << L"Invalid content root: " << root << L"\n";
+            return 2;
+        }
+    }
+
+    database_root = normalize_path(database_root);
+    std::vector<esm::ContentIndexShardSpec> shard_specs;
+    shard_specs.reserve(roots.size());
+    for (const auto& root : roots) {
+        std::filesystem::path database;
+        if (roots.size() == 1) {
+            database = direct_database_set
+                           ? normalize_path(direct_database)
+                           : database_root / L"xapian";
+        } else {
+            database = database_root / L"volumes" /
+                       esm::content_root_database_key(root) / L"xapian";
+        }
+        shard_specs.push_back({root, std::move(database)});
     }
 
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     SetConsoleCtrlHandler(console_handler, TRUE);
     try {
-        esm::XapianContentIndex index(database);
-        initial_scan(index, root, maximum_bytes);
-        if (stop_requested.load(std::memory_order_relaxed)) return 0;
+        esm::ShardedContentIndex index(shard_specs);
+        std::vector<std::jthread> workers;
+        workers.reserve(index.shard_count());
+        for (std::size_t shard_index = 0; shard_index < index.shard_count();
+             ++shard_index) {
+            auto root_excludes = excluded_paths;
+            for (const auto& spec : shard_specs) {
+                if (path_is_within(spec.database_path,
+                                   index.shard_root(shard_index))) {
+                    root_excludes.push_back(spec.database_path);
+                }
+            }
+            esm::ContentPathFilter filter(index.shard_root(shard_index),
+                                          use_default_excludes,
+                                          std::move(root_excludes));
+            index.shard(shard_index)
+                .set_indexing(true, L"等待后台扫描 " +
+                                        index.shard_root(shard_index).wstring());
+            workers.emplace_back(
+                [&index, shard_index, filter = std::move(filter),
+                 maximum_bytes](std::stop_token token) mutable {
+                    scan_and_watch(index.shard(shard_index),
+                                   index.shard_root(shard_index),
+                                   std::move(filter), maximum_bytes, token);
+                });
+        }
 
-        std::jthread watcher([&](std::stop_token token) {
-            watch_root(index, root, maximum_bytes, token);
-        });
-        std::wcout << L"Content service ready\n"
-                   << L"  root: " << root << L"\n"
-                   << L"  db:   " << database << L"\n"
+        std::wcout << L"Content service started; initial scans run in background\n"
                    << L"  pipe: " << pipe << L"\n";
-        const auto pipe_error = esm::serve_content_named_pipe(
-            pipe, index, stop_requested);
+        for (std::size_t shard_index = 0; shard_index < shard_specs.size();
+             ++shard_index) {
+            std::wcout << L"  root: " << shard_specs[shard_index].root << L"\n"
+                       << L"  db:   " << shard_specs[shard_index].database_path
+                       << L"\n";
+        }
+
+        const auto pipe_error =
+            esm::serve_content_named_pipe(pipe, index, stop_requested);
         stop_requested.store(true, std::memory_order_relaxed);
-        watcher.request_stop();
-        if (watcher.joinable()) watcher.join();
+        for (auto& worker : workers) worker.request_stop();
+        for (auto& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
         if (pipe_error != ERROR_SUCCESS) {
             std::wcerr << L"Content pipe stopped with error " << pipe_error
                        << L"\n";
@@ -229,6 +400,9 @@ int wmain(int argc, wchar_t** argv) {
         }
     } catch (const std::exception& exception) {
         std::cerr << "Content service failed: " << exception.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "Content service failed: unknown non-standard exception\n";
         return 1;
     }
     return 0;

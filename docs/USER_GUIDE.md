@@ -167,3 +167,18 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 ## 10. 当前限制
 
 当前版本尚未提供完整 Everything 查询函数、ETP 协议、Windows 原生预览处理器、完整 Shell 右键扩展、按用户权限模拟查询、签名二进制和自动升级。详情见 [CURRENT_STATUS.md](CURRENT_STATUS.md)。
+
+## 11. 实验性文件内容搜索
+
+当前内容搜索没有集成到正式 `esm_gui.exe`、portable 包和 NSIS 安装流程，需要从源码构建目录手动启动。
+
+```powershell
+.\esm_content_service.exe `
+  --root D:\work `
+  --db "$env:LOCALAPPDATA\everything_sm\content\xapian"
+.\esm_content_lab.exe
+```
+
+实验 UI 的“内容匹配”列显示 Xapian 摘要，黄色/橙色区域表示命中词；双击可打开文件。内容服务不可用时，状态栏会明确提示“独立内容服务不可用；现有文件名搜索不受影响”。
+
+当前只索引白名单中的纯文本文件，默认跳过大于 4 MiB 的文件，不支持 PDF、Office 和 OCR。首次启动会递归扫描指定根目录；如果 watcher 报告通知溢出，当前需要重启内容服务重新扫描。完整命令、格式列表和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

@@ -1,7 +1,8 @@
-﻿cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.25)
 project(everything_sm VERSION 0.1.0 LANGUAGES CXX)
 option(ESM_BUILD_TESTS "Build unit tests" ON)
 option(ESM_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(ESM_BUILD_CONTENT_SEARCH "Build the isolated Xapian content-search prototype" OFF)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -58,6 +59,84 @@ if(MINGW)
   target_link_options(esm_launcher PRIVATE -municode -mwindows -static)
   target_link_options(esm_gui PRIVATE -municode -mwindows -static)
 endif()
+
+if(ESM_BUILD_CONTENT_SEARCH)
+  include(cmake/BuildXapian.cmake)
+  esm_add_xapian_dependency()
+  message(STATUS "Content search uses ${ESM_XAPIAN_DESCRIPTION}")
+
+  add_library(esm_content_protocol
+      src/content/content_protocol.cpp
+      src/platform/windows/content_named_pipe.cpp
+  )
+  target_include_directories(esm_content_protocol PUBLIC include)
+  target_link_libraries(esm_content_protocol PUBLIC advapi32)
+  target_compile_definitions(esm_content_protocol PUBLIC
+      UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+  add_library(esm_xapian_content
+      src/content/xapian_content_index.cpp
+  )
+  target_include_directories(esm_xapian_content PUBLIC include)
+  target_link_libraries(esm_xapian_content
+      PRIVATE esm_xapian_dependency z rpcrt4 ws2_32)
+  target_compile_definitions(esm_xapian_content PUBLIC
+      UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+  add_executable(esm_content_service
+      src/apps/content_service/main.cpp
+  )
+  target_link_libraries(esm_content_service PRIVATE
+      esm_core esm_content_protocol esm_xapian_content)
+
+  add_executable(esm_content_lab WIN32
+      src/apps/content_lab/main.cpp
+      src/apps/gui/resources.rc
+  )
+  target_link_libraries(esm_content_lab PRIVATE
+      esm_content_protocol comctl32 shell32)
+
+  add_executable(esm_content_cli
+      src/apps/content_cli/main.cpp
+  )
+  target_link_libraries(esm_content_cli PRIVATE esm_content_protocol)
+
+  if(ESM_BUILD_TESTS)
+    add_executable(esm_content_tests tests/content_test.cpp)
+    target_link_libraries(esm_content_tests PRIVATE
+        esm_content_protocol esm_xapian_content)
+    add_test(NAME esm_content_tests COMMAND esm_content_tests)
+  endif()
+
+  set(ESM_CONTENT_TARGETS
+      esm_content_protocol
+      esm_xapian_content
+      esm_content_service
+      esm_content_lab
+      esm_content_cli)
+  if(TARGET esm_content_tests)
+    list(APPEND ESM_CONTENT_TARGETS esm_content_tests)
+  endif()
+  foreach(ESM_CONTENT_TARGET IN LISTS ESM_CONTENT_TARGETS)
+    if(MSVC)
+      target_compile_options(${ESM_CONTENT_TARGET}
+          PRIVATE /W4 /permissive- /utf-8)
+    else()
+      target_compile_options(${ESM_CONTENT_TARGET}
+          PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+  endforeach()
+
+  if(MINGW)
+    target_link_options(esm_content_service PRIVATE -municode -static)
+    target_link_options(esm_content_lab PRIVATE -municode -mwindows -static)
+    target_link_options(esm_content_cli PRIVATE -municode -static)
+    if(TARGET esm_content_tests)
+      target_link_options(esm_content_tests PRIVATE -static)
+    endif()
+  endif()
+endif()
+
 if(ESM_BUILD_TESTS)
   enable_testing()
   add_executable(esm_tests tests/test_main.cpp)

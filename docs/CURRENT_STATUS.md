@@ -1,4 +1,4 @@
-# 当前状态（2026-07-25）
+# 当前状态（2026-07-26）
 
 本文描述当前 `main` 分支能力，不代表稳定版本承诺。项目目标是接近 Everything 的体验和性能，但目前不能称为完整复刻或完全兼容。
 
@@ -129,3 +129,18 @@
 ## 6. 发布判断
 
 当前可用于开发验证和个人机器试用，但还不应作为具备完整权限隔离、稳定升级、签名供应链和跨 provider 支持的企业级发布。任何状态变化都必须同步更新本文件和 `CHANGELOG.md`。
+
+## 7. 独立内容搜索原型（2026-07-26）
+
+已完成第一阶段可运行原型：
+
+- `esm_content_service.exe`：单根目录启动扫描、Xapian 持久数据库、目录 watcher 增量 upsert/delete、独立 `everything_sm_content` Pipe；
+- `esm_content_lab.exe`：180 ms debounce、后台查询、过期响应丢弃、名称/路径/内容摘要/相关度列、黄色匹配高亮、双击打开；
+- `esm_content_cli.exe`：status/search 真实 IPC 诊断；
+- 纯文本扩展名白名单、UTF-8/UTF-16 BOM/本地 ANSI 解码、二进制 NUL 检测和 4 MiB 默认上限；
+- Xapian 默认 AND、phrase/boolean/love-hate/wildcard 和 CJK n-gram；
+- 仓库固定包含 Xapian Core 1.4.31 官方发布源码，MinGW 默认从 `third_party/xapian-core` 构建静态库，CI 不依赖预编译 Xapian 包；
+- 协议、提取器、英文/中文查询、摘要高亮、upsert、delete 自动测试；
+- 本机真实 E2E 已验证英文、中文和 watcher 修改后增量命中。
+
+仍属于实验状态：没有 SCM 注册、NSIS 集成、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、PDF/Office/OCR、ACL impersonation、多 root/provider、内容容量/延迟/长期内存基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

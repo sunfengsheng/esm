@@ -207,3 +207,19 @@ NSIS 安装程序在覆盖二进制前会停止并卸载旧服务，再安装新
 - 服务停止期间的变化可在重启协调后恢复；
 - 卸载不会遗留运行中的进程或服务；
 - 安装包和 portable zip 的 SHA-256 已生成。
+
+## 9. 实验内容服务运行说明
+
+`esm_content_service.exe` 当前是控制台服务进程原型，不是 SCM 服务。启动示例：
+
+```powershell
+.\esm_content_service.exe `
+  --root D:\work `
+  --db "$env:LOCALAPPDATA\everything_sm\content\xapian" `
+  --pipe everything_sm_content `
+  --max-mib 4
+```
+
+停止时使用 `Ctrl+C`，不要把它注册成正式系统服务。默认 `%PROGRAMDATA%\everything_sm\content\xapian` 与主文件名 snapshot/WAL 无关；开发环境建议显式使用独立 `--db`，避免不同 root 共用数据库。
+
+当前恢复方式是停止进程、保留或移走独立 Xapian 数据库后重新启动扫描。服务停止期间删除的文件可能形成 stale 文档，目录通知溢出也需要重启校准；正式运维前必须实现自动 reconciliation、日志、SCM recovery、配置和卸载数据策略。

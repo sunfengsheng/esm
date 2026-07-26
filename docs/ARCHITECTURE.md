@@ -248,3 +248,28 @@ GUI 设置、历史、书签、筛选器、运行次数/最近打开记录以及
 - 元数据和图标后台任务不得直接阻塞 UI 线程。
 
 未来架构修改必须同步更新本文件、`docs/CURRENT_STATUS.md` 和 `CHANGELOG.md`。
+
+## 13. 独立 Xapian 内容搜索原型
+
+2026-07-26 新增的内容搜索采用严格的进程和依赖隔离：
+
+```mermaid
+flowchart LR
+    GUI["esm_gui.exe"] --> NamePipe["everything_sm"]
+    NamePipe --> Service["esm_service.exe"]
+    Service --> Metadata["MetadataIndex / MFT / USN"]
+
+    Lab["esm_content_lab.exe"] --> ContentPipe["everything_sm_content"]
+    ContentCLI["esm_content_cli.exe"] --> ContentPipe
+    ContentPipe --> ContentService["esm_content_service.exe"]
+    ContentService --> Extract["纯文本提取器（当前内置）"]
+    ContentService --> Xapian["独立 Xapian DB"]
+```
+
+`esm_service.exe` 和 `esm_gui.exe` 不链接 Xapian，文件名服务也不加载内容数据库。内容服务使用单独的版本化二进制协议、Pipe DACL、数据库目录和两个 Pipe worker。搜索请求返回路径、相关度、摘要以及 UTF-16 code-unit 高亮范围，避免 UI 再解析 UTF-8 字节偏移。
+
+构建时依赖同样隔离：`third_party/xapian-core` 固定保存未经本地修改的 Xapian Core 1.4.31 发布源码，`cmake/BuildXapian.cmake` 通过独立 Autotools 子构建生成静态 `libxapian.a`，再只链接到 `esm_xapian_content`。`esm_core`、`esm_service` 和主 GUI 的依赖图不包含该 imported target。`SYSTEM` provider 仅用于开发机或非 MinGW 工具链显式使用 ABI 匹配的已有静态库。
+
+内容文档当前以规范化小写路径的 FNV-1a 64 位哈希形成 Xapian boolean unique term；正文由 `TermGenerator::FLAG_NGRAMS` 建索引，查询和摘要启用 n-gram。完整路径与提取正文暂存在 Xapian document data 中，因此当前空间模型不能视为最终方案。
+
+启动扫描和 watcher 目前都在 `esm_content_service.exe` 内执行。正式架构计划增加受限 extractor worker、启动 reconciliation、内容正文压缩 sidecar、统一 `FileIdentity(volume + file-id)`、权限过滤和 SCM 生命周期。详细边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

@@ -1,4 +1,4 @@
-﻿# 变更记录
+# 变更记录
 
 本项目采用类似 Keep a Changelog 的结构。尚未发布的修改记录在 `Unreleased`；发布版本时再移动到对应版本标题下。
 
@@ -6,15 +6,22 @@
 
 ### Added
 
+- 新增独立 Xapian 文件内容搜索原型：`esm_content_service.exe`、`esm_content_lab.exe`、`esm_content_cli.exe`、独立 Named Pipe、纯文本提取、CJK n-gram、摘要与 UTF-16 高亮。
+- 新增内容协议、Named Pipe、文本提取和 Xapian 生命周期自动测试；仓库固定包含 Xapian Core 1.4.31 上游源码，Windows CI 从源码构建静态库、运行测试并检查三个实验程序的动态依赖。
+
 - 建立完整文档入口，包括用户手册、查询语法、开发指南、运维手册和当前状态说明。
 - 增加仓库级文档同步规则、pre-commit Hook 和 GitHub Actions 文档检查。
 
 ### Changed
 
+- 文件内容索引保持为独立进程和独立数据库，现有 `esm_service.exe`、`MetadataIndex` 与文件名查询路径不链接 Xapian；内容原型改为显式 opt-in，启用后默认通过 `third_party/xapian-core` 可复现构建静态 Xapian，并保留 `SYSTEM` 开发回退。
+
 - 重构根 `README.md`，使其作为项目入口而不是把所有实现细节堆在单一章节中。
 - 同步架构、性能和路线图文档与当前代码实现。
 
 ### Fixed
+
+- 修复内容 Pipe 客户端 HANDLE 返回时被局部析构关闭的问题，并修正实验 UI 读取搜索框文本时的终止字符缓冲区越界；真实 status/search IPC、中文查询和 watcher 增量更新恢复可用。
 
 - 文档明确多卷 NTFS 服务、数据存放位置、管理员权限要求和“只能搜索 C 盘”等常见问题的排查步骤。
 

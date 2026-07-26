@@ -6,6 +6,7 @@
 
 - [用户手册](USER_GUIDE.md)：安装、启动、GUI 操作、快捷键和故障排查。
 - [查询语法](QUERY_SYNTAX.md)：当前支持的查询表达式和兼容边界。
+- [独立内容搜索原型](CONTENT_SEARCH.md)：Xapian 内容服务、实验 UI、运行方式和已知限制。
 - [当前状态](CURRENT_STATUS.md)：已实现、部分实现、未实现和已知问题。
 
 ## 开发者

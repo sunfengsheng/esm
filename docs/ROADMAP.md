@@ -138,3 +138,17 @@
 3. 用户/架构/运维/性能文档已同步；
 4. `CHANGELOG.md` 已记录；
 5. 不以单一 happy path 代替完整边界声明。
+
+### 2026-07-26 第一阶段进展
+
+已建立独立 Xapian 内容服务、独立 Pipe、CLI 和实验 UI，并完成纯文本提取、CJK n-gram、摘要/高亮、watcher 增量更新和基础自动测试。该阶段只验证技术路径，不改变现有文件名搜索服务。
+
+P7 下一批工作按以下顺序推进：
+
+1. 启动 stale-document reconciliation 和 watcher overflow 自动校准；
+2. 可取消的长期查询 worker 与 UI 关闭生命周期；
+3. 独立受限 extractor worker、超时和崩溃隔离；
+4. 压缩正文 sidecar，避免完整正文直接放大 Xapian document data；
+5. 多 root/provider 配置、SCM 服务和安装/恢复策略；
+6. ACL impersonation、真实容量/性能/长期内存基线；
+7. Xapian GPL 分发合规完成后，再考虑把入口合并进主 GUI。

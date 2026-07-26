@@ -1,10 +1,10 @@
-﻿# everything_sm
+# everything_sm
 
 [![Windows build](https://github.com/sunfengsheng/esm/actions/workflows/windows-build.yml/badge.svg)](https://github.com/sunfengsheng/esm/actions/workflows/windows-build.yml)
 
 `everything_sm` 是一个 clean-room Windows 本地文件搜索引擎，目标是在不复制 Everything 源码的前提下，实现接近 Everything 的文件名搜索体验和性能。
 
-> 当前状态：已实现多卷 NTFS 自动发现、MFT 建库、USN Journal 增量跟踪、快照与 WAL 恢复、Named Pipe 查询服务、Windows SCM 服务、原生 GUI、递归扫描/`ReadDirectoryChangesW` 回退以及 NSIS 安装包。项目仍未达到 Everything 的完整查询语法、完整 NTFS 语义、资源占用和发布成熟度，详见 [当前状态](docs/CURRENT_STATUS.md) 与 [路线图](docs/ROADMAP.md)。
+> 当前状态：已实现多卷 NTFS 自动发现、MFT 建库、USN Journal 增量跟踪、快照与 WAL 恢复、Named Pipe 查询服务、Windows SCM 服务、原生 GUI、递归扫描/`ReadDirectoryChangesW` 回退以及 NSIS 安装包；另有与主服务完全隔离的 Xapian 文件内容搜索实验原型。项目仍未达到 Everything 的完整查询语法、完整 NTFS 语义、资源占用和发布成熟度，内容搜索也尚未进入正式安装流程，详见 [当前状态](docs/CURRENT_STATUS.md)、[内容搜索原型](docs/CONTENT_SEARCH.md) 与 [路线图](docs/ROADMAP.md)。
 
 ## 快速开始
 
@@ -44,6 +44,11 @@ ctest --test-dir build --output-on-failure
 | `esm_service.exe` | Windows SCM 索引服务及服务管理命令 |
 | `esm_server.exe` | 前台扫描、MFT 或 live 索引服务器 |
 | `esm_cli.exe` | 命令行搜索、诊断和服务查询 |
+| `esm_content_service.exe` | 独立 Xapian 文件内容索引服务原型 |
+| `esm_content_lab.exe` | 独立内容搜索实验 UI，显示摘要和匹配高亮 |
+| `esm_content_cli.exe` | 内容服务状态与 IPC 查询诊断 |
+
+内容搜索是显式 opt-in 的实验 target；启用后默认从仓库内 `third_party/xapian-core` 的 Xapian Core 1.4.31 上游源码构建静态库，不依赖预安装的 Xapian 二进制包；详细构建和 GPL 分发边界见 [内容搜索原型](docs/CONTENT_SEARCH.md) 与 [开发指南](docs/DEVELOPMENT.md)。
 
 常用开发命令：
 
@@ -90,6 +95,10 @@ flowchart LR
     Server --> Pipe
     GUI["esm_gui"] --> Pipe
     CLI["esm_cli"] --> Pipe
+    ContentLab["esm_content_lab"] --> ContentPipe["everything_sm_content"]
+    ContentCLI["esm_content_cli"] --> ContentPipe
+    ContentPipe --> ContentService["esm_content_service"]
+    ContentService --> Xapian["独立 Xapian DB"]
 ```
 
 详细设计见 [架构文档](docs/ARCHITECTURE.md)。
@@ -99,6 +108,7 @@ flowchart LR
 - [文档导航](docs/README.md)
 - [用户手册](docs/USER_GUIDE.md)
 - [查询语法](docs/QUERY_SYNTAX.md)
+- [独立内容搜索原型](docs/CONTENT_SEARCH.md)
 - [当前状态](docs/CURRENT_STATUS.md)
 - [架构文档](docs/ARCHITECTURE.md)
 - [开发指南](docs/DEVELOPMENT.md)

@@ -1,4 +1,4 @@
-﻿# 开发指南
+# 开发指南
 
 ## 1. 技术栈
 
@@ -163,3 +163,35 @@ git status --short
 7. `vMAJOR.MINOR.PATCH` tag 发布 GitHub Release。
 
 当前未完成代码签名、自动升级和稳定 SDK 兼容承诺。
+
+## 10. 构建独立内容搜索原型
+
+内容搜索默认不参与普通构建，必须显式传入 `-DESM_BUILD_CONTENT_SEARCH=ON`。完整 Xapian Core 1.4.31 官方发布源码保存在 `third_party/xapian-core`，来源、归档 SHA-256 和许可证记录在 `third_party/README.md`。启用后默认 `ESM_XAPIAN_PROVIDER=BUNDLED` 会通过 `cmake/BuildXapian.cmake` 和 `cmake/build-xapian-mingw.sh` 调用上游 Autotools，生成独立静态 `libxapian.a`；不需要安装 MSYS2 的 `xapian-core` 二进制包。
+
+MinGW64 依赖：
+
+```powershell
+C:\msys64\usr\bin\pacman.exe -S --needed --noconfirm `
+  mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake `
+  mingw-w64-x86_64-zlib make diffutils gawk grep sed perl
+```
+
+Release 构建和测试：
+
+```powershell
+cmake -S . -B build-content -G "MinGW Makefiles" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DESM_BUILD_TESTS=ON `
+  -DESM_BUILD_BENCHMARKS=OFF `
+  -DESM_BUILD_CONTENT_SEARCH=ON `
+  -DESM_XAPIAN_PROVIDER=BUNDLED `
+  -DESM_XAPIAN_BUILD_JOBS=4
+cmake --build build-content --parallel 4
+ctest --test-dir build-content --output-on-failure
+```
+
+第一次构建会在构建目录的 `_deps/xapian-1.4.31-build` 中配置并编译静态库。`ESM_XAPIAN_BUILD_JOBS` 只控制 Xapian 子构建并行度。若开发机已经有 ABI 匹配的静态库，可使用 `-DESM_XAPIAN_PROVIDER=SYSTEM`；非 MinGW 编译器目前也必须使用该模式。
+
+`esm_content_tests` 覆盖协议 round-trip、UTF-16 高亮范围、文本编码/大小/二进制过滤以及 Xapian upsert/search/delete 生命周期。CI 的 UCRT64 job 从仓库内源码冷构建 Xapian，测试三个实验程序，并检查内容服务没有动态依赖 Xapian DLL。portable ZIP 和 NSIS 包暂不分发内容搜索二进制，待 Xapian 许可证兼容和分发材料审查完成后再决定发布方式。
+
+由于 Xapian 使用 GPL-2.0-or-later，发布负责人在把该原型纳入正式安装包前必须完成许可证兼容、对应源码、许可证文本和构建材料审查。仅把源码放入 `third_party` 不等于已经完成二进制分发合规。

@@ -1,0 +1,3 @@
+# Preserve upstream release bytes and executable shell scripts.
+third_party/xapian-core/** -text -whitespace conflict-marker-size=64
+cmake/*.sh text eol=lf

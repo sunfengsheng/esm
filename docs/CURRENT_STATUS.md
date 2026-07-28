@@ -25,7 +25,7 @@
 
 - 普通词、引号、限定字段、排除词。
 - AND/OR/NOT、`&&`/`||`/`|`、圆括号/尖括号分组和固定优先级。
-- `name:`、`path:`、`ext:`（含分号列表）、`file:`、`folder:`、`root:`、`count:`。
+- `name:`、`path:`、`filelist:`（完整文件名/路径列表）、`ext:`（含分号列表）、`file:`、`folder:`、`root:`、`count:`。
 - `child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`，按当前 base + overlay 视图匹配或统计目录直接子项。
 - 通配符、基础正则、数字/大小范围、Everything 大小常量、修改日期、自然周期/滚动 N 单位/月名/星期名日期常量和属性过滤。
 - 大小写、全字、路径、变音符号选项。
@@ -59,7 +59,7 @@
 
 ### Everything 查询兼容
 
-已经有布尔、正则、大小/日期/属性、筛选器、书签、历史和 duplicate 的基础能力；本轮补充了 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`、`|`/`< >`、`ext:` 分号列表、数字/大小范围、大小常量、`datemodified:`，以及 `next/coming` 自然周期、`last/past/prev/next/coming<N><单位>`、英文月份/星期名称日期常量；周起点读取 Windows 当前用户区域设置，并区分“上一个完整周期”的 `last/prev` 与滚动阈值 `past`。`child:` 与子项统计查询目前需要按需遍历当前目录关系，功能结果覆盖增量 overlay，但尚无 Everything 等级的常驻专用子项索引。仍缺少 Everything 的其余函数、宏、创建/访问/最近变化时间族、`unknown`、完整区域化日期与范围、属性族、转义细节和完整兼容测试矩阵。初始全盘基线目前通过 `FSCTL_ENUM_USN_DATA` 获取名称/父关系/属性，不含大小和时间；USN 后续直接变化项已刷新元数据，但旧条目的宽泛 `size:` / `dm:` 查询仍可能漏项，需后续增加低内存 NTFS 元数据基线。
+已经有布尔、正则、大小/日期/属性、筛选器、书签、历史和 duplicate 的基础能力；本轮补充了 `filelist:` 完整文件名/路径列表，以及 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`、`|`/`< >`、`ext:` 分号列表、数字/大小范围、大小常量、`datemodified:`，以及 `next/coming` 自然周期、`last/past/prev/next/coming<N><单位>`、英文月份/星期名称日期常量；周起点读取 Windows 当前用户区域设置，并区分“上一个完整周期”的 `last/prev` 与滚动阈值 `past`。`filelist:` 已覆盖大小写、变音符号、通配符和 base + overlay 语义，但暂未建立专用多值候选索引；`child:` 与子项统计查询目前需要按需遍历当前目录关系，功能结果覆盖增量 overlay，但尚无 Everything 等级的常驻专用子项索引。仍缺少 Everything 的其余函数、宏、创建/访问/最近变化时间族、`unknown`、完整区域化日期与范围、属性族、转义细节和完整兼容测试矩阵。初始全盘基线目前通过 `FSCTL_ENUM_USN_DATA` 获取名称/父关系/属性，不含大小和时间；USN 后续直接变化项已刷新元数据，但旧条目的宽泛 `size:` / `dm:` 查询仍可能漏项，需后续增加低内存 NTFS 元数据基线。
 
 ### NTFS 语义
 

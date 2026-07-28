@@ -613,6 +613,33 @@ ParsedWord parse_word(std::wstring token, ParsedQuery& query) {
         return result;
     }
 
+    if (starts_with(folded, L"filelist:")) {
+        result.term.target = MatchTarget::filename_list;
+        const auto list = std::wstring_view(token).substr(9);
+        std::size_t part_start = 0;
+        while (part_start <= list.size()) {
+            const auto separator = list.find(L'|', part_start);
+            auto part = std::wstring(list.substr(
+                part_start, separator == std::wstring_view::npos
+                    ? list.size() - part_start : separator - part_start));
+            if (part.empty()) {
+                query.valid = false;
+                query.error = L"empty file list item";
+                return result;
+            }
+            result.term.alternatives.push_back(std::move(part));
+            if (separator == std::wstring_view::npos) break;
+            part_start = separator + 1;
+        }
+        result.term.value = result.term.alternatives.front();
+        result.term.wildcard = std::any_of(
+            result.term.alternatives.begin(), result.term.alternatives.end(),
+            [](const std::wstring& value) {
+                return value.find_first_of(L"*?") != std::wstring::npos;
+            });
+        return result;
+    }
+
     const auto scoped = [&](std::wstring_view prefix, MatchTarget target) {
         if (!starts_with(folded, prefix)) return false;
         result.term.target = target;

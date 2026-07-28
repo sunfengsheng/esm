@@ -34,11 +34,21 @@ annual AND report
 |---|---|---|
 | `name:` | 只匹配名称 | `name:report` |
 | `path:` | 匹配完整路径 | `path:projects` |
+| `filelist:` | 按 `|` 分隔的完整文件名或完整路径列表匹配 | `filelist:"report.docx|invoice.pdf"` |
 | `ext:` | 匹配扩展名，可带或不带点；分号分隔多个扩展名 | `ext:jpg;png` |
 | `file:` / `files:` | 只返回文件 | `file: ext:cpp` |
 | `folder:` / `dir:` | 只返回目录 | `folder: name:src` |
 
 `file:` 和 `folder:` 是独立指令，后面不接值。
+
+`filelist:` 的整个列表应放在双引号中，因为普通查询里的未加引号 `|` 仍表示布尔 OR。每个不含路径分隔符或盘符冒号的候选按完整文件名匹配；含 `\`、`/` 或盘符冒号的候选按完整路径匹配。列表项支持 `*` 和 `?` 锚定通配符，并遵守大小写和变音符号选项；空列表项会被拒绝。
+
+```text
+filelist:"report.docx|invoice.pdf"
+filelist:"D:\A\a.txt|D:\B\b.txt"
+```
+
+当前 `filelist:` 使用完整 evaluator 检查多个候选，能看到 base + overlay 的创建、替换和删除，但尚无 Everything 等级的专用多值候选索引；在超大索引上的宽列表查询可能更慢。
 
 ### Everything 风格的名称与路径函数
 
@@ -87,7 +97,7 @@ report !draft
 
 ## 5. 通配符
 
-普通词和 `name:`、`path:`、`ext:` 支持：
+普通词和 `name:`、`path:`、`ext:`、`filelist:` 支持：
 
 - `*`：零个或多个字符；
 - `?`：一个字符。

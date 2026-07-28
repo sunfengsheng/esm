@@ -269,6 +269,68 @@ void test_query_parser() {
     require(!esm::parse_query(L"\"unterminated").valid, "unterminated quote should fail");
 }
 
+
+void test_filelist_query() {
+    const auto parsed =
+        esm::parse_query(L"filelist:\"alpha.txt|beta.log\"");
+    require(parsed.valid && parsed.terms.size() == 1 &&
+                parsed.terms[0].target == esm::MatchTarget::filename_list &&
+                parsed.terms[0].alternatives.size() == 2 &&
+                parsed.terms[0].alternatives[0] == L"alpha.txt" &&
+                parsed.terms[0].alternatives[1] == L"beta.log",
+            "filelist parser preserves pipe-delimited alternatives");
+    require(!esm::parse_query(L"filelist:").valid,
+            "empty filelist is rejected");
+    require(!esm::parse_query(L"filelist:\"alpha.txt||beta.log\"").valid,
+            "empty filelist item is rejected");
+    const auto ordinary_or = esm::parse_query(L"alpha|beta");
+    require(ordinary_or.valid && ordinary_or.terms.size() == 2,
+            "ordinary pipe remains a boolean OR operator");
+
+    esm::MetadataIndex index;
+    std::vector<esm::FileRecord> records;
+    records.push_back(record(1, L"alpha.txt", L"D:\\alpha.txt"));
+    records.push_back(record(2, L"alpha.txt", L"D:\\folder\\alpha.txt"));
+    records.push_back(record(3, L"beta.log", L"D:\\logs\\beta.log"));
+    records.push_back(record(4, L"alphabet.txt", L"D:\\alphabet.txt"));
+    records.push_back(record(5, L"caf\u00e9.txt", L"D:\\caf\u00e9.txt"));
+    index.replace(std::move(records));
+
+    esm::SearchOptions options;
+    options.limit = 20;
+    auto results = index.search(L"filelist:\"alpha.txt|beta.log\"", options);
+    require(results.size() == 3,
+            "filelist matches complete filenames across duplicate paths");
+
+    results = index.search(
+        L"filelist:\"D:\\alpha.txt|D:/folder/alpha.txt\"", options);
+    require(results.size() == 2,
+            "filelist matches complete paths and normalizes separators");
+
+    results = index.search(L"filelist:\"alpha*.txt|*.log\"", options);
+    require(results.size() == 4,
+            "filelist alternatives support anchored wildcards");
+
+    options.case_sensitive = true;
+    require(index.search(L"filelist:\"ALPHA.TXT\"", options).empty(),
+            "filelist honors case-sensitive search");
+    options.case_sensitive = false;
+    options.match_diacritics = false;
+    results = index.search(L"filelist:\"cafe.txt\"", options);
+    require(results.size() == 1 && results.front().record.id == 5,
+            "filelist honors diacritic-insensitive search");
+
+    std::vector<esm::FileRecord> updates;
+    updates.push_back(record(6, L"overlay.tmp", L"D:\\overlay.tmp"));
+    index.apply_delta(std::move(updates), {});
+    results = index.search(L"filelist:\"overlay.tmp\"", options);
+    require(results.size() == 1 && results.front().record.id == 6,
+            "filelist sees overlay creations");
+    index.apply_delta({}, {6});
+    require(index.search(L"filelist:\"overlay.tmp\"", options).empty(),
+            "filelist suppresses overlay deletions");
+}
+
 void test_everything_date_constants() {
     constexpr std::uint64_t ticks_per_second = 10000000ULL;
     constexpr std::uint64_t ticks_per_day = 86400ULL * ticks_per_second;
@@ -2528,7 +2590,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

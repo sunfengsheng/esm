@@ -9,6 +9,7 @@ enum class MatchTarget {
     any,
     name,
     path,
+    filename_list,
     extension,
     name_prefix,
     name_suffix,

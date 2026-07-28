@@ -169,8 +169,12 @@ CompiledTerm compile_term(const QueryTerm& term, bool sensitive,
                                         match_diacritics);
     result.alternatives.reserve(term.alternatives.size());
     for (const auto& alternative : term.alternatives) {
-        result.alternatives.push_back(normalize_match_text(
-            alternative, sensitive, match_diacritics));
+        auto normalized = normalize_match_text(
+            alternative, sensitive, match_diacritics);
+        if (term.target == MatchTarget::filename_list) {
+            std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+        }
+        result.alternatives.push_back(std::move(normalized));
     }
     result.excluded = term.excluded;
     result.wildcard = term.wildcard;
@@ -340,6 +344,50 @@ bool anchored_wildcard_match(std::wstring_view pattern,
     return pattern_index == pattern.size();
 }
 
+bool filename_list_match(const CompiledTerm& term, std::wstring_view name,
+                         std::wstring_view path, bool sensitive) {
+    const auto matches = [&](std::wstring_view candidate,
+                             std::wstring_view pattern, bool normalized) {
+        if (pattern.find_first_of(L"*?") != std::wstring::npos) {
+            if (candidate.find(L'/') != std::wstring_view::npos) {
+                auto normalized_separators = std::wstring(candidate);
+                std::replace(normalized_separators.begin(),
+                             normalized_separators.end(), L'/', L'\\');
+                return anchored_wildcard_match(
+                    pattern, normalized_separators,
+                    normalized ? true : sensitive);
+            }
+            return anchored_wildcard_match(pattern, candidate,
+                                           normalized ? true : sensitive);
+        }
+        if (pattern.size() != candidate.size()) return false;
+        for (std::size_t index = 0; index < pattern.size(); ++index) {
+            wchar_t candidate_char = candidate[index];
+            if (candidate_char == L'/') candidate_char = L'\\';
+            if (normalize_char(candidate_char, normalized ? true : sensitive) !=
+                pattern[index]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (const auto& pattern : term.alternatives) {
+        const bool path_pattern =
+            pattern.find_first_of(L"\\:") != std::wstring::npos;
+        const auto candidate = path_pattern ? path : name;
+        if (matches(candidate, pattern, false)) return true;
+        if (!term.match_diacritics && has_non_ascii(candidate)) {
+            auto normalized = normalize_match_text(candidate, sensitive, false);
+            if (path_pattern) {
+                std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+            }
+            if (matches(normalized, pattern, true)) return true;
+        }
+    }
+    return false;
+}
+
 bool extension_list_match(const CompiledTerm& term, std::wstring_view extension,
                           bool sensitive) {
     const auto matches = [&](std::wstring_view candidate,
@@ -424,6 +472,8 @@ bool term_matches(const CompiledTerm& term, std::wstring_view name,
         return text_match(term, name, sensitive, whole_word);
     case MatchTarget::path:
         return text_match(term, path, sensitive, whole_word);
+    case MatchTarget::filename_list:
+        return filename_list_match(term, name, path, sensitive);
     case MatchTarget::extension: {
         const auto ext = extension_of(name);
         return extension_list_match(term, ext, sensitive);
@@ -1879,9 +1929,17 @@ std::vector<SearchResult> MetadataIndex::search(
     }
     const bool query_reads_path = options.match_path ||
         std::any_of(terms.begin(), terms.end(), [](const CompiledTerm& term) {
-            return term.target == MatchTarget::path ||
+            if (term.target == MatchTarget::path ||
                 term.target == MatchTarget::path_depth ||
-                term.target == MatchTarget::parent_path;
+                term.target == MatchTarget::parent_path) {
+                return true;
+            }
+            return term.target == MatchTarget::filename_list &&
+                std::any_of(term.alternatives.begin(), term.alternatives.end(),
+                            [](const std::wstring& alternative) {
+                                return alternative.find_first_of(L"\\:") !=
+                                    std::wstring::npos;
+                            });
         });
     const bool query_reads_child_counts =
         std::any_of(terms.begin(), terms.end(), [](const CompiledTerm& term) {

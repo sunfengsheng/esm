@@ -6,6 +6,8 @@
 
 ### Added
 
+- 文件名查询新增 Everything 风格的 `filelist:`：双引号中的 `|` 分隔完整文件名或完整路径候选，支持每项 `*`/`?` 锚定通配符、大小写/变音符号选项、路径分隔符归一化以及 base + overlay 增量视图。
+
 - 文件名查询新增 Everything 风格的 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:`；支持单个 `|`、`< >` 分组、`ext:` 分号扩展名列表、数字/大小范围、Everything 大小常量、`datemodified:`、下一个自然周/月/年、滚动 N 年/月/周/日/时/分/秒，以及英文月份/星期日期常量。高级搜索窗口新增文件名前缀、后缀和直接父文件夹条件。
 
 - 内容服务新增整机内容索引第一阶段：显式 `--all-fixed` 固定卷发现、可重复 `--root`、每根独立 Xapian 分片数据库、全局结果聚合、默认系统/缓存目录排除与多根自动测试。

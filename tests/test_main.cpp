@@ -255,6 +255,46 @@ void test_advanced_query_and_sorting() {
     require(parsed.valid && !parsed.program.empty(), "boolean query parses");
     require(!esm::parse_query(L"alpha OR").valid, "dangling boolean operator rejected");
     require(!esm::parse_query(L"(alpha").valid, "unmatched parenthesis rejected");
+    require(!esm::parse_query(L"len:many").valid,
+            "invalid filename length rejected");
+    const auto filename_functions = esm::parse_query(
+        L"startwith:alpha endwith:.txt len:>=10 depth:<=2 parent:D:\\copy");
+    require(filename_functions.valid && filename_functions.terms.size() == 5 &&
+                filename_functions.terms[0].target == esm::MatchTarget::name_prefix &&
+                filename_functions.terms[1].target == esm::MatchTarget::name_suffix &&
+                filename_functions.terms[2].target == esm::MatchTarget::filename_length &&
+                filename_functions.terms[3].target == esm::MatchTarget::path_depth &&
+                filename_functions.terms[4].target == esm::MatchTarget::parent_path,
+            "Everything filename and path functions parse");
+    const auto compatibility_functions = esm::parse_query(
+        L"count:25 root: ext:txt;.log size:1kb..10mb");
+    require(compatibility_functions.valid &&
+                compatibility_functions.max_results == 25 &&
+                compatibility_functions.terms.size() == 3 &&
+                compatibility_functions.terms[0].target ==
+                    esm::MatchTarget::path_depth &&
+                compatibility_functions.terms[1].alternatives.size() == 2 &&
+                compatibility_functions.terms[1].alternatives[0] == L"txt" &&
+                compatibility_functions.terms[1].alternatives[1] == L"log" &&
+                compatibility_functions.terms[2].has_lower_bound &&
+                compatibility_functions.terms[2].has_upper_bound,
+            "Everything count, root, extension-list and range functions parse");
+    require(!esm::parse_query(L"count:many alpha").valid,
+            "invalid count rejected");
+    require(esm::parse_query(L"<alpha|beta> !ext:tmp").valid,
+            "Everything pipe and angle-bracket boolean syntax parses");
+    const auto today_query = esm::parse_query(L"datemodified:today");
+    require(today_query.valid && today_query.terms.size() == 1 &&
+                today_query.terms[0].target ==
+                    esm::MatchTarget::last_write_time &&
+                today_query.terms[0].has_lower_bound &&
+                today_query.terms[0].has_upper_bound &&
+                !today_query.terms[0].upper_inclusive,
+            "relative modified-date interval parses");
+    const auto exact_day_query = esm::parse_query(L"dm:2026-07-28");
+    require(exact_day_query.valid && exact_day_query.terms[0].has_lower_bound &&
+                exact_day_query.terms[0].has_upper_bound,
+            "calendar date expands to the full local day");
     require(esm::natural_compare(L"file2.txt", L"file10.txt") < 0,
             "natural numeric ordering");
 
@@ -262,6 +302,8 @@ void test_advanced_query_and_sorting() {
     auto alpha = record(1, L"alpha2.txt", L"D:\\alpha2.txt");
     alpha.size = 2048;
     alpha.attributes = FILE_ATTRIBUTE_ARCHIVE;
+    alpha.last_write_time = static_cast<std::int64_t>(
+        today_query.terms[0].lower_bound);
     auto beta = record(2, L"beta10.log", L"D:\\beta10.log");
     beta.size = 8 * 1024 * 1024;
     beta.attributes = FILE_ATTRIBUTE_HIDDEN;
@@ -281,6 +323,50 @@ void test_advanced_query_and_sorting() {
     results = index.search(L"attr:hidden", options);
     require(results.size() == 1 && results[0].record.id == 2,
             "attribute predicate");
+    results = index.search(L"startwith:alpha", options);
+    require(results.size() == 3, "startwith filename function");
+    results = index.search(L"endwith:.log", options);
+    require(results.size() == 1 && results[0].record.id == 2,
+            "endwith filename function");
+    results = index.search(L"len:=11", options);
+    require(results.size() == 1 && results[0].record.id == 3,
+            "filename length function");
+    results = index.search(L"depth:=0", options);
+    require(results.size() == 3, "path depth function for volume-root files");
+    results = index.search(L"parents:=1", options);
+    require(results.size() == 1 && results[0].record.id == 4,
+            "parents alias for path depth");
+    results = index.search(L"parent:D:\\copy", options);
+    require(results.size() == 1 && results[0].record.id == 4,
+            "parent exact-folder function excludes subfolders");
+    results = index.search(L"infolder:D:\\", options);
+    require(results.size() == 3,
+            "infolder alias accepts a volume root parent");
+    results = index.search(L"root:", options);
+    require(results.size() == 3,
+            "root function matches entries directly below a volume root");
+    results = index.search(L"ext:txt;log", options);
+    require(results.size() == 4,
+            "semicolon extension list matches every listed extension");
+    results = index.search(L"ext:t*;log", options);
+    require(results.size() == 4,
+            "extension list supports per-extension wildcards");
+    results = index.search(L"size:large", options);
+    require(results.size() == 1 && results[0].record.id == 2,
+            "Everything large size constant");
+    results = index.search(L"size:1mb..10mb", options);
+    require(results.size() == 1 && results[0].record.id == 2,
+            "inclusive size range");
+    results = index.search(L"dm:today", options);
+    require(results.size() == 1 && results[0].record.id == 1,
+            "today modified-date interval matches current local day");
+    results = index.search(L"len:10-11", options);
+    require(results.size() == 4, "numeric hyphen range");
+    results = index.search(L"count:2 alpha", options);
+    require(results.size() == 2, "count function caps query results");
+    results = index.search(L"<alpha|beta> !ext:log", options);
+    require(results.size() == 3,
+            "pipe OR and angle-bracket grouping execute with NOT");
     results = index.search(L"alpha dupe:name-size", options);
     require(results.size() == 2, "duplicate name and size predicate");
     options.sort = esm::SortField::name;
@@ -288,6 +374,86 @@ void test_advanced_query_and_sorting() {
     require(results.size() == 3 && results[0].record.name == L"alpha2.txt" &&
                 results.back().record.name == L"alpha10.txt",
             "natural name sort");
+}
+
+void test_child_count_query_functions() {
+    const auto parsed = esm::parse_query(
+        L"child:alpha empty: childcount:1..3 childfilecount:>=1 "
+        L"childfoldercount:=1");
+    require(parsed.valid && parsed.terms.size() == 5 &&
+                parsed.terms[0].target == esm::MatchTarget::child_name &&
+                parsed.terms[1].target == esm::MatchTarget::direct_child_count &&
+                parsed.terms[2].target == esm::MatchTarget::direct_child_count &&
+                parsed.terms[3].target == esm::MatchTarget::child_file_count &&
+                parsed.terms[4].target == esm::MatchTarget::child_folder_count,
+            "Everything direct-child functions parse");
+    require(!esm::parse_query(L"child:").valid,
+            "empty child filename rejected");
+    require(!esm::parse_query(L"childcount:many").valid,
+            "invalid child count rejected");
+
+    std::vector<esm::FileRecord> records;
+    auto add = [&](std::uint64_t id, std::uint64_t parent_id,
+                   std::wstring name, std::wstring path, bool directory) {
+        auto value = record(id, std::move(name), std::move(path), directory);
+        value.parent_id = parent_id;
+        records.push_back(std::move(value));
+    };
+    add(1, 0, L"Root", LR"(D:\Root)", true);
+    add(2, 1, L"Empty", LR"(D:\Root\Empty)", true);
+    add(3, 1, L"Mixed", LR"(D:\Root\Mixed)", true);
+    add(4, 3, L"Nested", LR"(D:\Root\Mixed\Nested)", true);
+    add(5, 3, L"alpha.txt", LR"(D:\Root\Mixed\alpha.txt)", false);
+    add(6, 4, L"beta.txt", LR"(D:\Root\Mixed\Nested\beta.txt)", false);
+    add(7, 1, L"Files", LR"(D:\Root\Files)", true);
+    add(8, 7, L"gamma.txt", LR"(D:\Root\Files\gamma.txt)", false);
+
+    esm::MetadataIndex index;
+    index.replace(std::move(records));
+    esm::SearchOptions options;
+    options.limit = 20;
+
+    auto results = index.search(L"empty:", options);
+    require(results.size() == 1 && results[0].record.id == 2,
+            "empty function matches only empty folders");
+    results = index.search(L"childcount:=2", options);
+    require(results.size() == 1 && results[0].record.id == 3,
+            "childcount includes direct files and folders");
+    results = index.search(L"childfilecount:=1", options);
+    require(results.size() == 3,
+            "childfilecount counts direct files only");
+    results = index.search(L"childfoldercount:=1", options);
+    require(results.size() == 1 && results[0].record.id == 3,
+            "childfoldercount counts direct folders only");
+    results = index.search(L"file: childcount:=0", options);
+    require(results.empty(), "child count functions never match files");
+    results = index.search(L"child:alpha.txt", options);
+    require(results.size() == 1 && results[0].record.id == 3,
+            "child function matches a direct child filename");
+    results = index.search(L"child:*.txt", options);
+    require(results.size() == 3,
+            "child function supports wildcard child filenames");
+    results = index.search(L"child:Nested", options);
+    require(results.size() == 1 && results[0].record.id == 3,
+            "child function includes direct child folders");
+    results = index.search(L"folder: !child:*.txt", options);
+    require(results.size() == 2,
+            "negated child function combines with folder filtering");
+
+    auto live_child = record(9, L"live.txt", LR"(D:\Root\Empty\live.txt)");
+    live_child.parent_id = 2;
+    index.apply_delta({live_child}, {});
+    require(index.search(L"empty:", options).empty(),
+            "overlay child creation updates empty-folder semantics");
+    results = index.search(L"child:live.txt", options);
+    require(results.size() == 1 && results[0].record.id == 2,
+            "overlay child creation updates child filename semantics");
+    index.apply_delta({}, {9});
+    results = index.search(L"empty:", options);
+    require(results.size() == 1 && results[0].record.id == 2,
+            "overlay child removal restores empty-folder semantics");
+    require(index.search(L"child:live.txt", options).empty(),
+            "overlay child removal clears child filename semantics");
 }
 
 void test_index_rvalue_replace_releases_source() {
@@ -433,6 +599,54 @@ void test_index_direct_ntfs_changes() {
     index.apply_ntfs_changes(identity, L"C:\\", raw_root_id, delete_batch);
     require(index.search(L"before.txt").empty(),
             "direct USN delete suppresses the base record");
+}
+
+void test_direct_ntfs_change_metadata_hydration() {
+    const auto suffix =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root_path = std::filesystem::temp_directory_path() /
+        ("esm-usn-metadata-test-" + std::to_string(suffix));
+    std::filesystem::create_directories(root_path);
+    const auto file_path = root_path / "live-metadata.bin";
+    { std::ofstream(file_path, std::ios::binary) << "live-metadata"; }
+
+    constexpr std::wstring_view identity = L"test-volume-usn-metadata";
+    constexpr std::uint64_t raw_root_id = 5;
+    const auto scoped_root_id =
+        esm::namespace_ntfs_file_id(identity, raw_root_id);
+    auto root = record(scoped_root_id, L"", root_path.wstring(), true);
+    root.parent_id = scoped_root_id;
+    root.attributes = FILE_ATTRIBUTE_DIRECTORY;
+
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> base;
+    base.push_back(std::move(root));
+    index.replace(std::move(base));
+
+    esm::UsnChangeBatch created_batch;
+    created_batch.changes.push_back(
+        {12, raw_root_id, 1, USN_REASON_FILE_CREATE,
+         FILE_ATTRIBUTE_ARCHIVE, L"live-metadata.bin"});
+    index.apply_ntfs_changes(identity, root_path.wstring(), raw_root_id,
+                             created_batch);
+
+    auto results = index.search(L"name:live-metadata.bin size:=13");
+    require(results.size() == 1 && results.front().record.size == 13 &&
+                results.front().record.last_write_time != 0,
+            "direct USN create hydrates size and write time");
+
+    { std::ofstream(file_path, std::ios::binary | std::ios::app) << "-updated"; }
+    esm::UsnChangeBatch updated_batch;
+    updated_batch.changes.push_back(
+        {12, raw_root_id, 2, USN_REASON_DATA_EXTEND,
+         FILE_ATTRIBUTE_ARCHIVE, L"live-metadata.bin"});
+    index.apply_ntfs_changes(identity, root_path.wstring(), raw_root_id,
+                             updated_batch);
+    results = index.search(L"name:live-metadata.bin size:=21");
+    require(results.size() == 1 && results.front().record.size == 21,
+            "direct USN data change refreshes file size");
+
+    std::filesystem::remove_all(root_path);
 }
 
 void test_shared_directory_path_signatures() {
@@ -2189,7 +2403,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

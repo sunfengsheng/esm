@@ -1,4 +1,5 @@
 #include "esm/index.hpp"
+#include "esm/file_metadata.hpp"
 #include "esm/volume_discovery.hpp"
 #include <algorithm>
 #include <array>
@@ -137,18 +138,104 @@ std::wstring normalize_match_text(std::wstring_view value, bool sensitive,
     return result;
 }
 struct CompiledTerm {
-    MatchTarget target{MatchTarget::any}; std::wstring value,wildcard_pattern;
-    bool excluded{},wildcard{},regex{},valid{true},match_diacritics{true}; NumericComparison comparison{NumericComparison::equal};
-    std::uint64_t numeric_value{}; std::uint32_t attribute_mask{}; bool attribute_absent{};
-    std::optional<std::wregex> regex_pattern; std::array<std::uint32_t,256> skip{};
+    MatchTarget target{MatchTarget::any};
+    std::wstring value;
+    std::wstring wildcard_pattern;
+    std::vector<std::wstring> alternatives;
+    bool excluded{};
+    bool wildcard{};
+    bool regex{};
+    bool valid{true};
+    bool match_diacritics{true};
+    NumericComparison comparison{NumericComparison::equal};
+    std::uint64_t numeric_value{};
+    bool has_lower_bound{};
+    bool lower_inclusive{true};
+    std::uint64_t lower_bound{};
+    bool has_upper_bound{};
+    bool upper_inclusive{true};
+    std::uint64_t upper_bound{};
+    std::uint32_t attribute_mask{};
+    bool attribute_absent{};
+    std::optional<std::wregex> regex_pattern;
+    std::array<std::uint32_t, 256> skip{};
 };
-CompiledTerm compile_term(const QueryTerm& term,bool sensitive,bool match_diacritics){CompiledTerm r;r.target=term.target;r.match_diacritics=match_diacritics;r.value=normalize_match_text(term.value,sensitive,match_diacritics);r.excluded=term.excluded;r.wildcard=term.wildcard;r.regex=term.regex;r.comparison=term.comparison;r.numeric_value=term.numeric_value;r.attribute_mask=term.attribute_mask;r.attribute_absent=term.attribute_absent;r.skip.fill((std::uint32_t)std::max<std::size_t>(1,r.value.size()));if(r.value.size()>1)for(std::size_t i=0;i+1<r.value.size();++i)if(r.value[i]<256)r.skip[(unsigned)r.value[i]]=(std::uint32_t)(r.value.size()-i-1);if(r.wildcard){r.wildcard_pattern=L"*"+r.value+L"*";}if(r.regex){try{auto flags=std::regex_constants::ECMAScript;const auto pattern=normalize_match_text(term.value,sensitive,match_diacritics);r.regex_pattern.emplace(pattern,flags);}catch(const std::regex_error&){r.valid=false;}}return r;}
+CompiledTerm compile_term(const QueryTerm& term, bool sensitive,
+                          bool match_diacritics) {
+    CompiledTerm result;
+    result.target = term.target;
+    result.match_diacritics = match_diacritics;
+    result.value = normalize_match_text(term.value, sensitive,
+                                        match_diacritics);
+    result.alternatives.reserve(term.alternatives.size());
+    for (const auto& alternative : term.alternatives) {
+        result.alternatives.push_back(normalize_match_text(
+            alternative, sensitive, match_diacritics));
+    }
+    result.excluded = term.excluded;
+    result.wildcard = term.wildcard;
+    result.regex = term.regex;
+    result.comparison = term.comparison;
+    result.numeric_value = term.numeric_value;
+    result.has_lower_bound = term.has_lower_bound;
+    result.lower_inclusive = term.lower_inclusive;
+    result.lower_bound = term.lower_bound;
+    result.has_upper_bound = term.has_upper_bound;
+    result.upper_inclusive = term.upper_inclusive;
+    result.upper_bound = term.upper_bound;
+    result.attribute_mask = term.attribute_mask;
+    result.attribute_absent = term.attribute_absent;
+    result.skip.fill(static_cast<std::uint32_t>(
+        std::max<std::size_t>(1, result.value.size())));
+    if (result.value.size() > 1) {
+        for (std::size_t index = 0; index + 1 < result.value.size(); ++index) {
+            if (result.value[index] < 256) {
+                result.skip[static_cast<unsigned>(result.value[index])] =
+                    static_cast<std::uint32_t>(result.value.size() - index - 1);
+            }
+        }
+    }
+    if (result.wildcard) result.wildcard_pattern = L"*" + result.value + L"*";
+    if (result.regex) {
+        try {
+            const auto flags = std::regex_constants::ECMAScript;
+            const auto pattern = normalize_match_text(term.value, sensitive,
+                                                      match_diacritics);
+            result.regex_pattern.emplace(pattern, flags);
+        } catch (const std::regex_error&) {
+            result.valid = false;
+        }
+    }
+    return result;
+}
 bool starts_text(std::wstring_view text,const CompiledTerm& term,bool sensitive){if(text.size()<term.value.size())return false;for(std::size_t i=0;i<term.value.size();++i)if(normalize_char(text[i],sensitive)!=term.value[i])return false;return true;}
 bool equal_text(std::wstring_view text,const CompiledTerm& term,bool sensitive){return text.size()==term.value.size()&&starts_text(text,term,sensitive);}
 bool contains_text(std::wstring_view text,const CompiledTerm& term,bool sensitive,bool whole_word){auto needle=std::wstring_view(term.value);if(needle.empty())return true;if(needle.size()>text.size())return false;std::size_t offset=0;while(offset+needle.size()<=text.size()){std::size_t j=needle.size();while(j&&normalize_char(text[offset+j-1],sensitive)==needle[j-1])--j;if(!j){bool left=offset==0||!word_char(text[offset-1]);bool right=offset+needle.size()==text.size()||!word_char(text[offset+needle.size()]);if(!whole_word||(left&&right))return true;++offset;continue;}wchar_t tail=normalize_char(text[offset+needle.size()-1],sensitive);std::size_t shift=needle.size();if(tail<256)shift=term.skip[(unsigned)tail];else for(std::size_t i=0;i+1<needle.size();++i)if(needle[i]==tail)shift=needle.size()-i-1;offset+=std::max<std::size_t>(1,shift);}return false;}
 bool wildcard_text(const CompiledTerm& term,std::wstring_view value,bool sensitive){auto ptn=std::wstring_view(term.wildcard_pattern);std::size_t p=0,v=0,star=std::wstring_view::npos,checkpoint=0;while(v<value.size()){bool same=p<ptn.size()&&ptn[p]!=L'*'&&ptn[p]!=L'?'&&normalize_char(value[v],sensitive)==ptn[p];if(p<ptn.size()&&(ptn[p]==L'?'||same)){++p;++v;}else if(p<ptn.size()&&ptn[p]==L'*'){star=p++;checkpoint=v;}else if(star!=std::wstring_view::npos){p=star+1;v=++checkpoint;}else return false;}while(p<ptn.size()&&ptn[p]==L'*')++p;return p==ptn.size();}
 std::wstring_view extension_of(std::wstring_view name){auto dot=name.find_last_of(L'.');return dot==std::wstring_view::npos||dot+1==name.size()?std::wstring_view{}:name.substr(dot+1);}
-bool compare_number(std::uint64_t value,const CompiledTerm& term){switch(term.comparison){case NumericComparison::equal:return value==term.numeric_value;case NumericComparison::less:return value<term.numeric_value;case NumericComparison::less_equal:return value<=term.numeric_value;case NumericComparison::greater:return value>term.numeric_value;case NumericComparison::greater_equal:return value>=term.numeric_value;}return false;}
+bool compare_number(std::uint64_t value, const CompiledTerm& term) {
+    if (term.has_lower_bound) {
+        if (value < term.lower_bound ||
+            (!term.lower_inclusive && value == term.lower_bound)) {
+            return false;
+        }
+    }
+    if (term.has_upper_bound) {
+        if (value > term.upper_bound ||
+            (!term.upper_inclusive && value == term.upper_bound)) {
+            return false;
+        }
+    }
+    if (term.has_lower_bound || term.has_upper_bound) return true;
+    switch (term.comparison) {
+    case NumericComparison::equal: return value == term.numeric_value;
+    case NumericComparison::less: return value < term.numeric_value;
+    case NumericComparison::less_equal: return value <= term.numeric_value;
+    case NumericComparison::greater: return value > term.numeric_value;
+    case NumericComparison::greater_equal: return value >= term.numeric_value;
+    }
+    return false;
+}
 bool has_non_ascii(std::wstring_view value) {
     return std::any_of(value.begin(), value.end(),
                        [](wchar_t ch) { return ch >= 0x80; });
@@ -206,14 +293,223 @@ bool prefix_text_match(const CompiledTerm& term, std::wstring_view value,
     }
     return starts_text(value, term, sensitive);
 }
-bool term_matches(const CompiledTerm& term,std::wstring_view name,std::wstring_view path,std::uint64_t size,std::int64_t modified,std::uint32_t attributes,bool match_path,bool sensitive,bool whole_word){switch(term.target){case MatchTarget::name:return text_match(term,name,sensitive,whole_word);case MatchTarget::path:return text_match(term,path,sensitive,whole_word);case MatchTarget::extension:{auto ext=extension_of(name);return term.regex||term.wildcard?text_match(term,ext,sensitive,whole_word):exact_text_match(term,ext,sensitive);}case MatchTarget::size:return compare_number(size,term);case MatchTarget::last_write_time:return compare_number(modified<0?0:(std::uint64_t)modified,term);case MatchTarget::attributes:{bool present=(attributes&term.attribute_mask)==term.attribute_mask;return term.attribute_absent?!present:present;}case MatchTarget::any:return text_match(term,name,sensitive,whole_word)||(match_path&&text_match(term,path,sensitive,whole_word));}return false;}
-bool evaluate(const ParsedQuery& query,const std::vector<CompiledTerm>& terms,std::wstring_view name,std::wstring_view path,std::uint64_t size,std::int64_t modified,std::uint32_t attributes,bool match_path,bool sensitive,bool whole_word){if(query.program.empty())return true;std::vector<bool> stack;stack.reserve(query.terms.size());for(auto& instruction:query.program){if(instruction.opcode==QueryOpcode::term){if(instruction.term_index>=terms.size())return false;stack.push_back(term_matches(terms[instruction.term_index],name,path,size,modified,attributes,match_path,sensitive,whole_word));}else if(instruction.opcode==QueryOpcode::logical_not){if(stack.empty())return false;stack.back()=!stack.back();}else{if(stack.size()<2)return false;bool right=stack.back();stack.pop_back();bool left=stack.back();stack.back()=instruction.opcode==QueryOpcode::logical_and?(left&&right):(left||right);}}return stack.size()==1&&stack.back();}
+bool suffix_text_match(const CompiledTerm& term, std::wstring_view value,
+                       bool sensitive) {
+    const auto ends_with_term = [&](std::wstring_view candidate,
+                                    bool normalized) {
+        if (candidate.size() < term.value.size()) return false;
+        const auto suffix = candidate.substr(candidate.size() - term.value.size());
+        return equal_text(suffix, term, normalized ? true : sensitive);
+    };
+    if (!term.match_diacritics) {
+        if (ends_with_term(value, false)) return true;
+        if (!has_non_ascii(value)) return false;
+        const auto normalized = normalize_match_text(value, sensitive, false);
+        return ends_with_term(normalized, true);
+    }
+    return ends_with_term(value, false);
+}
+bool anchored_wildcard_match(std::wstring_view pattern,
+                             std::wstring_view value, bool sensitive) {
+    std::size_t pattern_index = 0;
+    std::size_t value_index = 0;
+    std::size_t star = std::wstring_view::npos;
+    std::size_t checkpoint = 0;
+    while (value_index < value.size()) {
+        const bool same = pattern_index < pattern.size() &&
+            pattern[pattern_index] != L'*' && pattern[pattern_index] != L'?' &&
+            normalize_char(value[value_index], sensitive) == pattern[pattern_index];
+        if (pattern_index < pattern.size() &&
+            (pattern[pattern_index] == L'?' || same)) {
+            ++pattern_index;
+            ++value_index;
+        } else if (pattern_index < pattern.size() &&
+                   pattern[pattern_index] == L'*') {
+            star = pattern_index++;
+            checkpoint = value_index;
+        } else if (star != std::wstring_view::npos) {
+            pattern_index = star + 1;
+            value_index = ++checkpoint;
+        } else {
+            return false;
+        }
+    }
+    while (pattern_index < pattern.size() && pattern[pattern_index] == L'*') {
+        ++pattern_index;
+    }
+    return pattern_index == pattern.size();
+}
+
+bool extension_list_match(const CompiledTerm& term, std::wstring_view extension,
+                          bool sensitive) {
+    const auto matches = [&](std::wstring_view candidate,
+                             bool normalized_candidate) {
+        for (const auto& pattern : term.alternatives) {
+            if (pattern.find_first_of(L"*?") != std::wstring::npos) {
+                if (anchored_wildcard_match(pattern, candidate,
+                                            normalized_candidate ? true
+                                                                 : sensitive)) {
+                    return true;
+                }
+            } else if (pattern.size() == candidate.size()) {
+                bool equal = true;
+                for (std::size_t index = 0; index < pattern.size(); ++index) {
+                    if (normalize_char(candidate[index],
+                                       normalized_candidate ? true : sensitive) !=
+                        pattern[index]) {
+                        equal = false;
+                        break;
+                    }
+                }
+                if (equal) return true;
+            }
+        }
+        return false;
+    };
+    if (matches(extension, false)) return true;
+    if (term.match_diacritics || !has_non_ascii(extension)) return false;
+    const auto normalized = normalize_match_text(extension, sensitive, false);
+    return matches(normalized, true);
+}
+
+std::wstring_view parent_path_of(std::wstring_view path) {
+    while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) {
+        path.remove_suffix(1);
+    }
+    const auto separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring_view::npos) return {};
+    if (separator == 2 && path.size() >= 3 && path[1] == L':') {
+        return path.substr(0, 3);
+    }
+    return path.substr(0, separator);
+}
+std::uint64_t path_depth_of(std::wstring_view path) {
+    const auto parent = parent_path_of(path);
+    if (parent.empty()) return 0;
+    std::size_t start = 0;
+    if (parent.size() >= 3 && parent[1] == L':' &&
+        (parent[2] == L'\\' || parent[2] == L'/')) {
+        start = 3;
+    } else if (parent.size() >= 2 &&
+               (parent[0] == L'\\' || parent[0] == L'/') &&
+               (parent[1] == L'\\' || parent[1] == L'/')) {
+        const auto server_end = parent.find_first_of(L"\\/", 2);
+        if (server_end == std::wstring_view::npos) return 0;
+        const auto share_end = parent.find_first_of(L"\\/", server_end + 1);
+        start = share_end == std::wstring_view::npos ? parent.size() : share_end + 1;
+    }
+    std::uint64_t depth = 0;
+    bool in_component = false;
+    for (std::size_t index = start; index < parent.size(); ++index) {
+        const bool separator = parent[index] == L'\\' || parent[index] == L'/';
+        if (separator) {
+            if (in_component) ++depth;
+            in_component = false;
+        } else {
+            in_component = true;
+        }
+    }
+    if (in_component) ++depth;
+    return depth;
+}
+bool term_matches(const CompiledTerm& term, std::wstring_view name,
+                  std::wstring_view path, std::uint64_t size,
+                  std::int64_t modified, std::uint32_t attributes,
+                  bool directory, bool child_name_match,
+                  std::uint64_t child_file_count,
+                  std::uint64_t child_folder_count, bool match_path,
+                  bool sensitive, bool whole_word) {
+    switch (term.target) {
+    case MatchTarget::name:
+        return text_match(term, name, sensitive, whole_word);
+    case MatchTarget::path:
+        return text_match(term, path, sensitive, whole_word);
+    case MatchTarget::extension: {
+        const auto ext = extension_of(name);
+        return extension_list_match(term, ext, sensitive);
+    }
+    case MatchTarget::name_prefix:
+        return prefix_text_match(term, name, sensitive);
+    case MatchTarget::name_suffix:
+        return suffix_text_match(term, name, sensitive);
+    case MatchTarget::filename_length:
+        return compare_number(name.size(), term);
+    case MatchTarget::path_depth:
+        return compare_number(path_depth_of(path), term);
+    case MatchTarget::parent_path:
+        return exact_text_match(term, parent_path_of(path), sensitive);
+    case MatchTarget::child_name:
+        return directory && child_name_match;
+    case MatchTarget::direct_child_count:
+        return directory &&
+            compare_number(child_file_count + child_folder_count, term);
+    case MatchTarget::child_file_count:
+        return directory && compare_number(child_file_count, term);
+    case MatchTarget::child_folder_count:
+        return directory && compare_number(child_folder_count, term);
+    case MatchTarget::size:
+        return compare_number(size, term);
+    case MatchTarget::last_write_time:
+        return compare_number(modified < 0 ? 0 :
+                              static_cast<std::uint64_t>(modified), term);
+    case MatchTarget::attributes: {
+        const bool present =
+            (attributes & term.attribute_mask) == term.attribute_mask;
+        return term.attribute_absent ? !present : present;
+    }
+    case MatchTarget::any:
+        return text_match(term, name, sensitive, whole_word) ||
+            (match_path && text_match(term, path, sensitive, whole_word));
+    }
+    return false;
+}
+template <typename ChildNameMatch>
+bool evaluate(const ParsedQuery& query,
+              const std::vector<CompiledTerm>& terms,
+              std::wstring_view name, std::wstring_view path,
+              std::uint64_t size, std::int64_t modified,
+              std::uint32_t attributes, bool directory,
+              std::uint64_t child_file_count,
+              std::uint64_t child_folder_count,
+              ChildNameMatch&& child_name_matches, bool match_path,
+              bool sensitive, bool whole_word) {
+    if (query.program.empty()) return true;
+    std::vector<bool> stack;
+    stack.reserve(query.terms.size());
+    for (const auto& instruction : query.program) {
+        if (instruction.opcode == QueryOpcode::term) {
+            if (instruction.term_index >= terms.size()) return false;
+            stack.push_back(term_matches(
+                terms[instruction.term_index], name, path, size, modified,
+                attributes, directory,
+                child_name_matches(instruction.term_index), child_file_count,
+                child_folder_count, match_path, sensitive, whole_word));
+        } else if (instruction.opcode == QueryOpcode::logical_not) {
+            if (stack.empty()) return false;
+            stack.back() = !stack.back();
+        } else {
+            if (stack.size() < 2) return false;
+            const bool right = stack.back();
+            stack.pop_back();
+            const bool left = stack.back();
+            stack.back() = instruction.opcode == QueryOpcode::logical_and
+                ? left && right : left || right;
+        }
+    }
+    return stack.size() == 1 && stack.back();
+}
 int rank_record(const std::vector<CompiledTerm>& terms,
                 std::wstring_view name, std::wstring_view path,
                 bool match_path, bool sensitive) {
     int score = 0;
     for (const auto& term : terms) {
-        if (term.excluded || term.target == MatchTarget::size ||
+        if (term.excluded || term.target == MatchTarget::filename_length ||
+            term.target == MatchTarget::path_depth ||
+            term.target == MatchTarget::parent_path ||
+            term.target == MatchTarget::direct_child_count ||
+            term.target == MatchTarget::child_file_count ||
+            term.target == MatchTarget::child_folder_count ||
+            term.target == MatchTarget::size ||
             term.target == MatchTarget::last_write_time ||
             term.target == MatchTarget::attributes) {
             continue;
@@ -1251,6 +1547,44 @@ void MetadataIndex::apply_ntfs_changes(
         }
     }
 
+    // USN records carry names, parent IDs, attributes, and reasons, but not
+    // file size or timestamps. Copy only directly changed records after their
+    // current paths have been resolved, release the index lock for filesystem
+    // I/O, then merge metadata back only when the record still has that path.
+    // Directory rename descendants keep their existing metadata and only
+    // receive refreshed paths above.
+    std::vector<FileRecord> metadata_updates;
+    metadata_updates.reserve(changed_ids.size());
+    for (const auto id : changed_ids) {
+        if (const auto found = overlay_.find(id); found != overlay_.end()) {
+            metadata_updates.push_back(found->second);
+        }
+    }
+    if (!metadata_updates.empty()) {
+        lock.unlock();
+        metadata_updates.erase(
+            std::remove_if(metadata_updates.begin(), metadata_updates.end(),
+                           [](FileRecord& record) {
+                               return !hydrate_file_metadata(record);
+                           }),
+            metadata_updates.end());
+        lock.lock();
+        for (const auto& update : metadata_updates) {
+            const auto found = overlay_.find(update.id);
+            if (found == overlay_.end() || found->second.path != update.path) {
+                continue;
+            }
+            auto& record = found->second;
+            record.size = update.size;
+            record.creation_time = update.creation_time;
+            record.last_access_time = update.last_access_time;
+            record.last_write_time = update.last_write_time;
+            record.change_time = update.change_time;
+            record.attributes = update.attributes;
+            record.directory = update.directory;
+        }
+    }
+
     if (auto_compaction_threshold_ != 0 &&
         overlay_.size() + removed_.size() >= auto_compaction_threshold_) {
         compact_locked();
@@ -1525,10 +1859,14 @@ FileRecord MetadataIndex::materialize(const CompactRecord& item) const {
 }
 
 std::vector<SearchResult> MetadataIndex::search(
-    std::wstring_view text, const SearchOptions& options) const {
-    if (options.limit == 0) return {};
+    std::wstring_view text, const SearchOptions& requested_options) const {
     const ParsedQuery query = parse_query(text);
     if (!query.valid) return {};
+    SearchOptions options = requested_options;
+    if (query.max_results.has_value()) {
+        options.limit = std::min(options.limit, *query.max_results);
+    }
+    if (options.limit == 0) return {};
     if (query.terms.empty() && !query.directories_only.has_value()) return {};
 
     const bool sensitive = query.case_sensitive.value_or(options.case_sensitive);
@@ -1541,8 +1879,28 @@ std::vector<SearchResult> MetadataIndex::search(
     }
     const bool query_reads_path = options.match_path ||
         std::any_of(terms.begin(), terms.end(), [](const CompiledTerm& term) {
-            return term.target == MatchTarget::path;
+            return term.target == MatchTarget::path ||
+                term.target == MatchTarget::path_depth ||
+                term.target == MatchTarget::parent_path;
         });
+    const bool query_reads_child_counts =
+        std::any_of(terms.begin(), terms.end(), [](const CompiledTerm& term) {
+            return term.target == MatchTarget::direct_child_count ||
+                term.target == MatchTarget::child_file_count ||
+                term.target == MatchTarget::child_folder_count;
+        });
+    constexpr auto no_child_name_slot =
+        std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> child_name_term_indices;
+    std::vector<std::size_t> child_name_slots(terms.size(),
+                                               no_child_name_slot);
+    for (std::size_t index = 0; index < terms.size(); ++index) {
+        if (terms[index].target != MatchTarget::child_name) continue;
+        child_name_slots[index] = child_name_term_indices.size();
+        child_name_term_indices.push_back(index);
+    }
+    const bool query_reads_direct_children = query_reads_child_counts ||
+        !child_name_term_indices.empty();
 
     std::shared_lock lock(mutex_);
     std::vector<Candidate> candidates;
@@ -1806,7 +2164,139 @@ std::vector<SearchResult> MetadataIndex::search(
         }
         candidates.push_back(candidate);
     };
-    const auto accepted = [&](bool directory, std::wstring_view name,
+    struct DirectChildCounts {
+        std::uint32_t files{};
+        std::uint32_t folders{};
+    };
+    const auto directory_count = directory_signature_rank_prefix_.empty()
+        ? std::size_t{} : static_cast<std::size_t>(
+              directory_signature_rank_prefix_.back());
+    std::vector<DirectChildCounts> base_child_counts;
+    std::unordered_map<std::uint64_t, DirectChildCounts> overlay_child_counts;
+    std::vector<std::vector<std::uint8_t>> base_child_name_matches;
+    std::unordered_map<std::uint64_t, std::vector<std::uint8_t>>
+        overlay_child_name_matches;
+    if (query_reads_direct_children) {
+        if (query_reads_child_counts) {
+            base_child_counts.resize(directory_count);
+            overlay_child_counts.reserve(overlay_.size());
+        }
+        base_child_name_matches.assign(
+            child_name_term_indices.size(),
+            std::vector<std::uint8_t>(directory_count));
+        overlay_child_name_matches.reserve(overlay_.size());
+
+        const auto increment_count = [](DirectChildCounts& counts,
+                                        bool directory) {
+            auto& value = directory ? counts.folders : counts.files;
+            if (value != std::numeric_limits<std::uint32_t>::max()) ++value;
+        };
+        const auto mark_base_child = [&](std::size_t parent_index,
+                                         std::wstring_view child_name,
+                                         bool child_directory) {
+            const auto directory_index =
+                directory_signature_index(parent_index);
+            if (directory_index >= directory_count) return;
+            if (query_reads_child_counts) {
+                increment_count(base_child_counts[directory_index],
+                                child_directory);
+            }
+            for (std::size_t slot = 0;
+                 slot < child_name_term_indices.size(); ++slot) {
+                if (base_child_name_matches[slot][directory_index]) continue;
+                if (text_match(terms[child_name_term_indices[slot]], child_name,
+                               sensitive, whole_word)) {
+                    base_child_name_matches[slot][directory_index] = 1;
+                }
+            }
+        };
+        const auto mark_overlay_child = [&](std::uint64_t parent,
+                                            std::wstring_view child_name,
+                                            bool child_directory) {
+            if (query_reads_child_counts) {
+                increment_count(overlay_child_counts[parent],
+                                child_directory);
+            }
+            std::vector<std::uint8_t>* matches = nullptr;
+            for (std::size_t slot = 0;
+                 slot < child_name_term_indices.size(); ++slot) {
+                if (!text_match(terms[child_name_term_indices[slot]],
+                                child_name, sensitive, whole_word)) {
+                    continue;
+                }
+                if (matches == nullptr) {
+                    matches = &overlay_child_name_matches.try_emplace(
+                        parent, child_name_term_indices.size(), 0).first->second;
+                }
+                (*matches)[slot] = 1;
+            }
+        };
+        const auto mark_parent_by_id = [&](std::uint64_t child_id,
+                                           std::uint64_t parent,
+                                           std::wstring_view child_name,
+                                           bool child_directory) {
+            if (parent == 0 || parent == child_id) return;
+            if (const auto overlay_parent = overlay_.find(parent);
+                overlay_parent != overlay_.end()) {
+                if (overlay_parent->second.directory) {
+                    mark_overlay_child(parent, child_name, child_directory);
+                }
+                return;
+            }
+            const auto base_parent = std::lower_bound(
+                records_.begin(), records_.end(), parent,
+                [](const CompactRecord& record, std::uint64_t id) {
+                    return record.id < id;
+                });
+            if (base_parent == records_.end() || base_parent->id != parent ||
+                !base_parent->directory() ||
+                std::binary_search(suppressed_base_ids_.begin(),
+                                   suppressed_base_ids_.end(), parent)) {
+                return;
+            }
+            mark_base_child(static_cast<std::size_t>(
+                                std::distance(records_.begin(), base_parent)),
+                            child_name, child_directory);
+        };
+        for (std::size_t index = 0; index < records_.size(); ++index) {
+            const auto& record = records_[index];
+            if (std::binary_search(suppressed_base_ids_.begin(),
+                                   suppressed_base_ids_.end(), record.id)) {
+                continue;
+            }
+            const auto child_name = name_view(record);
+            if (record.parent_index != missing_parent_index &&
+                record.parent_index < records_.size()) {
+                const auto& base_parent = records_[record.parent_index];
+                if (base_parent.id == record.id) continue;
+                if (const auto overlay_parent = overlay_.find(base_parent.id);
+                    overlay_parent != overlay_.end()) {
+                    if (overlay_parent->second.directory) {
+                        mark_overlay_child(base_parent.id, child_name,
+                                           record.directory());
+                    }
+                    continue;
+                }
+                if (base_parent.directory() &&
+                    !std::binary_search(suppressed_base_ids_.begin(),
+                                        suppressed_base_ids_.end(),
+                                        base_parent.id)) {
+                    mark_base_child(record.parent_index, child_name,
+                                    record.directory());
+                }
+                continue;
+            }
+            mark_parent_by_id(record.id, parent_id(record), child_name,
+                              record.directory());
+        }
+        for (const auto& [id, record] : overlay_) {
+            mark_parent_by_id(id, record.parent_id, record.name,
+                              record.directory);
+        }
+    }
+    constexpr auto no_base_index = std::numeric_limits<std::size_t>::max();
+    const auto accepted = [&](std::uint64_t id, std::size_t base_index,
+                              bool directory, std::wstring_view name,
                               std::wstring_view path, std::uint64_t size,
                               std::int64_t modified,
                               std::uint32_t attributes) {
@@ -1814,8 +2304,39 @@ std::vector<SearchResult> MetadataIndex::search(
             directory != *query.directories_only) {
             return false;
         }
+        DirectChildCounts child_counts;
+        if (query_reads_child_counts && directory) {
+            if (base_index != no_base_index) {
+                const auto count_index = directory_signature_index(base_index);
+                if (count_index < base_child_counts.size()) {
+                    child_counts = base_child_counts[count_index];
+                }
+            } else if (const auto found = overlay_child_counts.find(id);
+                       found != overlay_child_counts.end()) {
+                child_counts = found->second;
+            }
+        }
+        const auto child_name_matches = [&](std::size_t term_index) {
+            if (!directory || term_index >= child_name_slots.size()) {
+                return false;
+            }
+            const auto slot = child_name_slots[term_index];
+            if (slot == no_child_name_slot) return false;
+            if (base_index != no_base_index) {
+                const auto directory_index =
+                    directory_signature_index(base_index);
+                return slot < base_child_name_matches.size() &&
+                    directory_index < base_child_name_matches[slot].size() &&
+                    base_child_name_matches[slot][directory_index] != 0;
+            }
+            const auto found = overlay_child_name_matches.find(id);
+            return found != overlay_child_name_matches.end() &&
+                slot < found->second.size() && found->second[slot] != 0;
+        };
         return evaluate(query, terms, name, path, size, modified, attributes,
-                        options.match_path, sensitive, whole_word);
+                        directory, child_counts.files, child_counts.folders,
+                        child_name_matches, options.match_path, sensitive,
+                        whole_word);
     };
     const auto signature_contains = [](const auto& candidate,
                                        const auto& required) {
@@ -1913,7 +2434,8 @@ std::vector<SearchResult> MetadataIndex::search(
         std::vector<Candidate> overlay_matches;
         overlay_matches.reserve(std::min(overlay_.size(), options.limit));
         for (const auto& [id, record] : overlay_) {
-            if (accepted(record.directory, record.name, record.path,
+            if (accepted(id, no_base_index, record.directory, record.name,
+                         record.path,
                          record.size, record.last_write_time,
                          record.attributes)) {
                 overlay_matches.push_back({
@@ -1954,7 +2476,8 @@ std::vector<SearchResult> MetadataIndex::search(
                 std::wstring path_scratch;
                 const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-                if (!accepted(record.directory(), name, path, record.size,
+                if (!accepted(record.id, index, record.directory(), name, path,
+                              record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
                 }
@@ -2089,7 +2612,8 @@ std::vector<SearchResult> MetadataIndex::search(
                 std::wstring path_scratch;
                 const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-                if (!accepted(record.directory(), name, path, record.size,
+                if (!accepted(record.id, index, record.directory(), name, path,
+                              record.size,
                               record.last_write_time, record.attributes)) {
                     continue;
                 }
@@ -2108,7 +2632,8 @@ std::vector<SearchResult> MetadataIndex::search(
         }
         for (const auto& [id, record] : overlay_) {
             if (!prefix_text_match(prefix_term, record.name, sensitive) ||
-                !accepted(record.directory, record.name, record.path,
+                !accepted(id, no_base_index, record.directory, record.name,
+                         record.path,
                           record.size, record.last_write_time,
                           record.attributes)) {
                 continue;
@@ -2144,7 +2669,8 @@ std::vector<SearchResult> MetadataIndex::search(
             std::wstring path_scratch;
             const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-            if (!accepted(record.directory(), name, path, record.size,
+            if (!accepted(record.id, index, record.directory(), name, path,
+                              record.size,
                           record.last_write_time, record.attributes)) {
                 continue;
             }
@@ -2154,7 +2680,8 @@ std::vector<SearchResult> MetadataIndex::search(
         }
         for (const auto& [id, record] : overlay_) {
             if (!text_match(path_term, record.name, sensitive, whole_word) ||
-                !accepted(record.directory, record.name, record.path,
+                !accepted(id, no_base_index, record.directory, record.name,
+                         record.path,
                           record.size, record.last_write_time,
                           record.attributes)) {
                 continue;
@@ -2176,7 +2703,8 @@ std::vector<SearchResult> MetadataIndex::search(
                     ? prefix_text_match(terms[0], record.name, sensitive)
                     : text_match(terms[0], record.name, sensitive, whole_word);
                 if (already_considered) continue;
-                if (accepted(record.directory, record.name, record.path,
+                if (accepted(id, no_base_index, record.directory, record.name,
+                         record.path,
                              record.size, record.last_write_time,
                              record.attributes)) {
                     consider({rank_record(terms, record.name, record.path,
@@ -2214,7 +2742,8 @@ std::vector<SearchResult> MetadataIndex::search(
             std::wstring path_scratch;
             const auto path = query_reads_path
                     ? path_view(record, path_scratch) : std::wstring_view{};
-            if (accepted(record.directory(), name, path, record.size,
+            if (accepted(record.id, index, record.directory(), name, path,
+                              record.size,
                          record.last_write_time, record.attributes)) {
                 consider({rank_record(terms, name, path, options.match_path,
                                       sensitive),
@@ -2261,7 +2790,8 @@ std::vector<SearchResult> MetadataIndex::search(
         }
         if (!simple_prefix_query && !simple_path_query) {
             for (const auto& [id, record] : overlay_) {
-                if (accepted(record.directory, record.name, record.path,
+                if (accepted(id, no_base_index, record.directory, record.name,
+                         record.path,
                              record.size, record.last_write_time,
                              record.attributes)) {
                     consider({rank_record(terms, record.name, record.path,

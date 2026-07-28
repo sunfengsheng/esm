@@ -34,26 +34,51 @@ annual AND report
 |---|---|---|
 | `name:` | 只匹配名称 | `name:report` |
 | `path:` | 匹配完整路径 | `path:projects` |
-| `ext:` | 匹配扩展名，可带或不带点 | `ext:pdf` |
+| `ext:` | 匹配扩展名，可带或不带点；分号分隔多个扩展名 | `ext:jpg;png` |
 | `file:` / `files:` | 只返回文件 | `file: ext:cpp` |
 | `folder:` / `dir:` | 只返回目录 | `folder: name:src` |
 
 `file:` 和 `folder:` 是独立指令，后面不接值。
+
+### Everything 风格的名称与路径函数
+
+| 语法 | 说明 | 示例 |
+|---|---|---|
+| `startwith:` | 文件名以指定文字开头 | `startwith:report` |
+| `endwith:` | 文件名以指定文字结尾 | `endwith:.pdf` |
+| `len:` | 按文件名 UTF-16 字符数比较 | `len:>=20` |
+| `depth:` / `parents:` | 按相对卷根或共享根的父目录层数比较 | `depth:=0` |
+| `parent:` / `infolder:` / `nosubfolders:` | 只匹配直接位于指定目录中的项目，不包含更深子目录 | `parent:"D:\Projects"` |
+| `root:` | 只匹配直接位于盘符根目录或 UNC 共享根中的项目 | `root:` |
+| `child:` | 匹配含有指定名称的直接子文件或子目录的文件夹 | `child:desktop.ini` |
+| `empty:` | 只匹配没有直接子文件或子目录的空目录 | `empty:` |
+| `childcount:` | 按直接子文件与子目录总数匹配目录 | `childcount:>=10` |
+| `childfilecount:` | 按直接子文件数匹配目录 | `childfilecount:=0` |
+| `childfoldercount:` | 按直接子目录数匹配目录 | `childfoldercount:1..3` |
+| `count:` | 将本次查询结果上限限制为指定非负整数 | `count:100 report` |
+
+`len:`、`depth:` 和三个 `child*count:` 函数支持 `=`、`<`、`<=`、`>`、`>=`，也支持两端包含的 `10..20` 或 `10-20` 范围。`child:`、`empty:` 和所有子项计数函数都只检查直接子级，不递归检查后代，并且自身不会匹配文件。`child:` 支持普通子串和 `*`/`?` 通配符，例如 `child:*.mp3`；`empty:` 等价于“目录且直接子项总数为 0”。`parent:` 比较完整直接父路径；路径包含空格时使用引号。`count:` 与 GUI/IPC 请求上限同时存在时取较小值。高级搜索窗口也可以生成 `startwith:`、`endwith:` 和 `parent:` 条件。
+
+当前这些函数是兼容子集：尚未实现 Everything 在函数参数中的全部通配符、宏展开和范围语义。`child:`/`empty:`/`child*count:` 会在查询开始时根据一致的 base + overlay 视图临时匹配或统计目录直接子项；普通查询不会构建该结构，但在超大目录树上执行直接子项查询仍可能明显慢于 Everything。多个 `child:` 条件目前逐项判断每个直接子名称。
 
 ## 4. 布尔表达式
 
 支持：
 
 - `AND` 或 `&&`
-- `OR` 或 `||`
+- `OR`、`||` 或单个 `|`
 - `NOT` 或独立的 `!`
-- 圆括号
+- 圆括号或 Everything 风格的尖括号 `< >` 分组
 - 词前 `!` 排除该词
 
 优先级从高到低为 `NOT`、`AND`、`OR`。相邻词之间自动插入 AND。
 
 ```text
 path:projects (ext:cpp OR ext:h) NOT path:build
+```
+
+```text
+<report|invoice> !draft
 ```
 
 ```text
@@ -70,6 +95,7 @@ report !draft
 ```text
 name:report-*.pdf
 ext:jp?
+ext:jpg;png;t*
 ```
 
 当前通配符实现是项目自有匹配器，并非 Everything 全部通配符语义。
@@ -102,11 +128,30 @@ size:<=512k
 file: size:=0
 ```
 
-不写比较符时按等于处理。
+不写比较符时按等于处理。还支持两端包含的范围：
+
+```text
+size:1mb..10mb
+size:1mb-10mb
+```
+
+支持 Everything 常用大小常量：
+
+| 常量 | 当前边界 |
+|---|---|
+| `empty` | `size = 0` |
+| `tiny` | `0 < size <= 10 KiB` |
+| `small` | `10 KiB < size <= 100 KiB` |
+| `medium` | `100 KiB < size <= 1 MiB` |
+| `large` | `1 MiB < size <= 16 MiB` |
+| `huge` | `16 MiB < size <= 128 MiB` |
+| `gigantic` | `size > 128 MiB` |
+
+`size:unknown` 尚未实现。多卷服务的 USN 增量会为直接创建或变化的项目刷新大小和修改时间；当前初始全盘 `FSCTL_ENUM_USN_DATA` 基线仍不携带这两项元数据，因此仅依赖大小/日期的宽泛查询在完成低内存 NTFS 元数据基线前可能漏掉尚未被增量刷新过的旧条目。
 
 ## 8. 修改时间过滤
 
-等价前缀：`date:`、`dm:`、`modified:`。
+等价前缀：`date:`、`dm:`、`modified:`、`datemodified:`。
 
 接受本地时间格式：
 
@@ -121,9 +166,20 @@ YYYY-MM-DD HH:MM
 ```text
 dm:>=2026-01-01
 modified:<2026-07-01T12:30
+datemodified:today
 ```
 
-当前未实现 Everything 的相对日期词、日期区间函数和全部时间字段。
+不带比较符的 `YYYY-MM-DD` 会匹配该本地自然日；带比较符时按该本地时间点比较。当前支持以下相对日期词：
+
+- `today`、`yesterday`；
+- `thisweek` / `currentweek`；
+- `lastweek` / `pastweek` / `prevweek`；
+- `thismonth` / `currentmonth`；
+- `lastmonth` / `pastmonth` / `prevmonth`；
+- `thisyear` / `currentyear`；
+- `lastyear` / `pastyear` / `prevyear`。
+
+相对日期使用本地时区，周从星期一开始，内部展开为左闭右开的时间区间。尚未实现 `datecreated:` / `dc:`、`dateaccessed:` / `da:`、`recentchange:` / `rc:`、任意 N 单位相对时间、月份/星期名称和完整日期范围语法。
 
 ## 9. 属性过滤
 
@@ -150,7 +206,15 @@ attr:hidden,system
 attr:!hidden
 ```
 
-## 10. 查询内选项
+## 10. 结果数量限制
+
+```text
+count:25 alpha
+```
+
+`count:` 接受非负整数，并将本次查询结果数限制为该值；它不会提高 GUI 或 IPC 已设置的最大结果上限。
+
+## 11. 查询内选项
 
 ```text
 case:on
@@ -161,7 +225,7 @@ wholeword:off
 
 布尔值还接受 `1/0`、`yes/no`、`true/false`。GUI 中的大小写、全字、路径和变音符号开关也会进入查询请求。
 
-## 11. 重复项
+## 12. 重复项
 
 ```text
 dupe:name
@@ -171,10 +235,10 @@ dupe:name-size
 
 分别按名称、大小、名称+大小筛选重复项。这只是当前支持的基础 duplicate mode，不是 Everything 全部 duplicate functions。
 
-## 12. 组合示例
+## 13. 组合示例
 
 ```text
-file: path:work (ext:cpp OR ext:h) !path:build
+file: path:work <ext:cpp|ext:h> !path:build
 ```
 
 ```text
@@ -186,16 +250,20 @@ case:on wholeword:on name:README ext:md
 ```
 
 ```text
-file: size:>100mb attr:!offline
+file: size:1mb..10mb ext:jpg;png dm:today
 ```
 
-## 13. 当前未兼容内容
+```text
+count:100 root:
+```
+
+## 14. 当前未兼容内容
 
 包括但不限于：
 
-- Everything 的全部函数、宏和预处理规则；
+- Everything 的其余函数、宏和预处理规则；
 - 完整属性、创建时间、访问时间等函数族；
-- 全部相对日期、范围和单位别名；
+- 创建/访问/最近变化时间字段、完整日期范围、任意 N 单位相对日期以及其余单位别名；
 - 完整正则、通配符和转义兼容细节；
 - ADS 内容、文件内容和 Xapian 内容查询；
 - ETP 查询协议兼容；

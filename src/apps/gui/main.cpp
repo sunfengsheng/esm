@@ -1537,7 +1537,11 @@ void advanced_search(App& a) {
   std::vector<esm::gui::FormField> fields{{L"\u5305\u542b\u6240\u6709\u8fd9\u4e9b\u8bcd", L""},
       {L"\u5305\u542b\u5b8c\u6574\u77ed\u8bed", L""}, {L"\u5305\u542b\u4efb\u610f\u8fd9\u4e9b\u8bcd\uff08\u7528\u7a7a\u683c\u5206\u9694\uff09", L""},
       {L"\u4e0d\u5305\u542b\u8fd9\u4e9b\u8bcd\uff08\u7528\u7a7a\u683c\u5206\u9694\uff09", L""}, {L"\u6269\u5c55\u540d\uff08\u4f8b\u5982 pdf docx\uff09", L""},
-      {L"\u6700\u5c0f\u5927\u5c0f\uff08\u4f8b\u5982 10mb\uff09", L""}, {L"\u6700\u5927\u5927\u5c0f\uff08\u4f8b\u5982 1gb\uff09", L""}};
+      {L"\u6700\u5c0f\u5927\u5c0f\uff08\u4f8b\u5982 10mb\uff09", L""},
+      {L"\u6700\u5927\u5927\u5c0f\uff08\u4f8b\u5982 1gb\uff09", L""},
+      {L"\u6587\u4ef6\u540d\u5f00\u5934\u4e3a", L""},
+      {L"\u6587\u4ef6\u540d\u7ed3\u5c3e\u4e3a", L""},
+      {L"\u76f4\u63a5\u4f4d\u4e8e\u6587\u4ef6\u5939\uff08\u4e0d\u542b\u5b50\u6587\u4ef6\u5939\uff09", L""}};
   std::vector<esm::gui::FormCheck> checks{{L"\u533a\u5206\u5927\u5c0f\u5199", a.settings.case_sensitive},
       {L"\u5168\u5b57\u5339\u914d", a.settings.whole_word}, {L"\u5339\u914d\u8def\u5f84", a.settings.match_path},
       {L"\u5339\u914d\u53d8\u97f3\u6807\u8bb0", a.settings.match_diacritics}};
@@ -1553,6 +1557,12 @@ void advanced_search(App& a) {
   if (!exts.empty()) { std::wstring c=L"("; for(size_t i=0;i<exts.size();++i){if(i)c+=L" OR ";c+=L"ext:"+exts[i];} c+=L")"; clauses.push_back(c); }
   if (!fields[5].value.empty()) clauses.push_back(L"size:>=" + fields[5].value);
   if (!fields[6].value.empty()) clauses.push_back(L"size:<=" + fields[6].value);
+  if (!fields[7].value.empty())
+    clauses.push_back(L"startwith:" + quote_value(fields[7].value));
+  if (!fields[8].value.empty())
+    clauses.push_back(L"endwith:" + quote_value(fields[8].value));
+  if (!fields[9].value.empty())
+    clauses.push_back(L"parent:" + quote_value(fields[9].value));
   std::wstring query;
   for (const auto& clause : clauses) { if (!query.empty()) query += L" AND "; query += clause; }
   a.settings.case_sensitive=checks[0].checked; a.settings.whole_word=checks[1].checked;

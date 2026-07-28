@@ -6,7 +6,22 @@
 #include <vector>
 namespace esm {
 enum class MatchTarget {
-    any, name, path, extension, size, last_write_time, attributes
+    any,
+    name,
+    path,
+    extension,
+    name_prefix,
+    name_suffix,
+    filename_length,
+    path_depth,
+    parent_path,
+    child_name,
+    direct_child_count,
+    child_file_count,
+    child_folder_count,
+    size,
+    last_write_time,
+    attributes
 };
 enum class NumericComparison { equal, less, less_equal, greater, greater_equal };
 enum class QueryOpcode { term, logical_and, logical_or, logical_not };
@@ -19,6 +34,13 @@ struct QueryTerm {
     bool regex{};
     NumericComparison comparison{NumericComparison::equal};
     std::uint64_t numeric_value{};
+    bool has_lower_bound{};
+    bool lower_inclusive{true};
+    std::uint64_t lower_bound{};
+    bool has_upper_bound{};
+    bool upper_inclusive{true};
+    std::uint64_t upper_bound{};
+    std::vector<std::wstring> alternatives;
     std::uint32_t attribute_mask{};
     bool attribute_absent{};
 };
@@ -33,6 +55,7 @@ struct ParsedQuery {
     DuplicateMode duplicate_mode{DuplicateMode::none};
     std::optional<bool> case_sensitive;
     std::optional<bool> whole_word;
+    std::optional<std::size_t> max_results;
     bool valid{true};
     std::wstring error;
 };

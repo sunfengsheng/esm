@@ -80,9 +80,22 @@ GUI 采用接近 Everything 的七菜单布局：`文件`、`编辑`、`查看`�
 - 匹配变音符号；
 - 正则表达式模式；
 - 高级搜索；
+
+  高级搜索表单还可以生成文件名前缀（`startwith:`）、文件名后缀（`endwith:`）和直接父文件夹（`parent:`）条件；父文件夹条件不会包含更深层的子目录。
 - 内置筛选器和自定义筛选器。
 
-书签保存查询文字以及相关搜索开关。查询语法详见 [QUERY_SYNTAX.md](QUERY_SYNTAX.md)。
+书签保存查询文字以及相关搜索开关。常用查询示例：
+
+```text
+ext:jpg;png
+root:
+count:100 report
+size:1mb..10mb
+dm:today
+<report|invoice> !draft
+```
+
+`child:` 返回包含匹配名称直接子项的文件夹；需要查找不包含某类直接子项的目录时，建议与 `folder:` 组合，例如 `folder: !child:*.mp3`。查询内的 `count:` 只会缩小当前 GUI/IPC 结果上限。相对日期使用本地时区，周从星期一开始。完整语法和仍未兼容的边界详见 [QUERY_SYNTAX.md](QUERY_SYNTAX.md)。
 
 ## 8. 本地持久化位置
 

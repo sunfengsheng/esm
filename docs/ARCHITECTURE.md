@@ -63,7 +63,7 @@ flowchart TB
 
 ## 3. 数据模型与文件身份
 
-`FileRecord` 表示可搜索条目，包含路径、名称、目录标志以及可用的大小、修改时间、属性和 NTFS 身份信息。
+`FileRecord` 表示可搜索条目，包含路径、名称、目录标志以及可用的大小、修改时间、属性和 NTFS 身份信息。初始多卷名称基线来自 `FSCTL_ENUM_USN_DATA`，该接口不提供大小和时间；当前只为 USN 直接变化项做按路径元数据补齐，完整低内存 NTFS 元数据基线仍是待完成工作。
 
 NTFS 路径重建以文件引用号和父引用号连接 MFT 节点。多卷模式必须把卷身份加入命名空间，避免不同卷上相同文件引用号冲突。
 
@@ -85,7 +85,7 @@ NTFS 路径重建以文件引用号和父引用号连接 MFT 节点。多卷模�
 3. 重建路径并加卷命名空间；
 4. 合并进 MetadataIndex；
 5. 启动每卷 live 更新；
-6. 约每 250 ms 读取各卷 USN Journal，并约每分钟重新发现挂载卷；
+6. 约每 250 ms 读取各卷 USN Journal，并约每分钟重新发现挂载卷；USN 本身不携带大小和时间，因此路径解析完成后只对直接创建或发生数据/基础信息变化的条目调用文件元数据读取，目录重命名的未直接变化后代只刷新路径；
 7. 仅在 snapshot 启动后建立 live 边界、USN checkpoint 失效/读取失败或挂载卷集合变化时执行完整 MFT reconciliation，并在该时点刷新机器级 snapshot。
 
 ### 4.2 单卷 live provider
@@ -118,6 +118,8 @@ v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视�
 rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 固定为 40 字节：包含 64 位 ID、大小和修改时间，32 位属性和字符串 offset，16 位路径/名称长度，以及打包在 32 位中的 31 位父记录索引和 1 位 name-only 标志。目录状态直接从 Windows 属性位推导；名称 bigram Bloom 使用 128 位/记录。
 
 完整路径 Bloom 不再按记录重复保存。每个目录拥有一份 256 位完整目录路径 trigram 签名；`directory_signature_bits` 标记目录记录，`directory_signature_rank_prefix` 通过 rank 把目录记录索引映射到签名索引。普通文件直接通过 `parent_index` 推导共享的父目录签名，不再保存每记录 32 位 owner；只有 orphan、父项异常或完整路径不能由父目录加名称表达的文件才保存稀疏 `PathSignatureFallback`。该 owner 元数据从 O(4N) 数组变为 bitset/rank + sparse fallback。对于不含路径分隔符的 mandatory `path:` 词，候选必须满足“文件名签名可能命中，或共享路径签名可能命中”；含 `\`、`/`、`:` 的词跳过共享签名过滤，最终始终由完整 evaluator 校验，避免跨组件 false negative。
+
+`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:` 使用同一父关系视图。查询解析器发现这些目标后，执行器才为基础目录按 `directory_signature_bits`/rank 分配紧凑的直接文件数、目录数和按 `child:` 查询项分配的命中字节数组，并把未被 suppression 覆盖的 base 子项与实时 overlay 子项合并；overlay 目录只在稀疏哈希表中保存计数或命中标记。`child:` 对每个直接子文件/子目录的名称执行普通子串、通配符或现有大小写/全字规则，不递归检查后代。普通名称、路径、大小和日期查询不会构建这些临时结构。这样保证增量创建、删除和父目录变化能立即反映到子名称、空目录和子项数量语义，同时避免给每个常驻 `CompactRecord` 增加字段；代价是超大目录树上的直接子项查询当前仍需一次 O(N) 父关系遍历，多个 `child:` 条件还会增加 O(N×T) 名称判断，后续若加入常驻 sidecar 必须重新评估内存预算和增量一致性。
 
 名称 trigram posting 使用两遍直接编码：第一遍统计每个 bucket 的 entry 数和 delta/varint 字节数，计算最终 byte offsets；第二遍直接写入最终 `encoded_positions`。构建过程不再保留一份完整的临时 `uint32_t posting_positions`。
 

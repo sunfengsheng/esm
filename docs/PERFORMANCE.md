@@ -253,3 +253,29 @@ esm_content_service.exe --all-fixed \
 - 下一步优先增加请求 generation/cancellation、单字符策略、查询阶段计时、先返回路径/相关度再异步生成少量可见行摘要，以及避免每个结果读取整段正文；
 - 再评估持久只读数据库句柄、并行 shard 查询和正文压缩 sidecar；
 - 完成优化后需在 `indexing=0` 与 `indexing=1` 两种状态分别报告 cold/warm p50、p95、最大值和真实 GUI 完成时间。
+
+## 10. 目录直接子项查询真实服务观察（2026-07-28）
+
+### 10.1 测试方法
+
+本次使用 Release MinGW/UCRT 构建和 NSIS 安装版，服务通过 `everything_sm_service` Named Pipe 提供查询。测试基于当前真实多卷索引；历史基线约 326 万条记录。每次使用 `esm_cli.exe` 发起 `limit=5` 的真实 IPC 查询，计时包含客户端进程、Named Pipe 往返以及服务端按需构建目录直接子项计数，不包含 GUI 列表绘制。
+
+目录子项函数目前不会为普通名称、路径、大小或日期查询增加常驻计数数组。只有查询包含 `child:`、`empty:`、`childcount:`、`childfilecount:` 或 `childfoldercount:` 时，服务才遍历 base 与实时 overlay 的父关系并生成临时命中/统计结构。因此本节数据反映当前 O(N) 慢路径，不能外推为普通名称查询性能；包含 T 个不同 `child:` 条件时还需要对每个直接子名称执行最多 T 次匹配，当前上界为 O(N×T)。
+
+### 10.2 单次功能验证样本
+
+| 查询场景 | 观察值 |
+|---|---:|
+| 新建空目录后 `name:esm-empty-probe-20260728 empty:` | 约 317～444 ms |
+| 新建一个直接子文件后 `name:esm-empty-probe-20260728 childcount:=1 childfilecount:=1 childfoldercount:=0` | 约 452 ms |
+| 删除直接子文件后再次查询 `name:esm-empty-probe-20260728 empty:` | 约 472 ms |
+| 安装版实时创建子文件后 `name:esm-child-probe-… child:needle-child-….txt` | 546.986 ms |
+| 删除该子文件后同一 `child:` 查询清空 | 567.048 ms |
+
+这些数据来自少量顺序功能验证样本，不是 p50、p95 或发布级基准。USN 传播时机、服务冷热状态和后台协调均可能影响结果。当前实现验证了 base 与 overlay 创建/删除的正确性，但尚未达到 Everything 同类目录子名称/计数函数的响应水平。两条 `child:` 数据同样各只有一次真实安装服务功能样本，只能证明实时创建/删除语义和当前量级，不能作为延迟分布。
+
+### 10.3 安装版进程内存观察
+
+包含 `child:` 的最新 NSIS 安装包大小为 2,538,445 字节，SHA-256 为 `CE748F2A783C8D4DB6657C14441E2CFF36A0C9B6F478E4D16C9338FBA4E055F3`；静默提权安装退出码为 0，构建版与 `C:\Program Files\everything_sm\esm_service.exe` 哈希一致。安装后的 PID 27928 稳定样本为 466,415,616 字节 Working Set、462,663,680 字节 Private Bytes。本次安装没有高频采样启动峰值；前一安装服务启动阶段曾观察到约 1.64 GiB Working Set / Private Bytes。
+
+稳定样本不能替代启动峰值。更早的首次重建流程还观察过约 2.7 GiB 峰值，因此当前仍需优化 snapshot 载入、repair/reconciliation 与索引替换期间的临时结构，不能声称内存已达到 Everything。

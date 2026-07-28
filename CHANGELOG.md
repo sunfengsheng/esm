@@ -6,6 +6,8 @@
 
 ### Added
 
+- 文件名查询新增 Everything 风格的 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:`；支持单个 `|`、`< >` 分组、`ext:` 分号扩展名列表、数字/大小范围、Everything 大小常量、`datemodified:` 以及常用相对修改日期。高级搜索窗口新增文件名前缀、后缀和直接父文件夹条件。
+
 - 内容服务新增整机内容索引第一阶段：显式 `--all-fixed` 固定卷发现、可重复 `--root`、每根独立 Xapian 分片数据库、全局结果聚合、默认系统/缓存目录排除与多根自动测试。
 - 新增独立 Xapian 文件内容搜索原型：`esm_content_service.exe`、`esm_content_lab.exe`、`esm_content_cli.exe`、独立 Named Pipe、纯文本提取、CJK n-gram、摘要与 UTF-16 高亮。
 - 新增内容协议、Named Pipe、文本提取和 Xapian 生命周期自动测试；仓库固定包含 Xapian Core 1.4.31 上游源码，Windows CI 从源码构建静态库、运行测试并检查三个实验程序的动态依赖。
@@ -15,6 +17,8 @@
 
 ### Changed
 
+- 目录直接子项匹配与统计仅在查询包含 `child:`/`empty:`/`child*count:` 时按当前 base + overlay 视图临时构建；`child:` 支持普通子串和通配符文件名，并同时检查直接子文件与子目录。普通文件名查询不承担该内存和遍历成本，增量创建/删除也会参与匹配与统计。
+
 - 内容服务初次扫描改为每根后台工作线程，Named Pipe 在扫描开始后立即可用；每个根拥有独立递归 watcher，单根 `--db` 模式保持兼容，多根使用 `--db-root\volumes\<root-key>\xapian`。
 - 文件内容索引保持为独立进程和独立数据库，现有 `esm_service.exe`、`MetadataIndex` 与文件名查询路径不链接 Xapian；内容原型改为显式 opt-in，启用后默认通过 `third_party/xapian-core` 可复现构建静态 Xapian，并保留 `SYSTEM` 开发回退。
 
@@ -22,6 +26,10 @@
 - 同步架构、性能和路线图文档与当前代码实现。
 
 ### Fixed
+
+- 修复多卷服务直接应用 USN 增量时只更新名称、路径和属性而没有刷新大小/时间的问题；创建、内容变化和基础信息变化现在会在路径解析后仅对直接变化项读取文件系统元数据，使实时 `size:` / `dm:` 条件和结果列使用新值。
+
+- 修复 MinGW/UCRT 构建下 `esm_tests.exe` 未静态链接运行库的问题，避免系统 `PATH` 中混入 `mingw64` DLL 时以 `0xc0000139`（入口点不存在）退出；测试运行库策略现与发布程序一致。
 
 - 修复内容服务在后台 watcher/初次扫描提交新 Xapian revision 时，并发查询可能抛出不继承 `std::exception` 的 `Xapian::DatabaseModifiedError` 并终止进程的问题：提交与查询快照使用共享/独占 revision 锁协调，数据库变化查询最多重新打开重试 3 次，Pipe、工作线程和服务入口增加非标准异常边界。
 - 修复内容 Pipe 客户端 HANDLE 返回时被局部析构关闭的问题，并修正实验 UI 读取搜索框文本时的终止字符缓冲区越界；真实 status/search IPC、中文查询和 watcher 增量更新恢复可用。

@@ -1,4 +1,4 @@
-# 当前状态（2026-07-26）
+# 当前状态（2026-07-28）
 
 本文描述当前 `main` 分支能力，不代表稳定版本承诺。项目目标是接近 Everything 的体验和性能，但目前不能称为完整复刻或完全兼容。
 
@@ -9,7 +9,7 @@
 - 自动发现带盘符的本地 NTFS 固定卷。
 - 读取 NTFS MFT，重建父子关系和完整路径。
 - 多卷记录命名空间合并。
-- USN Journal 增量创建、删除、重命名和更新处理。
+- USN Journal 增量创建、删除、重命名和更新处理；直接变化项在路径解析后刷新大小、修改时间和属性。
 - 约每 250 ms 跟随 USN Journal，并约每分钟检查挂载卷集合；完整 MFT reconciliation 只在启动建立 live 边界、USN checkpoint 失效/读取失败或卷集合变化时触发。
 - 普通目录递归扫描，以及 `ReadDirectoryChangesW` 触发后的树级重新扫描回退。
 
@@ -24,9 +24,10 @@
 ### 查询与性能路径
 
 - 普通词、引号、限定字段、排除词。
-- AND/OR/NOT、括号和固定优先级。
-- `name:`、`path:`、`ext:`、`file:`、`folder:`。
-- 通配符、基础正则、大小/日期/属性过滤。
+- AND/OR/NOT、`&&`/`||`/`|`、圆括号/尖括号分组和固定优先级。
+- `name:`、`path:`、`ext:`（含分号列表）、`file:`、`folder:`、`root:`、`count:`。
+- `child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`，按当前 base + overlay 视图匹配或统计目录直接子项。
+- 通配符、基础正则、数字/大小范围、Everything 大小常量、修改日期/常用相对日期和属性过滤。
 - 大小写、全字、路径、变音符号选项。
 - `dupe:name`、`dupe:size`、`dupe:name-size`。
 - 基础 Explorer 风格自然排序和服务端排序。
@@ -58,7 +59,7 @@
 
 ### Everything 查询兼容
 
-已经有布尔、正则、大小/日期/属性、筛选器、书签、历史和 duplicate 的基础能力，但缺少 Everything 的全部函数、宏、相对日期、属性族、转义细节和完整兼容测试矩阵。
+已经有布尔、正则、大小/日期/属性、筛选器、书签、历史和 duplicate 的基础能力；本轮补充了 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`、`|`/`< >`、`ext:` 分号列表、数字/大小范围、大小常量、`datemodified:` 和常用相对修改日期。`child:` 与子项统计查询目前需要按需遍历当前目录关系，功能结果覆盖增量 overlay，但尚无 Everything 等级的常驻专用子项索引。仍缺少 Everything 的其余函数、宏、创建/访问/最近变化时间族、完整相对日期与范围、属性族、转义细节和完整兼容测试矩阵。初始全盘基线目前通过 `FSCTL_ENUM_USN_DATA` 获取名称/父关系/属性，不含大小和时间；USN 后续直接变化项已刷新元数据，但旧条目的宽泛 `size:` / `dm:` 查询仍可能漏项，需后续增加低内存 NTFS 元数据基线。
 
 ### NTFS 语义
 
@@ -76,9 +77,12 @@
 
 已有本地 Pipe DACL、NSIS、服务自启动、CI artifact 和 tag release；仍缺 per-request impersonation、按用户搜索权限隔离、代码签名、自动升级、崩溃报告、日志轮转和稳定 SDK。
 
+### 测试运行库基线
+
+MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库，避免从 `PATH` 误载 `mingw64` DLL 导致 `0xc0000139`。2026-07-28 在 `build-ucrt-vendor-final` Release 配置中，主测试目标重新构建后通过。
+
 ## 3. 未实现
 
-- Xapian 或其他文档内容全文索引。
 - Everything ETP 兼容服务。
 - 完整 Windows Shell 原生上下文菜单扩展。
 - Windows Preview Handler 完整预览。

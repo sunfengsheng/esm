@@ -143,6 +143,12 @@ if(ESM_BUILD_TESTS)
   add_executable(esm_tests tests/test_main.cpp)
   target_link_libraries(esm_tests PRIVATE esm_core)
   add_dependencies(esm_tests esm_server)
+  if(MINGW)
+    # Keep the test runner on the same UCRT runtime as the shipped binaries.
+    # A dynamically linked runner can accidentally load mingw64 DLLs from PATH
+    # instead of the configured ucrt64 toolchain and fail with 0xc0000139.
+    target_link_options(esm_tests PRIVATE -static)
+  endif()
   add_test(NAME esm_tests COMMAND esm_tests)
 endif()
 if(ESM_BUILD_BENCHMARKS)

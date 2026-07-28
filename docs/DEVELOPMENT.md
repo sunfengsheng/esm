@@ -195,3 +195,13 @@ ctest --test-dir build-content --output-on-failure
 `esm_content_tests` 覆盖协议 round-trip、UTF-16 高亮范围、文本编码/大小/二进制过滤、Xapian upsert/search/delete 生命周期、多 shard 聚合路由、全局 limit、状态汇总、路径排除和数据库 root key。CI 的 UCRT64 job 从仓库内源码冷构建 Xapian，测试三个实验程序，并检查内容服务没有动态依赖 Xapian DLL。开发时可用两个临时 `--root` 配合唯一 `--pipe` 做多根 E2E；不要在自动测试或普通开发启动中使用 `--all-fixed`，避免未经确认触发整机扫描。portable ZIP 和 NSIS 包暂不分发内容搜索二进制，待 Xapian 许可证兼容和分发材料审查完成后再决定发布方式。
 
 由于 Xapian 使用 GPL-2.0-or-later，发布负责人在把该原型纳入正式安装包前必须完成许可证兼容、对应源码、许可证文本和构建材料审查。仅把源码放入 `third_party` 不等于已经完成二进制分发合规。
+## MinGW/UCRT 测试运行库
+
+`esm_tests.exe`、服务、CLI 和 GUI 在 MinGW 构建中统一使用静态 GCC/libstdc++/winpthread 运行库。不要移除测试目标的 `-static`：开发机同时安装 `mingw64` 与 `ucrt64` 时，动态测试程序可能从 `PATH` 加载错误 ABI 的 DLL，并在进入 `main` 前以 `0xc0000139`（入口点不存在）退出。
+
+验证命令：
+
+```powershell
+cmake --build build-ucrt-vendor-final --config Release --target esm_tests
+ctest --test-dir build-ucrt-vendor-final -C Release -R '^esm_tests$' --output-on-failure
+```

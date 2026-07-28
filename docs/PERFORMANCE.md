@@ -19,6 +19,10 @@
 
 该方案显著降低普通名称子串查询的扫描量，并把 posting 从固定 4 字节/条压缩到当前真实样本约 1.13 字节/条。16-bit hash 会产生 collision，但只影响候选数量，不影响最终正确性。
 
+### 精确 `filelist:` 候选扫描
+
+单一正向、非正则且不含通配符的 `filelist:` 复用已有名称前缀表，不新增常驻文件名或完整路径哈希表。每个候选先按 basename 的首字符/前两个字符范围缩小 base 记录，再做完整文件名校验；只有名称精确命中的记录才重建路径并运行统一 evaluator。忽略变音符号时同时扫描 accent-folded 前缀表，查询期只用小型 `uint32` 集合去重，overlay 仍完整检查。带 `*`/`?` 的列表和复杂布尔组合仍回退原候选路径。
+
 ### GUI 连续输入
 
 - 输入活跃：请求最多 200 条；
@@ -81,7 +85,20 @@ limit = 1000
 
 本轮最终代码的 3 次真实索引构建耗时为 21.718、21.972、22.505 秒，中位数约 21.972 秒。`CompactRecord` 和路径签名 owner 压缩后，`path:test1` 的 3 次 p50 中位数为 41.40 ms，比上一正式开发基线的 43.46 ms 略好；纯名称查询仍大致为 0.03–4.59 ms。以上均为索引内基准，不代表 GUI、IPC、图标和元数据补齐的端到端延迟。
 
-## 4. GUI 合成连续变化测试
+## 4. 2026-07-28 精确 `filelist:` 安装服务对照
+
+测试方法：在同一 Windows 机器上复用同一个 `C:\ProgramData\everything_sm\indexes\mft-index.snapshot`（测量时 1,022,362,538 字节），先运行提交 `9e905a7` 的 Release `esm_service.exe`，再运行本轮 Release 二进制；每次替换后重启同一个 `everything_sm` 服务，使用已安装 `esm_cli.exe` 经同一个 Named Pipe 查询，每条查询连续运行 5 次。PowerShell 调用原生 CLI 时把参数写成 `'filelist:\"...\"'`，让 CRT 接收到查询中的字面双引号；否则 `|` 会被解析成普通布尔 OR，不能作为 `filelist:` 基准。下表是 CLI 输出的服务端计时，不包含 GUI、Shell 图标和人工输入延迟。
+
+| 查询 | `9e905a7` 5 次范围 / 中位数 | 本轮 5 次范围 / 中位数 |
+|---|---:|---:|
+| `filelist:"123456789.txt|definitely_missing_esm_probe.txt"` | 778.603–950.810 ms / 854.474 ms | 11.707–23.602 ms / 12.899 ms |
+| `filelist:"D:\test1\123456789.txt|D:\definitely_missing_esm_probe.txt"` | 3790.31–5999.75 ms / 4091.17 ms | 11.622–22.988 ms / 13.122 ms |
+
+两组都正确返回 `D:\test1\123456789.txt`。按这 5 次样本的中位数计算，精确文件名列表约快 66 倍，精确完整路径列表约快 312 倍；这是固定机器/固定 snapshot 的小样本对照，不是统计充分的 p50/p95，也不能外推为 Everything 等级性能。本轮安装包为 `everything_sm-0.1.0-setup.exe`，大小 2,551,461 字节，SHA-256 为 `D440FCA59BF1B20AFCB772D8A9079E6CCFBCDF5174CD664FA0FD536D50EE64A2`。
+
+通配符样本 `filelist:"123456789.*"` 仍走完整 evaluator；重启后的 5 次服务端结果波动约 485–1299 ms，受冷页和后台活动影响明显，因此本轮不把它列为优化前后结论。后续应为可提取固定 basename 前缀的通配符设计候选范围，并用更长时间序列报告 p50/p95。
+
+## 5. GUI 合成连续变化测试
 
 测试通过跨进程 `SetWindowText` 连续改变 ComboBox 文本，共 62 次：
 
@@ -93,9 +110,9 @@ limit = 1000
 
 **限制：** 这是合成消息调度测试，不包含真实键盘输入、IME、显示器刷新、Shell 图标、完整 IPC 往返和人眼感知，因此不能作为真实端到端输入延迟。它只证明文本变化处理没有长时间同步阻塞调用方。
 
-## 5. 内存状态
+## 6. 内存状态
 
-### 5.1 优化前历史观察
+### 6.1 优化前历史观察
 
 约 326 万记录的已安装服务曾测得：
 
@@ -107,7 +124,7 @@ limit = 1000
 
 主要问题是加载 snapshot 后的 `vector<FileRecord>` 没有被 rvalue `replace` 真正消费，完整路径记录、Catalog 和搜索加速器长期重复驻留。
 
-### 5.2 当前真实 snapshot 的单索引结构
+### 6.2 当前真实 snapshot 的单索引结构
 
 测试方法：2026-07-25，Release 构建；输入为 `C:\ProgramData\everything_sm\indexes\mft-index.snapshot`；记录数 3,264,188；完整进程独立运行 3 次。索引构建结束后读取 Working Set 和 Private Bytes，通过 `MetadataIndex::storage_stats()` 统计 vector capacity；另以 10 ms 间隔采样 snapshot 已载入到索引替换完成之间的进程峰值。
 
@@ -136,7 +153,7 @@ posting 构建继续使用两遍统计并直接把 delta/varint 写入最终 byt
 
 本轮稳定 Private Bytes 从上一正式单索引基线约 473.04 MiB 降到约 436.32 MiB。`path:test1` 的 3 次 p50 中位数为 41.40 ms，纯名称查询约为 0.03–4.59 ms。最终 evaluator 仍负责正确性校验，因此 Bloom/hash 误报只增加候选，不改变结果。曾试验把名称 Bloom 从 128 位压到 64 位，`path:test1` 接近 90 ms，因此没有保留该方案。
 
-### 5.3 完整服务与 Everything 对比
+### 6.3 完整服务与 Everything 对比
 
 Everything 的同机样本为 1.4.1.1030：主进程约 312.78 MiB Private Bytes，辅助/服务进程约 3.99 MiB，合计约 316.77 MiB；其数据库约 146.20 MiB、总条目约 369.9 万。
 
@@ -156,17 +173,18 @@ IPC 正确返回 `D:\test1\123456789.txt`。首次 `123456789.txt` 冷查询出�
 
 没有保留 `EmptyWorkingSet`/`SetProcessWorkingSetSize(-1, -1)` 方案：它只能改变任务管理器 Working Set，并会增加冷页缺页和首次宽泛查询延迟。当前只在大阶段结束后调用 `_heapmin` 归还完全空闲的 CRT heap region，并调用 `HeapCompact` 整理进程堆。
 
-## 6. 已知慢路径
+## 7. 已知慢路径
 
 - `path:` 查询无法只依靠名称 gram，通常比纯名称查询慢；
 - 宽泛正则和复杂 OR 可能无法提取 mandatory gram；
+- 带 `*`/`?` 的 `filelist:` 目前不使用精确 basename 候选扫描；
 - 单字符/双字符查询候选集合天然较大；
 - duplicate mode 需要额外分组；
 - 首次 Shell 图标或文件元数据读取会触发额外系统调用；
 - 首次建库、完整协调和 snapshot 写入会竞争 CPU、内存带宽和磁盘；
 - GUI 显示大量列、预览或图标时会增加 UI 工作。
 
-## 7. 基准规范
+## 8. 基准规范
 
 提交性能数据时必须：
 

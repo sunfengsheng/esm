@@ -48,7 +48,7 @@ filelist:"report.docx|invoice.pdf"
 filelist:"D:\A\a.txt|D:\B\b.txt"
 ```
 
-当前 `filelist:` 使用完整 evaluator 检查多个候选，能看到 base + overlay 的创建、替换和删除，但尚无 Everything 等级的专用多值候选索引；在超大索引上的宽列表查询可能更慢。
+单一正向且不含 `*`/`?` 的精确 `filelist:` 会先从每个候选提取 basename，复用现有 raw/accent-folded 名称前缀表生成 base 候选；完整路径只为文件名精确命中的记录重建，并继续通过完整 evaluator 校验。overlay 创建、替换和删除仍实时参与结果。该路径不新增常驻文件名/路径哈希表；带通配符的列表、复杂布尔组合和宽候选仍可能回退完整扫描，尚不能视为 Everything 的完整多值查询实现。
 
 ### Everything 风格的名称与路径函数
 

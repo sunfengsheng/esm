@@ -154,6 +154,19 @@ flowchart LR
 
 无法安全提取 mandatory 名称 gram 的查询（例如部分 `path:`、正则或复杂 OR）会使用更宽的候选路径或完整求值，因此延迟更高。
 
+### 精确 `filelist:` 候选生成
+
+单一正向、非正则且不含 `*`/`?` 的 `filelist:` 不再默认遍历整个 base。执行器从每个列表项提取 basename，通过 `name_prefix_order`/`name_prefix_ranges` 及 accent-folded 对应表定位首字符或前两个字符范围，再用完整文件名比较过滤。只有 basename 精确匹配的记录才重建完整路径并运行原布尔 evaluator；因此路径归一化、大小写、变音符号和其他 request 选项仍由统一语义层决定。查询期 `uint32` 集合只用于去重 raw/folded 和多列表项候选，生命周期限于本次请求，不增加常驻索引。overlay 仍逐项检查；若列表项无法安全提取 basename，或查询包含通配符/复杂程序，则回退原完整候选路径。
+
+```mermaid
+flowchart LR
+    Filelist["精确 filelist 列表"] --> Basename["提取每项 basename"]
+    Basename --> Prefix["raw / folded 名称前缀范围"]
+    Prefix --> ExactName["完整文件名校验与去重"]
+    ExactName --> Path["仅候选重建完整路径"]
+    Path --> Eval["统一 evaluator + overlay"]
+```
+
 ## 7. 查询引擎
 
 查询解析器：

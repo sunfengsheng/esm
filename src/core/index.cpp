@@ -2481,12 +2481,135 @@ std::vector<SearchResult> MetadataIndex::search(
         }
     }
 
+    // Exact filelist queries can use the existing compact filename prefix
+    // tables without adding a permanent filename/path hash map. Every full
+    // path match must first have the exact basename from that alternative, so
+    // only those small name ranges need path reconstruction and evaluation.
+    bool exact_filelist_scan_complete = false;
+    const bool simple_exact_filelist_query = query.terms.size() == 1 &&
+        query.program.size() == 1 &&
+        query.program.front().opcode == QueryOpcode::term &&
+        query.program.front().term_index == 0 && !terms[0].excluded &&
+        terms[0].target == MatchTarget::filename_list &&
+        !terms[0].regex && !terms[0].wildcard &&
+        !terms[0].alternatives.empty() &&
+        name_prefix_order_.size() == records_.size();
+    if (simple_exact_filelist_query) {
+        std::unordered_set<std::uint32_t> inspected_base;
+        inspected_base.reserve(terms[0].alternatives.size() * 4);
+
+        const auto prefix_bounds = [&](
+                std::wstring_view prefix,
+                const std::vector<NamePrefixRange>& ranges,
+                const std::vector<NameFirstCharacterRange>& first_ranges) {
+            std::pair<std::uint32_t, std::uint32_t> bounds{};
+            if (prefix.size() == 1) {
+                const auto key = static_cast<std::uint16_t>(
+                    normalize_char(prefix.front(), false));
+                const auto found = std::lower_bound(
+                    first_ranges.begin(), first_ranges.end(), key,
+                    [](const NameFirstCharacterRange& range,
+                       std::uint16_t value) { return range.key < value; });
+                if (found != first_ranges.end() && found->key == key) {
+                    bounds = {found->begin, found->end};
+                }
+            } else if (!prefix.empty()) {
+                const auto key = name_prefix_key(prefix);
+                const auto found = std::lower_bound(
+                    ranges.begin(), ranges.end(), key,
+                    [](const NamePrefixRange& range, std::uint32_t value) {
+                        return range.key < value;
+                    });
+                if (found != ranges.end() && found->key == key) {
+                    bounds = {found->begin, found->end};
+                }
+            }
+            return bounds;
+        };
+
+        bool all_alternatives_accelerated = true;
+        for (const auto& alternative : terms[0].alternatives) {
+            auto basename = std::wstring_view(alternative);
+            const auto separator = basename.find_last_of(L"\\:");
+            if (separator != std::wstring_view::npos) {
+                basename.remove_prefix(separator + 1);
+            }
+            if (basename.empty()) {
+                all_alternatives_accelerated = false;
+                break;
+            }
+
+            auto name_term = terms[0];
+            name_term.target = MatchTarget::name;
+            name_term.value.assign(basename);
+            name_term.alternatives.clear();
+
+            const auto scan_range = [&](
+                    const std::vector<std::uint32_t>& order,
+                    const std::vector<NamePrefixRange>& ranges,
+                    const std::vector<NameFirstCharacterRange>& first_ranges) {
+                const auto [begin, end] =
+                    prefix_bounds(basename, ranges, first_ranges);
+                for (std::uint32_t position = begin; position < end; ++position) {
+                    const auto index = order[position];
+                    if (!inspected_base.insert(index).second) continue;
+                    const auto& record = records_[index];
+                    if (std::binary_search(suppressed_base_ids_.begin(),
+                                           suppressed_base_ids_.end(),
+                                           record.id)) {
+                        continue;
+                    }
+                    const auto name = name_view(record);
+                    if (!exact_text_match(name_term, name, sensitive)) continue;
+                    std::wstring path_scratch;
+                    const auto path = query_reads_path
+                        ? path_view(record, path_scratch) : std::wstring_view{};
+                    if (!accepted(record.id, index, record.directory(), name,
+                                  path, record.size, record.last_write_time,
+                                  record.attributes)) {
+                        continue;
+                    }
+                    consider({rank_record(terms, name, path, options.match_path,
+                                          sensitive),
+                              record.id, index, false});
+                }
+            };
+
+            scan_range(name_prefix_order_, name_prefix_ranges_,
+                       name_first_character_ranges_);
+            if (!options.match_diacritics) {
+                scan_range(folded_name_prefix_order_,
+                           folded_name_prefix_ranges_,
+                           folded_name_first_character_ranges_);
+            }
+        }
+
+        if (all_alternatives_accelerated) {
+            for (const auto& [id, record] : overlay_) {
+                if (!accepted(id, no_base_index, record.directory, record.name,
+                              record.path, record.size, record.last_write_time,
+                              record.attributes)) {
+                    continue;
+                }
+                consider({rank_record(terms, record.name, record.path,
+                                      options.match_path, sensitive),
+                          id, 0, true});
+            }
+            exact_filelist_scan_complete = true;
+        } else {
+            relevance_best = {};
+            sorted_best.clear();
+            candidates.clear();
+        }
+    }
+
     // The GUI defaults to case-insensitive natural name order. Walking a
     // pre-sorted base order and merging the small delta overlay means we only
     // inspect records until the requested page is complete; the old path
     // materialized and sorted every match, which made one-character queries
     // take seconds on multi-million-file catalogs.
-    if (options.sort == SortField::name && !sensitive &&
+    if (!exact_filelist_scan_complete &&
+        options.sort == SortField::name && !sensitive &&
         query.duplicate_mode == DuplicateMode::none &&
         natural_name_order_.size() == records_.size()) {
         std::vector<Candidate> overlay_matches;
@@ -2591,7 +2714,7 @@ std::vector<SearchResult> MetadataIndex::search(
     // prefix matches always outrank substring-only matches, so if the prefix
     // range already fills the requested page, the rest of the catalog cannot
     // affect the result set.
-    bool prefix_result_complete = false;
+    bool prefix_result_complete = exact_filelist_scan_complete;
     const bool simple_prefix_query = relevance_bounded && query.terms.size() == 1 &&
         query.program.size() == 1 &&
         query.program.front().opcode == QueryOpcode::term &&

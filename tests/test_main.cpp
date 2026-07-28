@@ -294,6 +294,12 @@ void test_filelist_query() {
     records.push_back(record(3, L"beta.log", L"D:\\logs\\beta.log"));
     records.push_back(record(4, L"alphabet.txt", L"D:\\alphabet.txt"));
     records.push_back(record(5, L"caf\u00e9.txt", L"D:\\caf\u00e9.txt"));
+    records.push_back(record(7, L"\u00e9clair.txt", L"D:\\docs\\\u00e9clair.txt"));
+    for (std::uint64_t id = 100; id < 20100; ++id) {
+        const auto suffix = std::to_wstring(id);
+        records.push_back(record(id, L"noise" + suffix + L".tmp",
+                                 L"D:\\noise\\noise" + suffix + L".tmp"));
+    }
     index.replace(std::move(records));
 
     esm::SearchOptions options;
@@ -307,6 +313,18 @@ void test_filelist_query() {
     require(results.size() == 2,
             "filelist matches complete paths and normalizes separators");
 
+    results = index.search(
+        L"filelist:\"D:\\missing.txt|D:/folder/alpha.txt\"", options);
+    require(results.size() == 1 && results.front().record.id == 2,
+            "filelist accelerates every exact alternative, not only the first");
+
+    options.sort = esm::SortField::name;
+    results = index.search(
+        L"filelist:\"D:\\alpha.txt|D:/folder/alpha.txt\"", options);
+    require(results.size() == 2,
+            "filelist exact candidate scan works with name sorting");
+    options.sort = esm::SortField::relevance;
+
     results = index.search(L"filelist:\"alpha*.txt|*.log\"", options);
     require(results.size() == 4,
             "filelist alternatives support anchored wildcards");
@@ -319,6 +337,13 @@ void test_filelist_query() {
     results = index.search(L"filelist:\"cafe.txt\"", options);
     require(results.size() == 1 && results.front().record.id == 5,
             "filelist honors diacritic-insensitive search");
+    results = index.search(L"filelist:\"eclair.txt\"", options);
+    require(results.size() == 1 && results.front().record.id == 7,
+            "filelist uses folded prefix ranges for leading diacritics");
+    results = index.search(
+        L"filelist:\"D:\\docs\\eclair.txt\"", options);
+    require(results.size() == 1 && results.front().record.id == 7,
+            "filelist exact path acceleration preserves diacritic matching");
 
     std::vector<esm::FileRecord> updates;
     updates.push_back(record(6, L"overlay.tmp", L"D:\\overlay.tmp"));

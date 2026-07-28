@@ -6,7 +6,7 @@
 
 ### Added
 
-- 文件名查询新增 Everything 风格的 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:`；支持单个 `|`、`< >` 分组、`ext:` 分号扩展名列表、数字/大小范围、Everything 大小常量、`datemodified:` 以及常用相对修改日期。高级搜索窗口新增文件名前缀、后缀和直接父文件夹条件。
+- 文件名查询新增 Everything 风格的 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:`；支持单个 `|`、`< >` 分组、`ext:` 分号扩展名列表、数字/大小范围、Everything 大小常量、`datemodified:`、下一个自然周/月/年、滚动 N 年/月/周/日/时/分/秒，以及英文月份/星期日期常量。高级搜索窗口新增文件名前缀、后缀和直接父文件夹条件。
 
 - 内容服务新增整机内容索引第一阶段：显式 `--all-fixed` 固定卷发现、可重复 `--root`、每根独立 Xapian 分片数据库、全局结果聚合、默认系统/缓存目录排除与多根自动测试。
 - 新增独立 Xapian 文件内容搜索原型：`esm_content_service.exe`、`esm_content_lab.exe`、`esm_content_cli.exe`、独立 Named Pipe、纯文本提取、CJK n-gram、摘要与 UTF-16 高亮。
@@ -26,6 +26,8 @@
 - 同步架构、性能和路线图文档与当前代码实现。
 
 ### Fixed
+
+- 修正相对日期兼容语义：`pastweek` / `pastmonth` / `pastyear` 改为滚动下界，`last` / `prev` 保持上一个完整自然周期；周边界改为读取 Windows 当前用户“每周第一天”设置，`this*` 周期不再包含今天之后的未来日期。
 
 - 修复多卷服务直接应用 USN 增量时只更新名称、路径和属性而没有刷新大小/时间的问题；创建、内容变化和基础信息变化现在会在路径解析后仅对直接变化项读取文件系统元数据，使实时 `size:` / `dm:` 条件和结果列使用新值。
 

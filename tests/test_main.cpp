@@ -37,6 +37,25 @@ esm::FileRecord record(std::uint64_t id, std::wstring name, std::wstring path, b
     value.directory = directory;
     return value;
 }
+
+SYSTEMTIME local_system_time(std::uint64_t value) {
+    FILETIME utc{};
+    utc.dwLowDateTime = static_cast<DWORD>(value);
+    utc.dwHighDateTime = static_cast<DWORD>(value >> 32U);
+    FILETIME local{};
+    SYSTEMTIME result{};
+    require(FileTimeToLocalFileTime(&utc, &local) != FALSE &&
+                FileTimeToSystemTime(&local, &result) != FALSE,
+            "FILETIME should convert to local SYSTEMTIME");
+    return result;
+}
+
+std::uint64_t current_file_time() {
+    FILETIME value{};
+    GetSystemTimeAsFileTime(&value);
+    return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32U) |
+        value.dwLowDateTime;
+}
 void test_multi_volume_namespacing() {
     const auto c_id = esm::namespace_ntfs_file_id(
         L"\\\\?\\Volume{11111111-1111-1111-1111-111111111111}\\", 42);
@@ -248,6 +267,112 @@ void test_query_parser() {
     require(query.terms[2].excluded, "excluded term");
     require(query.directories_only.has_value() && !*query.directories_only, "file filter");
     require(!esm::parse_query(L"\"unterminated").valid, "unterminated quote should fail");
+}
+
+void test_everything_date_constants() {
+    constexpr std::uint64_t ticks_per_second = 10000000ULL;
+    constexpr std::uint64_t ticks_per_day = 86400ULL * ticks_per_second;
+
+    const auto last_week = esm::parse_query(L"dm:lastweek");
+    const auto past_week = esm::parse_query(L"dm:pastweek");
+    require(last_week.valid && last_week.terms.size() == 1 &&
+                last_week.terms[0].has_lower_bound &&
+                last_week.terms[0].has_upper_bound,
+            "lastweek is the previous complete calendar week");
+    require(past_week.valid && past_week.terms.size() == 1 &&
+                past_week.terms[0].has_lower_bound &&
+                !past_week.terms[0].has_upper_bound,
+            "pastweek is a rolling seven-day lower threshold");
+
+    const auto next_week = esm::parse_query(L"dm:nextweek");
+    require(next_week.valid && next_week.terms[0].has_lower_bound &&
+                next_week.terms[0].has_upper_bound,
+            "nextweek date constant parses");
+    const auto next_week_start =
+        local_system_time(next_week.terms[0].lower_bound);
+    require(next_week_start.wHour == 0 && next_week_start.wMinute == 0 &&
+                next_week_start.wSecond == 0,
+            "nextweek starts at local midnight");
+    const auto next_week_ticks = next_week.terms[0].upper_bound -
+        next_week.terms[0].lower_bound;
+    require(next_week_ticks >= 167ULL * 60 * 60 * ticks_per_second &&
+                next_week_ticks <= 169ULL * 60 * 60 * ticks_per_second,
+            "nextweek spans one local calendar week including DST changes");
+
+    const auto next_month = esm::parse_query(L"dm:comingmonth");
+    require(next_month.valid && next_month.terms[0].has_lower_bound &&
+                next_month.terms[0].has_upper_bound &&
+                local_system_time(next_month.terms[0].lower_bound).wDay == 1 &&
+                local_system_time(next_month.terms[0].upper_bound).wDay == 1,
+            "comingmonth covers the next complete calendar month");
+    const auto next_year = esm::parse_query(L"dm:nextyear");
+    const auto next_year_start =
+        local_system_time(next_year.terms[0].lower_bound);
+    require(next_year.valid && next_year_start.wMonth == 1 &&
+                next_year_start.wDay == 1,
+            "nextyear starts on January 1 of the next year");
+
+    const auto before_last_hours = current_file_time();
+    const auto last_hours = esm::parse_query(L"dm:last24hours");
+    const auto after_last_hours = current_file_time();
+    require(last_hours.valid && last_hours.terms[0].has_lower_bound &&
+                !last_hours.terms[0].has_upper_bound &&
+                last_hours.terms[0].lower_bound + 24ULL * 60 * 60 *
+                    ticks_per_second + ticks_per_second >= before_last_hours &&
+                last_hours.terms[0].lower_bound + 24ULL * 60 * 60 *
+                    ticks_per_second <= after_last_hours + ticks_per_second,
+            "last24hours uses an exact rolling lower threshold");
+
+    const auto before_next_minutes = current_file_time();
+    const auto next_minutes = esm::parse_query(L"dm:next30mins");
+    const auto after_next_minutes = current_file_time();
+    require(next_minutes.valid && next_minutes.terms[0].has_lower_bound &&
+                next_minutes.terms[0].has_upper_bound &&
+                next_minutes.terms[0].lower_bound + ticks_per_second >=
+                    before_next_minutes &&
+                next_minutes.terms[0].lower_bound <=
+                    after_next_minutes + ticks_per_second &&
+                next_minutes.terms[0].upper_bound -
+                    next_minutes.terms[0].lower_bound ==
+                    30ULL * 60 * ticks_per_second,
+            "next30mins uses an exact rolling future interval");
+
+    const auto last_weeks = esm::parse_query(L"dm:prev3weeks");
+    const auto now = current_file_time();
+    require(last_weeks.valid && last_weeks.terms[0].has_lower_bound &&
+                !last_weeks.terms[0].has_upper_bound,
+            "prev3weeks rolling date constant parses");
+    const auto weeks_ago = now - last_weeks.terms[0].lower_bound;
+    require(weeks_ago >= 20ULL * ticks_per_day &&
+                weeks_ago <= 22ULL * ticks_per_day,
+            "prev3weeks is approximately three local weeks before now");
+
+    const auto next_months = esm::parse_query(L"dm:next2months");
+    require(next_months.valid && next_months.terms[0].has_lower_bound &&
+                next_months.terms[0].has_upper_bound,
+            "next2months rolling future interval parses");
+
+    SYSTEMTIME local_now{};
+    GetLocalTime(&local_now);
+    const auto january = esm::parse_query(L"dm:jan");
+    const auto january_start = local_system_time(january.terms[0].lower_bound);
+    const auto january_end = local_system_time(january.terms[0].upper_bound);
+    require(january.valid && january_start.wYear == local_now.wYear &&
+                january_start.wMonth == 1 && january_start.wDay == 1 &&
+                january_end.wMonth == 2 && january_end.wDay == 1,
+            "month-name constant selects that month in the current year");
+
+    const auto tuesday = esm::parse_query(L"dm:tuesday");
+    const auto tuesday_start =
+        local_system_time(tuesday.terms[0].lower_bound);
+    require(tuesday.valid && tuesday_start.wDayOfWeek == 2 &&
+                tuesday_start.wHour == 0 && tuesday_start.wMinute == 0,
+            "weekday-name constant selects that day in the current week");
+
+    require(!esm::parse_query(L"dm:last0hours").valid &&
+                !esm::parse_query(L"dm:last2hour").valid &&
+                !esm::parse_query(L"dm:next99999999999999999999seconds").valid,
+            "invalid rolling date constants are rejected");
 }
 
 void test_advanced_query_and_sorting() {
@@ -2403,7 +2528,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

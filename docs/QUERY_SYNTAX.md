@@ -167,19 +167,29 @@ YYYY-MM-DD HH:MM
 dm:>=2026-01-01
 modified:<2026-07-01T12:30
 datemodified:today
+dm:nextweek
+dm:last24hours
+dm:jan
+dm:tuesday
 ```
 
-不带比较符的 `YYYY-MM-DD` 会匹配该本地自然日；带比较符时按该本地时间点比较。当前支持以下相对日期词：
+不带比较符的 `YYYY-MM-DD` 会匹配该本地自然日；带比较符时按该本地时间点比较。当前支持以下 Everything 风格日期常量：
 
 - `today`、`yesterday`；
-- `thisweek` / `currentweek`；
-- `lastweek` / `pastweek` / `prevweek`；
-- `thismonth` / `currentmonth`；
-- `lastmonth` / `pastmonth` / `prevmonth`；
-- `thisyear` / `currentyear`；
-- `lastyear` / `pastyear` / `prevyear`。
+- `thisweek` / `currentweek`、`thismonth` / `currentmonth`、`thisyear` / `currentyear`：从当前自然周期起点到今天结束；
+- `lastweek` / `prevweek`、`lastmonth` / `prevmonth`、`lastyear` / `prevyear`：上一个完整自然周期；
+- `comingweek` / `nextweek`、`comingmonth` / `nextmonth`、`comingyear` / `nextyear`：下一个完整自然周期；
+- `pastweek`、`pastmonth`、`pastyear`：从当前时刻向前滚动一个单位形成下界；
+- `<last|past|prev|coming|next><N><years|months|weeks|days>`，例如 `last3weeks`、`next2months`；
+- `<last|past|prev|coming|next><N><hours|minutes|mins|seconds|secs>`，例如 `last24hours`、`next30mins`；
+- 英文月份全名和缩写：`january`…`december`、`jan`…`dec`，匹配当前年份中的对应完整月份；
+- 英文星期全名和缩写：`sunday`…`saturday`、`sun`…`sat`，匹配当前周中的对应完整自然日。
 
-相对日期使用本地时区，周从星期一开始，内部展开为左闭右开的时间区间。尚未实现 `datecreated:` / `dc:`、`dateaccessed:` / `da:`、`recentchange:` / `rc:`、任意 N 单位相对时间、月份/星期名称和完整日期范围语法。
+周边界读取 Windows 当前用户的“每周第一天”区域设置，不再固定为星期一。自然日、周、月和年按本地日历边界计算，因此跨夏令时的一周按 UTC 时间衡量可能是 167、168 或 169 小时。
+
+为贴近 Everything 1.4，`last/past/prev<N>...` 以及 `pastweek` / `pastmonth` / `pastyear` 只设置滚动下界，不设置上界，所以时间戳位于未来的异常文件也可能命中；`coming/next<N>...` 使用“当前时刻到未来边界”的左闭右开区间。单数单位形式（如 `last1hour`）当前不接受，应写为 `last1hours`。
+
+尚未实现 `datecreated:` / `dc:`、`dateaccessed:` / `da:`、`recentchange:` / `rc:`、`unknown`、完整区域化日期输入和 Everything 的全部日期范围组合。初始 MFT 基线仍可能缺少旧条目的修改时间，详见《当前状态》。
 
 ## 9. 属性过滤
 

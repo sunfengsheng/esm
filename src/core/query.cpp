@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <cwctype>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -95,35 +96,103 @@ bool local_system_time_to_file_time(const SYSTEMTIME& local_time,
     return true;
 }
 
+void clear_local_time(SYSTEMTIME& value) {
+    value.wHour = 0;
+    value.wMinute = 0;
+    value.wSecond = 0;
+    value.wMilliseconds = 0;
+}
+
 bool add_local_days(SYSTEMTIME& value, int days) {
     FILETIME file_time{};
     if (!SystemTimeToFileTime(&value, &file_time)) return false;
     ULARGE_INTEGER ticks{};
     ticks.LowPart = file_time.dwLowDateTime;
     ticks.HighPart = file_time.dwHighDateTime;
-    const auto delta = static_cast<std::int64_t>(days) * 864000000000LL;
-    const auto adjusted = static_cast<std::int64_t>(ticks.QuadPart) + delta;
-    if (adjusted < 0) return false;
-    ticks.QuadPart = static_cast<std::uint64_t>(adjusted);
+    constexpr std::uint64_t ticks_per_day = 864000000000ULL;
+    const auto magnitude_days = days < 0
+        ? static_cast<std::uint64_t>(-static_cast<std::int64_t>(days))
+        : static_cast<std::uint64_t>(days);
+    if (magnitude_days > std::numeric_limits<std::uint64_t>::max() /
+                             ticks_per_day) return false;
+    const auto delta = magnitude_days * ticks_per_day;
+    if (days < 0) {
+        if (delta > ticks.QuadPart) return false;
+        ticks.QuadPart -= delta;
+    } else {
+        if (delta > std::numeric_limits<std::uint64_t>::max() -
+                        ticks.QuadPart) return false;
+        ticks.QuadPart += delta;
+    }
     file_time.dwLowDateTime = ticks.LowPart;
     file_time.dwHighDateTime = ticks.HighPart;
     return FileTimeToSystemTime(&file_time, &value) != FALSE;
 }
 
-void shift_local_month(SYSTEMTIME& value, int months) {
-    int year = value.wYear;
-    int month = static_cast<int>(value.wMonth) - 1 + months;
-    while (month < 0) {
-        month += 12;
-        --year;
-    }
-    while (month >= 12) {
-        month -= 12;
-        ++year;
-    }
+bool is_leap_year(int year) {
+    return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+int days_in_month(int year, int month) {
+    static constexpr int lengths[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && is_leap_year(year)) return 29;
+    return lengths[month - 1];
+}
+
+bool shift_local_months(SYSTEMTIME& value, std::int64_t months,
+                        bool preserve_day) {
+    const auto total_month = static_cast<std::int64_t>(value.wYear) * 12 +
+        static_cast<std::int64_t>(value.wMonth) - 1 + months;
+    if (total_month < 12 || total_month > 119999) return false;
+    const int year = static_cast<int>(total_month / 12);
+    const int month = static_cast<int>(total_month % 12) + 1;
+    const int day = preserve_day
+        ? std::min<int>(value.wDay, days_in_month(year, month)) : 1;
     value.wYear = static_cast<WORD>(year);
-    value.wMonth = static_cast<WORD>(month + 1);
-    value.wDay = 1;
+    value.wMonth = static_cast<WORD>(month);
+    value.wDay = static_cast<WORD>(day);
+    return true;
+}
+
+bool shift_local_years(SYSTEMTIME& value, std::int64_t years) {
+    const auto year = static_cast<std::int64_t>(value.wYear) + years;
+    if (year < 1 || year > 9999) return false;
+    value.wYear = static_cast<WORD>(year);
+    value.wDay = static_cast<WORD>(std::min<int>(
+        value.wDay, days_in_month(value.wYear, value.wMonth)));
+    return true;
+}
+
+int first_day_of_week() {
+    wchar_t value[4]{};
+    if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IFIRSTDAYOFWEEK,
+                        value, static_cast<int>(std::size(value))) > 0 &&
+        value[0] >= L'0' && value[0] <= L'6') {
+        // LOCALE_IFIRSTDAYOFWEEK uses Monday=0; SYSTEMTIME uses Sunday=0.
+        return ((value[0] - L'0') + 1) % 7;
+    }
+    return 1;
+}
+
+bool start_of_local_week(const SYSTEMTIME& now, SYSTEMTIME& start) {
+    start = now;
+    clear_local_time(start);
+    const int days_since_start =
+        (static_cast<int>(now.wDayOfWeek) - first_day_of_week() + 7) % 7;
+    return add_local_days(start, -days_since_start);
+}
+
+void set_lower_bound(QueryTerm& term, std::uint64_t value) {
+    term.has_lower_bound = true;
+    term.lower_bound = value;
+    term.lower_inclusive = true;
+}
+
+void set_upper_bound(QueryTerm& term, std::uint64_t value) {
+    term.has_upper_bound = true;
+    term.upper_bound = value;
+    term.upper_inclusive = false;
 }
 
 bool set_date_interval(QueryTerm& term, const SYSTEMTIME& start,
@@ -134,13 +203,133 @@ bool set_date_interval(QueryTerm& term, const SYSTEMTIME& start,
         !local_system_time_to_file_time(end, upper) || lower >= upper) {
         return false;
     }
-    term.has_lower_bound = true;
-    term.lower_bound = lower;
-    term.lower_inclusive = true;
-    term.has_upper_bound = true;
-    term.upper_bound = upper;
-    term.upper_inclusive = false;
+    set_lower_bound(term, lower);
+    set_upper_bound(term, upper);
     return true;
+}
+
+bool set_rolling_date_interval(QueryTerm& term, const SYSTEMTIME& now,
+                               const SYSTEMTIME& boundary, bool future) {
+    std::uint64_t now_value{};
+    std::uint64_t boundary_value{};
+    if (!local_system_time_to_file_time(now, now_value) ||
+        !local_system_time_to_file_time(boundary, boundary_value)) {
+        return false;
+    }
+    if (future) {
+        if (boundary_value <= now_value) return false;
+        set_lower_bound(term, now_value);
+        set_upper_bound(term, boundary_value);
+    } else {
+        if (boundary_value >= now_value) return false;
+        // Everything 1.4 intentionally leaves the upper side open for
+        // last/past/prev rolling constants, so future-dated records match.
+        set_lower_bound(term, boundary_value);
+    }
+    return true;
+}
+
+int month_constant(std::wstring_view value) {
+    static constexpr std::wstring_view names[] = {
+        L"january", L"february", L"march", L"april", L"may", L"june",
+        L"july", L"august", L"september", L"october", L"november",
+        L"december"};
+    static constexpr std::wstring_view short_names[] = {
+        L"jan", L"feb", L"mar", L"apr", L"may", L"jun",
+        L"jul", L"aug", L"sep", L"oct", L"nov", L"dec"};
+    for (int index = 0; index < 12; ++index) {
+        if (value == names[index] || value == short_names[index]) return index + 1;
+    }
+    return 0;
+}
+
+int weekday_constant(std::wstring_view value) {
+    static constexpr std::wstring_view names[] = {
+        L"sunday", L"monday", L"tuesday", L"wednesday", L"thursday",
+        L"friday", L"saturday"};
+    static constexpr std::wstring_view short_names[] = {
+        L"sun", L"mon", L"tue", L"wed", L"thu", L"fri", L"sat"};
+    for (int index = 0; index < 7; ++index) {
+        if (value == names[index] || value == short_names[index]) return index;
+    }
+    return -1;
+}
+
+bool parse_rolling_date(std::wstring_view folded, const SYSTEMTIME& now,
+                        QueryTerm& term) {
+    bool future = false;
+    std::wstring_view rest;
+    if (starts_with(folded, L"coming")) {
+        future = true;
+        rest = folded.substr(6);
+    } else if (starts_with(folded, L"next")) {
+        future = true;
+        rest = folded.substr(4);
+    } else if (starts_with(folded, L"last")) {
+        rest = folded.substr(4);
+    } else if (starts_with(folded, L"past")) {
+        rest = folded.substr(4);
+    } else if (starts_with(folded, L"prev")) {
+        rest = folded.substr(4);
+    } else {
+        return false;
+    }
+
+    std::size_t number_end = 0;
+    while (number_end < rest.size() && rest[number_end] >= L'0' &&
+           rest[number_end] <= L'9') {
+        ++number_end;
+    }
+    if (number_end == 0 || number_end == rest.size()) return false;
+
+    std::uint64_t amount{};
+    if (!parse_unsigned(rest.substr(0, number_end), amount) || amount == 0 ||
+        amount > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    const auto unit = rest.substr(number_end);
+    SYSTEMTIME boundary = now;
+    const auto signed_amount = static_cast<std::int64_t>(amount) *
+        (future ? 1 : -1);
+    if (unit == L"years") {
+        if (!shift_local_years(boundary, signed_amount)) return false;
+    } else if (unit == L"months") {
+        if (!shift_local_months(boundary, signed_amount, true)) return false;
+    } else if (unit == L"weeks") {
+        if (amount > static_cast<std::uint64_t>(
+                std::numeric_limits<int>::max() / 7)) return false;
+        if (!add_local_days(boundary,
+                static_cast<int>(signed_amount * 7))) return false;
+    } else if (unit == L"days") {
+        if (!add_local_days(boundary, static_cast<int>(signed_amount))) return false;
+    } else {
+        std::uint64_t seconds_per_unit{};
+        if (unit == L"hours") seconds_per_unit = 60 * 60;
+        else if (unit == L"minutes" || unit == L"mins") seconds_per_unit = 60;
+        else if (unit == L"seconds" || unit == L"secs") seconds_per_unit = 1;
+        else return false;
+
+        if (amount > std::numeric_limits<std::uint64_t>::max() /
+                         seconds_per_unit) return false;
+        const auto seconds = amount * seconds_per_unit;
+        constexpr std::uint64_t ticks_per_second = 10000000ULL;
+        if (seconds > std::numeric_limits<std::uint64_t>::max() /
+                          ticks_per_second) return false;
+        std::uint64_t now_value{};
+        if (!local_system_time_to_file_time(now, now_value)) return false;
+        const auto delta = seconds * ticks_per_second;
+        if ((!future && delta > now_value) ||
+            (future && delta > std::numeric_limits<std::uint64_t>::max() -
+                                    now_value)) return false;
+        if (future) {
+            set_lower_bound(term, now_value);
+            set_upper_bound(term, now_value + delta);
+        } else {
+            set_lower_bound(term, now_value - delta);
+        }
+        return true;
+    }
+    return set_rolling_date_interval(term, now, boundary, future);
 }
 
 bool parse_relative_date(std::wstring_view input, QueryTerm& term) {
@@ -148,10 +337,7 @@ bool parse_relative_date(std::wstring_view input, QueryTerm& term) {
     SYSTEMTIME now{};
     GetLocalTime(&now);
     SYSTEMTIME start = now;
-    start.wHour = 0;
-    start.wMinute = 0;
-    start.wSecond = 0;
-    start.wMilliseconds = 0;
+    clear_local_time(start);
     SYSTEMTIME end = start;
 
     if (folded == L"today") {
@@ -159,42 +345,81 @@ bool parse_relative_date(std::wstring_view input, QueryTerm& term) {
     } else if (folded == L"yesterday") {
         if (!add_local_days(start, -1)) return false;
     } else if (folded == L"thisweek" || folded == L"currentweek") {
-        const int days_since_monday = (static_cast<int>(now.wDayOfWeek) + 6) % 7;
-        if (!add_local_days(start, -days_since_monday)) return false;
-        end = start;
-        if (!add_local_days(end, 7)) return false;
-    } else if (folded == L"lastweek" || folded == L"pastweek" ||
-               folded == L"prevweek") {
-        const int days_since_monday = (static_cast<int>(now.wDayOfWeek) + 6) % 7;
-        if (!add_local_days(start, -days_since_monday - 7)) return false;
+        if (!start_of_local_week(now, start)) return false;
+        end = now;
+        clear_local_time(end);
+        if (!add_local_days(end, 1)) return false;
+    } else if (folded == L"lastweek" || folded == L"prevweek") {
+        if (!start_of_local_week(now, end)) return false;
+        start = end;
+        if (!add_local_days(start, -7)) return false;
+    } else if (folded == L"pastweek") {
+        SYSTEMTIME boundary = now;
+        if (!add_local_days(boundary, -7)) return false;
+        return set_rolling_date_interval(term, now, boundary, false);
+    } else if (folded == L"comingweek" || folded == L"nextweek") {
+        if (!start_of_local_week(now, start) || !add_local_days(start, 7)) {
+            return false;
+        }
         end = start;
         if (!add_local_days(end, 7)) return false;
     } else if (folded == L"thismonth" || folded == L"currentmonth") {
         start.wDay = 1;
-        end = start;
-        shift_local_month(end, 1);
-    } else if (folded == L"lastmonth" || folded == L"pastmonth" ||
-               folded == L"prevmonth") {
+        end = now;
+        clear_local_time(end);
+        if (!add_local_days(end, 1)) return false;
+    } else if (folded == L"lastmonth" || folded == L"prevmonth") {
         start.wDay = 1;
         end = start;
-        shift_local_month(start, -1);
+        if (!shift_local_months(start, -1, false)) return false;
+    } else if (folded == L"pastmonth") {
+        SYSTEMTIME boundary = now;
+        if (!shift_local_months(boundary, -1, true)) return false;
+        return set_rolling_date_interval(term, now, boundary, false);
+    } else if (folded == L"comingmonth" || folded == L"nextmonth") {
+        start.wDay = 1;
+        if (!shift_local_months(start, 1, false)) return false;
+        end = start;
+        if (!shift_local_months(end, 1, false)) return false;
     } else if (folded == L"thisyear" || folded == L"currentyear") {
         start.wMonth = 1;
         start.wDay = 1;
-        end = start;
-        ++end.wYear;
-    } else if (folded == L"lastyear" || folded == L"pastyear" ||
-               folded == L"prevyear") {
+        end = now;
+        clear_local_time(end);
+        if (!add_local_days(end, 1)) return false;
+    } else if (folded == L"lastyear" || folded == L"prevyear") {
         start.wMonth = 1;
         start.wDay = 1;
         end = start;
-        --start.wYear;
+        if (!shift_local_years(start, -1)) return false;
+    } else if (folded == L"pastyear") {
+        SYSTEMTIME boundary = now;
+        if (!shift_local_years(boundary, -1)) return false;
+        return set_rolling_date_interval(term, now, boundary, false);
+    } else if (folded == L"comingyear" || folded == L"nextyear") {
+        start.wMonth = 1;
+        start.wDay = 1;
+        if (!shift_local_years(start, 1)) return false;
+        end = start;
+        if (!shift_local_years(end, 1)) return false;
+    } else if (const int month = month_constant(folded); month != 0) {
+        start.wMonth = static_cast<WORD>(month);
+        start.wDay = 1;
+        end = start;
+        if (!shift_local_months(end, 1, false)) return false;
+    } else if (const int weekday = weekday_constant(folded); weekday >= 0) {
+        if (!start_of_local_week(now, start)) return false;
+        const int offset = (weekday - first_day_of_week() + 7) % 7;
+        if (!add_local_days(start, offset)) return false;
+        end = start;
+        if (!add_local_days(end, 1)) return false;
+    } else if (parse_rolling_date(folded, now, term)) {
+        return true;
     } else {
         return false;
     }
     return set_date_interval(term, start, end);
 }
-
 bool parse_date_term(std::wstring_view input, QueryTerm& term) {
     if (parse_relative_date(input, term)) return true;
     if (input.size() == 10 && input[4] == L'-' && input[7] == L'-') {

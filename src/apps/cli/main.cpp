@@ -168,9 +168,12 @@ int run_live(const std::filesystem::path& volume,
               << " start_usn=" << cursor << "\n";
 
     auto scan = esm::enumerate_ntfs_volume(volume.wstring());
-    std::cout << "Discovered " << scan.records.size() << " entries in "
-              << scan.elapsed.count() << " ms (" << scan.errors
-              << " errors)\n";
+    std::cout << "MFT bootstrap completed for " << scan.records.size()
+              << " entries in " << scan.elapsed.count() << " ms ("
+              << scan.errors << " enumeration errors); metadata stage "
+              << "hydrated " << scan.metadata_hydrated << " entries in "
+              << scan.metadata_elapsed.count() << " ms ("
+              << scan.metadata_errors << " errors)\n";
     if (scan.root_id == 0 || (scan.records.empty() && scan.errors != 0)) {
         std::cout << "MFT bootstrap failed\n";
         return 1;
@@ -364,9 +367,17 @@ int main(int argc, char** argv) {
     auto scan = mode == "mft"
         ? esm::enumerate_ntfs_volume(root.wstring())
         : esm::scan_directories({root});
-    std::cout << "Discovered " << scan.records.size() << " entries in "
+    std::cout << (mode == "mft" ? "MFT bootstrap completed for "
+                                 : "Discovered ")
+              << scan.records.size() << " entries in "
               << scan.elapsed.count() << " ms (" << scan.errors
               << " errors)\n";
+    if (mode == "mft") {
+        std::cout << "Hydrated search metadata for "
+                  << scan.metadata_hydrated << " entries in "
+                  << scan.metadata_elapsed.count() << " ms ("
+                  << scan.metadata_errors << " errors)\n";
+    }
     if (scan.records.empty() && scan.errors != 0) return 1;
     esm::MetadataIndex index;
     index.replace(std::move(scan.records));

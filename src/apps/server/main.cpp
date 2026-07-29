@@ -184,9 +184,13 @@ int main(int argc, char** argv) {
                 std::cout << "Metadata snapshot rejected, error="
                           << started.snapshot_error << "; rebuilding MFT\n";
             }
-            std::cout << "Discovered " << started.entries << " entries in "
+            std::cout << "MFT enumeration/path stage completed for "
+                      << started.entries << " entries in "
                       << started.enumeration_elapsed.count() << " ms ("
-                      << started.scan_errors << " errors)\n";
+                      << started.scan_errors << " errors); metadata stage "
+                      << "hydrated " << started.metadata_hydrated
+                      << " entries in " << started.metadata_elapsed.count()
+                      << " ms (" << started.metadata_errors << " errors)\n";
         }
         std::cout << "Search index ready: " << live_session.index().size()
                   << " entries in " << started.index_elapsed.count()
@@ -263,9 +267,17 @@ int main(int argc, char** argv) {
         auto scan = mode == "mft"
             ? esm::enumerate_ntfs_volume(root.wstring())
             : esm::scan_directories({root});
-        std::cout << "Discovered " << scan.records.size() << " entries in "
+        std::cout << (mode == "mft" ? "MFT bootstrap completed for "
+                                     : "Discovered ")
+                  << scan.records.size() << " entries in "
                   << scan.elapsed.count() << " ms (" << scan.errors
                   << " errors)\n";
+        if (mode == "mft") {
+            std::cout << "Hydrated search metadata for "
+                      << scan.metadata_hydrated << " entries in "
+                      << scan.metadata_elapsed.count() << " ms ("
+                      << scan.metadata_errors << " errors)\n";
+        }
         if (scan.records.empty() && scan.errors != 0) {
             directory_watch_thread.request_stop();
             if (directory_watch_thread.joinable())

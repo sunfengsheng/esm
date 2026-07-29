@@ -1,4 +1,5 @@
 ﻿#include "esm/ntfs_enumerator.hpp"
+#include "esm/file_metadata.hpp"
 #include <windows.h>
 #include <winioctl.h>
 #include <algorithm>
@@ -18,18 +19,32 @@ std::wstring normalize_volume(std::wstring_view input) {
     if (drive >= L'a' && drive <= L'z') drive = static_cast<wchar_t>(drive - (L'a' - L'A'));
     return std::wstring{drive, L':'};
 }
-std::uint64_t root_file_id(const std::wstring& volume) {
-    const std::wstring root = volume + L"\\";
-    Handle handle{CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
-    if (handle.value == INVALID_HANDLE_VALUE) return 0;
-    BY_HANDLE_FILE_INFORMATION info{};
-    if (!GetFileInformationByHandle(handle.value, &info)) return 0;
-    return (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32U) | info.nFileIndexLow;
+std::uint64_t root_file_id(const std::wstring& volume) noexcept {
+    try {
+        const std::wstring root = volume + L"\\";
+        Handle handle{CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+        if (handle.value == INVALID_HANDLE_VALUE) return 0;
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(handle.value, &info)) return 0;
+        return (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32U) | info.nFileIndexLow;
+    } catch (...) {
+        return 0;
+    }
 }
 }
-ScanResult enumerate_ntfs_volume(std::wstring_view requested_volume) {
+std::uint64_t query_ntfs_root_file_id(
+    std::wstring_view requested_volume) noexcept {
+    try {
+        const std::wstring volume = normalize_volume(requested_volume);
+        return volume.empty() ? 0 : root_file_id(volume);
+    } catch (...) {
+        return 0;
+    }
+}
+ScanResult enumerate_ntfs_volume(
+    std::wstring_view requested_volume, NtfsEnumerationOptions options) {
     const auto started = std::chrono::steady_clock::now();
     ScanResult result;
     const std::wstring volume = normalize_volume(requested_volume);
@@ -73,7 +88,7 @@ ScanResult enumerate_ntfs_volume(std::wstring_view requested_volume) {
         }
     }
 
-    const std::uint64_t root_id = root_file_id(volume);
+    const std::uint64_t root_id = query_ntfs_root_file_id(volume);
     result.root_id = root_id;
     std::unordered_map<std::uint64_t, std::size_t> directories;
     directories.reserve(raw.size() / 8);
@@ -105,6 +120,17 @@ ScanResult enumerate_ntfs_volume(std::wstring_view requested_volume) {
         record.name = entry.name;
         record.path = resolve_directory(entry.parent, 0) + L"\\" + entry.name;
         result.records.push_back(std::move(record));
+    }
+
+    if (options.hydrate_search_metadata) {
+        const auto metadata_started = std::chrono::steady_clock::now();
+        const auto metadata = hydrate_file_search_metadata_records(
+            result.records, options.metadata_worker_count);
+        result.metadata_hydrated = metadata.hydrated;
+        result.metadata_errors = metadata.errors;
+        result.metadata_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - metadata_started);
     }
     result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
     return result;

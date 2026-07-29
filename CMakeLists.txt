@@ -25,6 +25,8 @@ add_library(esm_core
     src/platform/windows/live_index.cpp
     src/platform/windows/metadata_snapshot.cpp
     src/platform/windows/metadata_wal.cpp
+    src/platform/windows/metadata_hydration_wal.cpp
+    src/platform/windows/mft_auto_state.cpp
     src/platform/windows/named_pipe.cpp
 )
 target_include_directories(esm_core PUBLIC include)
@@ -160,6 +162,8 @@ if(ESM_BUILD_BENCHMARKS)
   target_link_libraries(esm_snapshot_benchmark PRIVATE esm_core psapi)
   add_executable(esm_real_search_benchmark benchmarks/real_search_benchmark.cpp)
   target_link_libraries(esm_real_search_benchmark PRIVATE esm_core psapi)
+  add_executable(esm_reconcile_benchmark benchmarks/reconciliation_benchmark.cpp)
+  target_link_libraries(esm_reconcile_benchmark PRIVATE esm_core psapi)
 endif()
 
 

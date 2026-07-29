@@ -1358,6 +1358,149 @@ std::uint32_t MetadataIndex::path_signature_owner(
         ? found->signature_index : invalid;
 }
 
+MetadataHydrationBatch MetadataIndex::metadata_hydration_batch(
+    std::uint64_t after_id, std::size_t limit) const {
+    MetadataHydrationBatch result;
+    result.next_id = after_id;
+    if (limit == 0) return result;
+
+    std::shared_lock lock(mutex_);
+    auto current = std::upper_bound(
+        records_.begin(), records_.end(), after_id,
+        [](std::uint64_t id, const CompactRecord& record) {
+            return id < record.id;
+        });
+    result.records.reserve((std::min)(
+        limit, static_cast<std::size_t>(records_.end() - current)));
+    constexpr std::size_t sparse_scan_multiplier = 64;
+    const auto scan_limit = limit >
+            (std::numeric_limits<std::size_t>::max)() / sparse_scan_multiplier
+        ? (std::numeric_limits<std::size_t>::max)()
+        : limit * sparse_scan_multiplier;
+    std::size_t examined = 0;
+    while (current != records_.end() && examined < scan_limit &&
+           result.records.size() < limit) {
+        result.next_id = current->id;
+        if (removed_.find(current->id) == removed_.end() &&
+            overlay_.find(current->id) == overlay_.end() &&
+            current->last_write_time == 0) {
+            result.records.push_back(materialize(*current));
+        }
+        ++current;
+        ++examined;
+    }
+    result.examined = examined;
+    result.complete = current == records_.end();
+    return result;
+}
+
+MetadataReuseStats MetadataIndex::reuse_search_metadata(
+    std::span<FileRecord> records) const {
+    MetadataReuseStats result;
+    result.examined = records.size();
+    if (records.empty()) return result;
+
+    std::sort(records.begin(), records.end(),
+              [](const FileRecord& left, const FileRecord& right) {
+                  return left.id < right.id;
+              });
+
+    std::shared_lock lock(mutex_);
+    std::size_t base_position = 0;
+    std::wstring path_scratch;
+    for (auto& target : records) {
+        if (const auto overlay = overlay_.find(target.id);
+            overlay != overlay_.end()) {
+            if (overlay->second.path != target.path) {
+                ++result.stale;
+                continue;
+            }
+            if (overlay->second.last_write_time == 0) {
+                ++result.unknown;
+                continue;
+            }
+            target.size = overlay->second.size;
+            target.last_write_time = overlay->second.last_write_time;
+            target.attributes = overlay->second.attributes;
+            target.directory = overlay->second.directory;
+            ++result.reused;
+            continue;
+        }
+        if (removed_.find(target.id) != removed_.end()) {
+            ++result.stale;
+            continue;
+        }
+        while (base_position < records_.size() &&
+               records_[base_position].id < target.id) {
+            ++base_position;
+        }
+        if (base_position == records_.size() ||
+            records_[base_position].id != target.id) {
+            ++result.unknown;
+            continue;
+        }
+        const auto& source = records_[base_position];
+        if (path_view(source, path_scratch) != target.path) {
+            ++result.stale;
+            continue;
+        }
+        if (source.last_write_time == 0) {
+            ++result.unknown;
+            continue;
+        }
+        target.size = source.size;
+        target.last_write_time = source.last_write_time;
+        target.attributes = source.attributes;
+        target.directory = source.directory();
+        ++result.reused;
+    }
+    return result;
+}
+
+MetadataApplyStats MetadataIndex::apply_search_metadata(
+    std::span<const FileRecord> updates) {
+    MetadataApplyStats result;
+    result.attempted = updates.size();
+    if (updates.empty()) return result;
+
+    std::unique_lock lock(mutex_);
+    std::wstring path_scratch;
+    for (const auto& update : updates) {
+        if (auto overlay = overlay_.find(update.id);
+            overlay != overlay_.end()) {
+            if (overlay->second.path != update.path) {
+                ++result.stale;
+                continue;
+            }
+            overlay->second.size = update.size;
+            overlay->second.last_write_time = update.last_write_time;
+            overlay->second.attributes = update.attributes;
+            overlay->second.directory = update.directory;
+            ++result.applied;
+            continue;
+        }
+        if (removed_.find(update.id) != removed_.end()) {
+            ++result.stale;
+            continue;
+        }
+        auto base = std::lower_bound(
+            records_.begin(), records_.end(), update.id,
+            [](const CompactRecord& record, std::uint64_t id) {
+                return record.id < id;
+            });
+        if (base == records_.end() || base->id != update.id ||
+            path_view(*base, path_scratch) != update.path) {
+            ++result.stale;
+            continue;
+        }
+        base->size = update.size;
+        base->last_write_time = update.last_write_time;
+        base->attributes = update.attributes;
+        ++result.applied;
+    }
+    return result;
+}
+
 void MetadataIndex::apply_delta(
     std::vector<FileRecord> upserts,
     const std::vector<std::uint64_t>& removed_ids) {
@@ -1394,7 +1537,8 @@ void MetadataIndex::apply_ntfs_changes(
     std::wstring_view volume_identity,
     std::wstring_view volume_root,
     std::uint64_t root_id,
-    const UsnChangeBatch& batch) {
+    const UsnChangeBatch& batch,
+    bool hydrate_search_metadata) {
     const auto scoped_root_id =
         namespace_ntfs_file_id(volume_identity, root_id);
     std::unique_lock lock(mutex_);
@@ -1607,10 +1751,21 @@ void MetadataIndex::apply_ntfs_changes(
     metadata_updates.reserve(changed_ids.size());
     for (const auto id : changed_ids) {
         if (const auto found = overlay_.find(id); found != overlay_.end()) {
-            metadata_updates.push_back(found->second);
+            auto& record = found->second;
+            // A USN change invalidates the previous filesystem metadata. If
+            // hydration now fails (for example because the file disappeared or
+            // became inaccessible), keep the searchable record but mark its
+            // size/timestamps unresolved instead of retaining stale values that
+            // could later be reused by a reconciliation generation.
+            record.size = 0;
+            record.last_write_time = 0;
+            record.creation_time = 0;
+            record.last_access_time = 0;
+            record.change_time = 0;
+            metadata_updates.push_back(record);
         }
     }
-    if (!metadata_updates.empty()) {
+    if (!metadata_updates.empty() && hydrate_search_metadata) {
         lock.unlock();
         metadata_updates.erase(
             std::remove_if(metadata_updates.begin(), metadata_updates.end(),
@@ -1641,6 +1796,27 @@ void MetadataIndex::apply_ntfs_changes(
     } else {
         rebuild_suppressed_base_ids_locked();
     }
+}
+
+std::vector<FileRecord> MetadataIndex::snapshot_records() const {
+    std::shared_lock lock(mutex_);
+    std::vector<FileRecord> result;
+    result.reserve(live_size_);
+    for (const auto& base : records_) {
+        if (removed_.find(base.id) != removed_.end() ||
+            overlay_.find(base.id) != overlay_.end()) {
+            continue;
+        }
+        result.push_back(materialize(base));
+    }
+    for (const auto& [id, record] : overlay_) {
+        if (removed_.find(id) == removed_.end()) result.push_back(record);
+    }
+    std::sort(result.begin(), result.end(),
+              [](const FileRecord& left, const FileRecord& right) {
+                  return left.id < right.id;
+              });
+    return result;
 }
 
 void MetadataIndex::rebuild_suppressed_base_ids_locked() {

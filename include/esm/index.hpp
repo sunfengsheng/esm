@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <shared_mutex>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,6 +52,23 @@ struct MetadataIndexStorageStats {
     std::size_t ordering_bytes{};
     std::size_t total_base_capacity_bytes{};
 };
+struct MetadataHydrationBatch {
+    std::vector<FileRecord> records;
+    std::size_t examined{};
+    std::uint64_t next_id{};
+    bool complete{};
+};
+struct MetadataApplyStats {
+    std::size_t attempted{};
+    std::size_t applied{};
+    std::size_t stale{};
+};
+struct MetadataReuseStats {
+    std::size_t examined{};
+    std::size_t reused{};
+    std::size_t unknown{};
+    std::size_t stale{};
+};
 class MetadataIndex {
 public:
     static constexpr std::size_t default_auto_compaction_threshold = 100'000;
@@ -72,10 +90,29 @@ public:
     void apply_ntfs_changes(std::wstring_view volume_identity,
                             std::wstring_view volume_root,
                             std::uint64_t root_id,
-                            const UsnChangeBatch& batch);
+                            const UsnChangeBatch& batch,
+                            bool hydrate_search_metadata = true);
     [[nodiscard]] std::vector<SearchResult> search(std::wstring_view query, const SearchOptions& options = {}) const;
     [[nodiscard]] std::size_t size() const;
     [[nodiscard]] std::size_t pending_delta_size() const;
+    // Materializes a bounded, ID-ordered base batch for filesystem metadata
+    // I/O outside the index lock. Overlay and already-hydrated records are
+    // skipped; sparse scans may examine beyond limit while returning at most
+    // limit unresolved records, reducing empty durable WAL transactions.
+    [[nodiscard]] MetadataHydrationBatch metadata_hydration_batch(
+        std::uint64_t after_id, std::size_t limit) const;
+    // Merges size/write-time/attribute updates only when the indexed path still
+    // matches the path that was hydrated, preventing rename races.
+    [[nodiscard]] MetadataApplyStats apply_search_metadata(
+        std::span<const FileRecord> updates);
+    // Sorts a new reconciliation baseline by ID and copies already-hydrated
+    // size/write-time/attributes from the current live view only when file ID
+    // and complete path still match. Unknown or stale records remain untouched.
+    [[nodiscard]] MetadataReuseStats reuse_search_metadata(
+        std::span<FileRecord> records) const;
+    // Materializes the current live base + overlay view, excluding removals,
+    // in stable ID order for a durable checkpoint consolidation.
+    [[nodiscard]] std::vector<FileRecord> snapshot_records() const;
     [[nodiscard]] bool compact();
     void set_auto_compaction_threshold(std::size_t threshold);
     [[nodiscard]] std::size_t compaction_count() const;

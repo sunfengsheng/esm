@@ -6,6 +6,12 @@
 
 ### Added
 
+- ?? `docs/EVERYTHING_COMPATIBILITY.md`????? Everything 1.4.1.1030 ??????????NTFS ???GUI???????????? PASS/PARTIAL/FAIL/UNTESTED ?????
+- ?? `mft-auto` ?? generation/volume/root ???????/USN append-only delta WAL v2???????????? snapshot generation????????root file ID?journal ID ??? USN cursor????? write-through + `FlushFileBuffers`?????? torn tail??? checkpoint ?????????????? cursor gap?
+- ???????? NTFS reconciliation ???? `esm_reconcile_benchmark`??????????? `FSCTL_ENUM_USN_DATA`??? namespacing????????checkpoint ??/????? 10 ms ???? Working Set ? Private Bytes?
+- 多卷 `mft-auto` 新增与 snapshot generation 绑定的低内存元数据补齐 WAL，以及保存卷身份、root file ID、原始 USN journal boundary、补齐 cursor 和完成状态的 sidecar；恢复时会重新读取并校验当前 root file ID，健康重启会重放大小、修改时间和属性更新，并从已刷盘 cursor 继续后台补齐。
+- 元数据 WAL 使用带校验事务、write-through append 和 `FlushFileBuffers`；恢复会拒绝 generation/path fingerprint 不匹配的旧更新，并自动截断不完整事务尾部。
+
 - 文件名查询新增 Everything 风格的 `filelist:`：双引号中的 `|` 分隔完整文件名或完整路径候选，支持每项 `*`/`?` 锚定通配符、大小写/变音符号选项、路径分隔符归一化以及 base + overlay 增量视图。
 
 - 文件名查询新增 Everything 风格的 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:`；支持单个 `|`、`< >` 分组、`ext:` 分号扩展名列表、数字/大小范围、Everything 大小常量、`datemodified:`、下一个自然周/月/年、滚动 N 年/月/周/日/时/分/秒，以及英文月份/星期日期常量。高级搜索窗口新增文件名前缀、后缀和直接父文件夹条件。
@@ -19,6 +25,12 @@
 
 ### Changed
 
+- ?? WAL ???????????????????? checkpoint ????????????? checkpoint ????????????????? MFT ????? reconciliation ????????????????????????????????
+- ??????????? snapshot ???????/USN WAL??? durable cursor ?? USN catch-up?WAL replay ??????????? I/O???????????????? hydration?
+- ?????? 5 ??? 100,000 ???????? checkpoint consolidation??? base + overlay - tombstone???? generation snapshot/WAL/state?????????????? generation ?????? WAL?
+- 默认多卷 `mft-auto` 服务改为两阶段首次建库和完整 reconciliation：MFT 路径重建后先保存并发布名称索引，使 Named Pipe 查询尽早可用；随后协调器按 ID 顺序每批检查 4,096 条基础记录、每批默认最多 4 个 worker 在索引锁外补齐大小/修改时间/属性，并在重新加锁时校验 ID 与路径仍匹配。USN 增量优先于下一批补齐；重命名、删除或全量替换造成的过期结果会被丢弃；每批之间检查停止请求，Event Log 每检查约 250,000 条报告一次进度并记录完成或提前停止摘要。
+- CLI、前台 MFT server 和单卷 MFT 服务继续保留同步元数据补齐行为；多卷后台补齐只物化有限批次路径，不保留第二份全盘路径向量。多卷服务现在先把每批成功读取的元数据事务刷入 generation-bound WAL，再合并内存索引；卷集合、卷身份、root 和原始 USN boundary 全部有效时，健康重启可跳过立即完整 MFT reconciliation。完整 reconciliation 创建新 generation 时，只有当前 live USN 状态仍连续可信，并且 MFT 扫描完成后可把新旧共有卷再次追赶到当前 USN 边界，才会把新 MFT 基线按 ID 排序，并在当前 live base/overlay 的文件 ID、完整路径一致且修改时间已知时复用大小、修改时间和属性；新 snapshot 直接保存复用结果，后台只读取未知或 stale 项。启动 state 失效、扫描后的 USN 追赶失败、普通 USN 读取失败或 journal gap 会禁用旧元数据复用，避免遗漏路径不变的内容修改。直接 USN 变化会先清空旧大小和时间，读取失败时保持未知，防止 stale 值进入查询或后续 generation；名称/USN delta 仍未持久化。
+
 - 精确且仅含单个正向 `filelist:` 条件的查询改为复用现有 raw/accent-folded 名称前缀表：先按每个候选的 basename 缩小 base 记录范围，完整路径只为文件名精确命中的少量候选重建；overlay 继续完整求值。该优化不新增常驻文件名或路径哈希表，带 `*`/`?` 的列表仍走完整 evaluator。
 
 - 目录直接子项匹配与统计仅在查询包含 `child:`/`empty:`/`child*count:` 时按当前 base + overlay 视图临时构建；`child:` 支持普通子串和通配符文件名，并同时检查直接子文件与子目录。普通文件名查询不承担该内存和遍历成本，增量创建/删除也会参与匹配与统计。
@@ -30,6 +42,8 @@
 - 同步架构、性能和路线图文档与当前代码实现。
 
 ### Fixed
+
+- 修复初始 NTFS MFT 基线只有名称/父关系/属性、旧文件大小和修改时间长期为零的问题：CLI、前台 server 和单卷服务在路径重建后同步原地补齐；默认多卷服务先发布名称索引，再后台有界分批补齐紧凑索引保存的大小、修改时间、属性和目录状态。不可访问或枚举后瞬时消失的条目保留原值并计入 metadata errors，不会阻断名称搜索。
 
 - 修正相对日期兼容语义：`pastweek` / `pastmonth` / `pastyear` 改为滚动下界，`last` / `prev` 保持上一个完整自然周期；周边界改为读取 Windows 当前用户“每周第一天”设置，`this*` 周期不再包含今天之后的未来日期。
 

@@ -139,3 +139,4 @@ flowchart LR
 - 优先保证正确性和可测量性能，再进行 UI 打磨。
 - 文件名/元数据索引与未来的文档内容索引保持独立。
 - 不声称已经完整复刻 Everything，也不声称兼容 Everything ETP。
+- [Everything ???????](docs/EVERYTHING_COMPATIBILITY.md)

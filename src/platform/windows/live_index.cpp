@@ -248,7 +248,13 @@ LiveStartResult LiveIndexSession::start(
         auto scan = enumerate_ntfs_volume(volume_.wstring());
         result.entries = scan.records.size();
         result.scan_errors = scan.errors;
-        result.enumeration_elapsed = scan.elapsed;
+        result.metadata_hydrated = scan.metadata_hydrated;
+        result.metadata_errors = scan.metadata_errors;
+        result.metadata_elapsed = scan.metadata_elapsed;
+        result.enumeration_elapsed =
+            scan.elapsed >= scan.metadata_elapsed
+                ? scan.elapsed - scan.metadata_elapsed
+                : std::chrono::milliseconds{};
         if (scan.root_id == 0 ||
             (scan.records.empty() && scan.errors != 0)) {
             result.error = scan.errors == 0 ? ERROR_INVALID_DATA

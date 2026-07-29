@@ -6,8 +6,10 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <span>
+#include <sstream>
 #include <vector>
 
 namespace esm {
@@ -16,8 +18,10 @@ static_assert(sizeof(wchar_t) == 2,
               "metadata WAL requires Windows UTF-16 wchar_t");
 
 constexpr std::uint32_t magic = 0x314c4157; // WAL1
-constexpr std::uint16_t version = 1;
-constexpr std::size_t header_size = 52;
+constexpr std::uint16_t single_volume_version = 1;
+constexpr std::uint16_t bound_volume_version = 2;
+constexpr std::size_t single_volume_header_size = 52;
+constexpr std::size_t bound_volume_header_size = 84;
 constexpr std::size_t fixed_change_size = 36;
 constexpr std::size_t max_transaction_size = 64 * 1024 * 1024;
 constexpr std::uint64_t fnv_offset = 1469598103934665603ULL;
@@ -34,6 +38,24 @@ std::uint64_t checksum_update(std::uint64_t value,
 
 std::uint64_t checksum(std::span<const std::uint8_t> bytes) {
     return checksum_update(fnv_offset, bytes);
+}
+
+std::uint64_t binding_fingerprint(std::wstring_view value) noexcept {
+    auto result = fnv_offset;
+    for (auto character : value) {
+        // Volume GUID paths, drive roots and mount roots use ASCII for their
+        // identity-bearing portion. Fold ASCII case so Windows-equivalent
+        // spellings produce the same durable binding without locale state.
+        if (character >= L'a' && character <= L'z') {
+            character = static_cast<wchar_t>(character - L'a' + L'A');
+        }
+        result ^= static_cast<std::uint8_t>(character & 0xffU);
+        result *= fnv_prime;
+        result ^= static_cast<std::uint8_t>(
+            (static_cast<std::uint16_t>(character) >> 8U) & 0xffU);
+        result *= fnv_prime;
+    }
+    return result;
 }
 
 void put16(std::vector<std::uint8_t>& out, std::uint16_t value) {
@@ -105,9 +127,7 @@ bool exact_write(HANDLE handle, std::span<const std::uint8_t> bytes,
     return true;
 }
 
-std::vector<std::uint8_t> encode(std::uint64_t journal,
-                                 std::int64_t start,
-                                 const UsnChangeBatch& batch) {
+std::vector<std::uint8_t> encode_payload(const UsnChangeBatch& batch) {
     if (batch.changes.size() >
         (std::numeric_limits<std::uint32_t>::max)()) {
         throw std::length_error("WAL has too many changes");
@@ -135,12 +155,18 @@ std::vector<std::uint8_t> encode(std::uint64_t journal,
             change.name.data());
         payload.insert(payload.end(), raw, raw + name_bytes);
     }
+    return payload;
+}
 
+std::vector<std::uint8_t> encode_single_volume(
+    std::uint64_t journal, std::int64_t start,
+    const UsnChangeBatch& batch) {
+    auto payload = encode_payload(batch);
     std::vector<std::uint8_t> out;
-    out.reserve(header_size + payload.size());
+    out.reserve(single_volume_header_size + payload.size());
     put32(out, magic);
-    put16(out, version);
-    put16(out, static_cast<std::uint16_t>(header_size));
+    put16(out, single_volume_version);
+    put16(out, static_cast<std::uint16_t>(single_volume_header_size));
     put32(out, static_cast<std::uint32_t>(payload.size()));
     put64(out, journal);
     put64(out, static_cast<std::uint64_t>(start));
@@ -150,6 +176,36 @@ std::vector<std::uint8_t> encode(std::uint64_t journal,
     put64(out, 0);
     out.insert(out.end(), payload.begin(), payload.end());
     patch64(out, 44, checksum(out));
+    return out;
+}
+
+std::vector<std::uint8_t> encode_bound_volume(
+    const MetadataWalBinding& binding,
+    std::uint64_t journal, std::int64_t start,
+    const UsnChangeBatch& batch) {
+    if (binding.generation == 0 || binding.volume_identity.empty() ||
+        binding.volume_root.empty() || binding.root_id == 0) {
+        throw std::invalid_argument("invalid multi-volume WAL binding");
+    }
+    auto payload = encode_payload(batch);
+    std::vector<std::uint8_t> out;
+    out.reserve(bound_volume_header_size + payload.size());
+    put32(out, magic);
+    put16(out, bound_volume_version);
+    put16(out, static_cast<std::uint16_t>(bound_volume_header_size));
+    put32(out, static_cast<std::uint32_t>(payload.size()));
+    put64(out, journal);
+    put64(out, static_cast<std::uint64_t>(start));
+    put64(out, static_cast<std::uint64_t>(batch.next_usn));
+    put32(out, static_cast<std::uint32_t>(batch.changes.size()));
+    put32(out, 0);
+    put64(out, binding.generation);
+    put64(out, binding_fingerprint(binding.volume_identity));
+    put64(out, binding_fingerprint(binding.volume_root));
+    put64(out, binding.root_id);
+    put64(out, 0);
+    out.insert(out.end(), payload.begin(), payload.end());
+    patch64(out, 76, checksum(out));
     return out;
 }
 
@@ -209,26 +265,13 @@ bool truncate_tail(const std::filesystem::path& path,
     discarded = original - valid_bytes;
     return true;
 }
-} // namespace
 
-std::filesystem::path metadata_wal_path(
-    const std::filesystem::path& checkpoint) {
-    auto value = checkpoint;
-    value += L".wal";
-    return value;
-}
-
-MetadataWalResult append_metadata_wal(
-    const std::filesystem::path& path,
-    std::uint64_t journal,
-    std::int64_t start,
-    const UsnChangeBatch& batch) {
+MetadataWalResult append_encoded(const std::filesystem::path& path,
+                                 std::int64_t start,
+                                 const UsnChangeBatch& batch,
+                                 std::vector<std::uint8_t> bytes) {
     MetadataWalResult result;
     result.next_usn = start;
-    if (batch.error || batch.next_usn <= start) {
-        result.error = batch.error ? batch.error : ERROR_INVALID_DATA;
-        return result;
-    }
     try {
         std::error_code ec;
         if (const auto parent = path.parent_path(); !parent.empty()) {
@@ -238,10 +281,11 @@ MetadataWalResult append_metadata_wal(
                 return result;
             }
         }
-        const auto bytes = encode(journal, start, batch);
         Handle file{CreateFileW(path.c_str(), FILE_APPEND_DATA,
                                 FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+                                OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                                nullptr)};
         if (file.value == INVALID_HANDLE_VALUE) {
             result.error = GetLastError();
             return result;
@@ -266,12 +310,14 @@ MetadataWalResult append_metadata_wal(
     return result;
 }
 
-MetadataWalResult replay_metadata_wal(
-    const std::filesystem::path& path,
-    std::uint64_t journal,
-    std::int64_t start,
-    NtfsCatalog& catalog,
-    MetadataIndex& index) {
+template <std::size_t HeaderSize, typename ValidateBinding, typename Apply>
+MetadataWalResult replay_impl(const std::filesystem::path& path,
+                              std::uint16_t expected_version,
+                              std::size_t checksum_offset,
+                              std::uint64_t journal,
+                              std::int64_t start,
+                              ValidateBinding&& validate_binding,
+                              Apply&& apply) {
     MetadataWalResult result;
     result.next_usn = start;
     try {
@@ -287,7 +333,7 @@ MetadataWalResult replay_metadata_wal(
         }
 
         while (true) {
-            std::array<std::uint8_t, header_size> header{};
+            std::array<std::uint8_t, HeaderSize> header{};
             input.read(reinterpret_cast<char*>(header.data()), header.size());
             const auto header_bytes = static_cast<std::size_t>(input.gcount());
             if (header_bytes == 0) {
@@ -302,9 +348,10 @@ MetadataWalResult replay_metadata_wal(
                 break;
             }
             if (get32(header.data()) != magic ||
-                get16(header.data() + 4) != version ||
-                get16(header.data() + 6) != header_size ||
-                get32(header.data() + 40) != 0) {
+                get16(header.data() + 4) != expected_version ||
+                get16(header.data() + 6) != HeaderSize ||
+                get32(header.data() + 40) != 0 ||
+                !validate_binding(header)) {
                 result.error = ERROR_INVALID_DATA;
                 return result;
             }
@@ -324,8 +371,8 @@ MetadataWalResult replay_metadata_wal(
                 }
             }
 
-            const auto expected = get64(header.data() + 44);
-            patch64(header, 44, 0);
+            const auto expected = get64(header.data() + checksum_offset);
+            patch64(header, checksum_offset, 0);
             auto actual = checksum(header);
             actual = checksum_update(actual, payload);
             if (actual != expected) {
@@ -345,7 +392,7 @@ MetadataWalResult replay_metadata_wal(
                 return result;
             }
 
-            result.valid_bytes += header_size + payload_size;
+            result.valid_bytes += HeaderSize + payload_size;
             if (transaction_next <= result.next_usn) continue;
             if (transaction_start != result.next_usn) {
                 result.error = ERROR_INVALID_DATA;
@@ -358,8 +405,7 @@ MetadataWalResult replay_metadata_wal(
                 result.error = ERROR_INVALID_DATA;
                 return result;
             }
-            auto delta = catalog.apply(batch);
-            index.apply_delta(std::move(delta.upserts), delta.removed_ids);
+            apply(batch);
             result.next_usn = transaction_next;
             ++result.transactions;
             result.changes += batch.changes.size();
@@ -380,13 +426,129 @@ MetadataWalResult replay_metadata_wal(
     }
     return result;
 }
+} // namespace
+
+std::filesystem::path metadata_wal_path(
+    const std::filesystem::path& checkpoint) {
+    auto value = checkpoint;
+    value += L".wal";
+    return value;
+}
+
+std::filesystem::path metadata_wal_path(
+    const std::filesystem::path& snapshot,
+    std::uint64_t generation,
+    std::wstring_view volume_identity) {
+    std::wostringstream suffix;
+    suffix << L".names." << std::hex << std::setfill(L'0')
+           << std::setw(16) << generation << L'.'
+           << std::setw(16) << binding_fingerprint(volume_identity)
+           << L".wal";
+    auto value = snapshot;
+    value += suffix.str();
+    return value;
+}
+
+MetadataWalResult append_metadata_wal(
+    const std::filesystem::path& path,
+    std::uint64_t journal,
+    std::int64_t start,
+    const UsnChangeBatch& batch) {
+    MetadataWalResult result;
+    result.next_usn = start;
+    if (batch.error || batch.next_usn <= start) {
+        result.error = batch.error ? batch.error : ERROR_INVALID_DATA;
+        return result;
+    }
+    try {
+        return append_encoded(path, start, batch,
+                              encode_single_volume(journal, start, batch));
+    } catch (const std::bad_alloc&) {
+        result.error = ERROR_NOT_ENOUGH_MEMORY;
+    } catch (...) {
+        result.error = ERROR_INVALID_DATA;
+    }
+    return result;
+}
+
+MetadataWalResult append_metadata_wal(
+    const std::filesystem::path& path,
+    const MetadataWalBinding& binding,
+    std::uint64_t journal,
+    std::int64_t start,
+    const UsnChangeBatch& batch) {
+    MetadataWalResult result;
+    result.next_usn = start;
+    if (batch.error || batch.next_usn <= start) {
+        result.error = batch.error ? batch.error : ERROR_INVALID_DATA;
+        return result;
+    }
+    try {
+        return append_encoded(path, start, batch,
+                              encode_bound_volume(binding, journal, start,
+                                                  batch));
+    } catch (const std::bad_alloc&) {
+        result.error = ERROR_NOT_ENOUGH_MEMORY;
+    } catch (...) {
+        result.error = ERROR_INVALID_DATA;
+    }
+    return result;
+}
+
+MetadataWalResult replay_metadata_wal(
+    const std::filesystem::path& path,
+    std::uint64_t journal,
+    std::int64_t start,
+    NtfsCatalog& catalog,
+    MetadataIndex& index) {
+    return replay_impl<single_volume_header_size>(
+        path, single_volume_version, 44, journal, start,
+        [](const auto&) { return true; },
+        [&](const UsnChangeBatch& batch) {
+            auto delta = catalog.apply(batch);
+            index.apply_delta(std::move(delta.upserts), delta.removed_ids);
+        });
+}
+
+MetadataWalResult replay_metadata_wal(
+    const std::filesystem::path& path,
+    const MetadataWalBinding& binding,
+    std::uint64_t journal,
+    std::int64_t start,
+    MetadataIndex& index) {
+    if (binding.generation == 0 || binding.volume_identity.empty() ||
+        binding.volume_root.empty() || binding.root_id == 0) {
+        MetadataWalResult result;
+        result.next_usn = start;
+        result.error = ERROR_INVALID_PARAMETER;
+        return result;
+    }
+    const auto identity = binding_fingerprint(binding.volume_identity);
+    const auto root = binding_fingerprint(binding.volume_root);
+    return replay_impl<bound_volume_header_size>(
+        path, bound_volume_version, 76, journal, start,
+        [&](const auto& header) {
+            return get64(header.data() + 44) == binding.generation &&
+                   get64(header.data() + 52) == identity &&
+                   get64(header.data() + 60) == root &&
+                   get64(header.data() + 68) == binding.root_id;
+        },
+        [&](const UsnChangeBatch& batch) {
+            index.apply_ntfs_changes(binding.volume_identity,
+                                     binding.volume_root,
+                                     binding.root_id, batch, false);
+        });
+}
 
 MetadataWalResult reset_metadata_wal(const std::filesystem::path& path) {
     MetadataWalResult result;
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec)) {
-        result.ok = true;
-        return result;
+    if (const auto parent = path.parent_path(); !parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            result.error = static_cast<std::uint32_t>(ec.value());
+            return result;
+        }
     }
     auto temporary = path;
     temporary += L".reset.tmp";

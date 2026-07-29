@@ -10,8 +10,11 @@
 #include "esm/journal_checkpoint.hpp"
 #include "esm/journal_replay.hpp"
 #include "esm/metadata_snapshot.hpp"
+#include "esm/metadata_hydration_wal.hpp"
 #include "esm/metadata_wal.hpp"
+#include "esm/mft_auto_state.hpp"
 #include "esm/ntfs_catalog.hpp"
+#include "esm/ntfs_enumerator.hpp"
 #include "esm/volume_discovery.hpp"
 #include <windows.h>
 #include <winioctl.h>
@@ -103,6 +106,8 @@ void test_ntfs_volume_discovery() {
         require(!volume.root.empty() && !volume.mount_path.empty() &&
                     !volume.identity.empty(),
                 "discovered NTFS volume metadata should be complete");
+        require(esm::query_ntfs_root_file_id(volume.root) != 0,
+                "discovered NTFS volume root file ID should be readable");
         if (index != 0)
             require(_wcsicmp(discovery.volumes[index - 1].root.c_str(),
                              volume.root.c_str()) < 0,
@@ -858,6 +863,26 @@ void test_direct_ntfs_change_metadata_hydration() {
     require(results.size() == 1 && results.front().record.size == 21,
             "direct USN data change refreshes file size");
 
+    std::filesystem::remove(file_path);
+    esm::UsnChangeBatch inaccessible_batch;
+    inaccessible_batch.changes.push_back(
+        {12, raw_root_id, 3, USN_REASON_DATA_EXTEND,
+         FILE_ATTRIBUTE_ARCHIVE, L"live-metadata.bin"});
+    index.apply_ntfs_changes(identity, root_path.wstring(), raw_root_id,
+                             inaccessible_batch);
+    results = index.search(L"name:live-metadata.bin");
+    require(results.size() == 1 && results.front().record.size == 0 &&
+                results.front().record.last_write_time == 0,
+            "failed USN metadata hydration invalidates stale size and time");
+    std::vector<esm::FileRecord> rebuilt;
+    rebuilt.push_back(record(
+        esm::namespace_ntfs_file_id(identity, 12), L"live-metadata.bin",
+        file_path.wstring()));
+    const auto reused = index.reuse_search_metadata(rebuilt);
+    require(reused.reused == 0 && reused.unknown == 1 &&
+                rebuilt.front().last_write_time == 0,
+            "invalidated USN metadata is not reused by reconciliation");
+
     std::filesystem::remove_all(root_path);
 }
 
@@ -1423,6 +1448,192 @@ void test_index_compaction() {
             "automatic compaction keeps replacement");
 }
 
+
+void test_index_background_metadata_batches() {
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> records;
+    records.push_back(record(40, L"delta.bin", L"D:\\delta.bin"));
+    records.push_back(record(10, L"alpha.bin", L"D:\\alpha.bin"));
+    records.push_back(record(30, L"gamma.bin", L"D:\\gamma.bin"));
+    records.push_back(record(20, L"beta.bin", L"D:\\beta.bin"));
+    index.replace(std::move(records));
+    const auto apply_one = [&](const esm::FileRecord& update) {
+        const std::array updates{update};
+        return index.apply_search_metadata(updates);
+    };
+
+    auto renamed_beta = record(20, L"beta-live.bin", L"D:\\beta-live.bin");
+    renamed_beta.size = 20;
+    index.apply_delta({renamed_beta}, {30});
+
+    const auto first = index.metadata_hydration_batch(0, 2);
+    require(first.examined == 4 && first.next_id == 40 && first.complete &&
+                first.records.size() == 2 && first.records[0].id == 10 &&
+                first.records[1].id == 40,
+            "metadata batch scans across overlay and removed records while "
+            "bounding unresolved I/O candidates");
+
+    auto alpha_update = first.records.front();
+    alpha_update.size = 123;
+    alpha_update.last_write_time = 456;
+    alpha_update.attributes = FILE_ATTRIBUTE_ARCHIVE;
+    const auto alpha_applied = apply_one(alpha_update);
+    auto alpha_results = index.search(L"alpha.bin");
+    require(alpha_applied.attempted == 1 && alpha_applied.applied == 1 &&
+                alpha_applied.stale == 0 && alpha_results.size() == 1 &&
+                alpha_results.front().record.size == 123 &&
+                alpha_results.front().record.last_write_time == 456 &&
+                alpha_results.front().record.attributes ==
+                    FILE_ATTRIBUTE_ARCHIVE,
+            "metadata apply updates compact searchable fields");
+
+    auto renamed_delta = record(40, L"delta-live.bin", L"D:\\delta-live.bin");
+    renamed_delta.size = 40;
+    index.apply_delta({renamed_delta}, {});
+    auto stale_delta = first.records[1];
+    stale_delta.size = 999;
+    const auto stale_rename = apply_one(stale_delta);
+    auto delta_results = index.search(L"delta-live.bin");
+    require(stale_rename.applied == 0 && stale_rename.stale == 1 &&
+                delta_results.size() == 1 &&
+                delta_results.front().record.size == 40,
+            "metadata apply rejects a path made stale by rename");
+
+    renamed_delta.size = 444;
+    renamed_delta.last_write_time = 555;
+    renamed_delta.attributes = FILE_ATTRIBUTE_HIDDEN;
+    const auto overlay_applied = apply_one(renamed_delta);
+    delta_results = index.search(L"delta-live.bin");
+    require(overlay_applied.applied == 1 && overlay_applied.stale == 0 &&
+                delta_results.front().record.size == 444 &&
+                delta_results.front().record.last_write_time == 555 &&
+                delta_results.front().record.attributes ==
+                    FILE_ATTRIBUTE_HIDDEN,
+            "metadata apply updates a path-matching overlay record");
+
+    index.apply_delta({}, {10});
+    const auto stale_removed = apply_one(alpha_update);
+    const auto missing = apply_one(
+        record(99, L"missing.bin", L"D:\\missing.bin"));
+    require(stale_removed.applied == 0 && stale_removed.stale == 1 &&
+                missing.applied == 0 && missing.stale == 1,
+            "metadata apply rejects removed and missing records");
+}
+
+void test_index_reuses_search_metadata() {
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> source;
+    source.push_back(record(10, L"known.bin", L"D:\\known.bin"));
+    source.back().size = 101;
+    source.back().last_write_time = 1001;
+    source.back().attributes = FILE_ATTRIBUTE_ARCHIVE;
+    source.push_back(record(20, L"renamed-old.bin", L"D:\\renamed-old.bin"));
+    source.back().size = 202;
+    source.back().last_write_time = 2002;
+    source.push_back(record(30, L"unknown.bin", L"D:\\unknown.bin"));
+    source.push_back(record(50, L"removed.bin", L"D:\\removed.bin"));
+    source.back().size = 505;
+    source.back().last_write_time = 5005;
+    index.replace(std::move(source));
+
+    auto overlay = record(40, L"overlay.bin", L"D:\\overlay.bin");
+    overlay.size = 404;
+    overlay.last_write_time = 4004;
+    overlay.attributes = FILE_ATTRIBUTE_HIDDEN;
+    index.apply_delta({overlay}, {50});
+
+    std::vector<esm::FileRecord> baseline;
+    baseline.push_back(record(60, L"new.bin", L"D:\\new.bin"));
+    baseline.push_back(record(40, L"overlay.bin", L"D:\\overlay.bin"));
+    baseline.push_back(record(20, L"renamed-new.bin", L"D:\\renamed-new.bin"));
+    baseline.push_back(record(10, L"known.bin", L"D:\\known.bin"));
+    baseline.push_back(record(50, L"removed.bin", L"D:\\removed.bin"));
+    baseline.push_back(record(30, L"unknown.bin", L"D:\\unknown.bin"));
+
+    const auto reused = index.reuse_search_metadata(baseline);
+    require(reused.examined == 6 && reused.reused == 2 &&
+                reused.unknown == 2 && reused.stale == 2,
+            "reconciliation metadata reuse classifies live records");
+    require(std::is_sorted(
+                baseline.begin(), baseline.end(),
+                [](const auto& left, const auto& right) {
+                    return left.id < right.id;
+                }),
+            "reconciliation metadata reuse sorts the baseline by ID");
+    require(baseline[0].id == 10 && baseline[0].size == 101 &&
+                baseline[0].last_write_time == 1001 &&
+                baseline[0].attributes == FILE_ATTRIBUTE_ARCHIVE,
+            "reconciliation metadata reuse copies matching base metadata");
+    require(baseline[3].id == 40 && baseline[3].size == 404 &&
+                baseline[3].last_write_time == 4004 &&
+                baseline[3].attributes == FILE_ATTRIBUTE_HIDDEN,
+            "reconciliation metadata reuse copies matching overlay metadata");
+    require(baseline[1].id == 20 && baseline[1].last_write_time == 0 &&
+                baseline[2].id == 30 && baseline[2].last_write_time == 0 &&
+                baseline[4].id == 50 && baseline[4].last_write_time == 0 &&
+                baseline[5].id == 60 && baseline[5].last_write_time == 0,
+            "stale and unknown metadata remains unresolved");
+
+    const auto unresolved = index.metadata_hydration_batch(0, 100);
+    require(unresolved.complete && unresolved.examined == 4 &&
+                unresolved.records.size() == 1 &&
+                unresolved.records.front().id == 30,
+            "background hydration skips already-known base metadata");
+}
+
+void test_search_metadata_batch_hydration() {
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("esm-search-metadata-test-" + std::to_string(suffix));
+    std::filesystem::create_directories(root / "folder");
+    const auto file = root / "payload.bin";
+    {
+        std::ofstream output(file, std::ios::binary);
+        output << "search-metadata";
+    }
+
+    std::vector<esm::FileRecord> records;
+    auto payload = record(1, L"payload.bin", file.wstring());
+    payload.size = 1;
+    payload.last_write_time = 2;
+    payload.creation_time = 101;
+    records.push_back(payload);
+    records.push_back(record(2, L"folder", (root / "folder").wstring(), true));
+    auto missing = record(3, L"missing.bin", (root / "missing.bin").wstring());
+    missing.size = 77;
+    missing.last_write_time = 88;
+    records.push_back(missing);
+
+    std::vector<std::uint8_t> succeeded(records.size());
+    const auto stats = esm::hydrate_file_search_metadata_records(
+        records, 2, succeeded);
+    require(stats.attempted == 3 && stats.hydrated == 2 && stats.errors == 1,
+            "search metadata batch reports success and failure counts");
+    require(succeeded == std::vector<std::uint8_t>({1, 1, 0}),
+            "search metadata batch marks only durable successful reads");
+    require(records[0].size == 15 &&
+                records[0].last_write_time > 116444736000000000ll &&
+                records[0].creation_time == 101 && !records[0].directory,
+            "search metadata batch populates compact file fields only");
+    require(records[1].directory && records[1].size == 0 &&
+                records[1].last_write_time > 116444736000000000ll,
+            "search metadata batch populates directory write time");
+    require(records[2].size == 77 && records[2].last_write_time == 88,
+            "failed search metadata hydration preserves old values");
+    std::vector<std::uint8_t> wrong_size(2);
+    bool rejected_wrong_size = false;
+    try {
+        (void)esm::hydrate_file_search_metadata_records(
+            records, 1, wrong_size);
+    } catch (const std::invalid_argument&) {
+        rejected_wrong_size = true;
+    }
+    require(rejected_wrong_size,
+            "search metadata batch rejects a mismatched success bitmap");
+
+    std::filesystem::remove_all(root);
+}
 
 void test_file_metadata_hydration() {
     const auto suffix = std::chrono::steady_clock::now()
@@ -2175,6 +2386,330 @@ void test_streaming_catalog_snapshot() {
     std::filesystem::remove_all(root);
 }
 
+void test_metadata_hydration_wal_recovery() {
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("esm-metadata-hydration-wal-" + std::to_string(suffix));
+    std::filesystem::create_directories(root);
+    const auto snapshot_path = root / "mft-index.snapshot";
+    const auto wal_path = esm::metadata_hydration_wal_path(snapshot_path);
+    constexpr std::uint64_t generation = 9'001;
+
+    require(wal_path.wstring().ends_with(L".metadata.wal"),
+            "metadata hydration WAL path should be a snapshot sidecar");
+    const auto initialized = esm::initialize_metadata_hydration_wal(
+        wal_path, generation);
+    require(initialized.ok && initialized.valid_bytes == 32,
+            "metadata hydration WAL should initialize atomically");
+
+    auto alpha = record(10, L"alpha.bin", L"C:\\alpha.bin");
+    alpha.size = 1'010;
+    alpha.last_write_time = 2'010;
+    alpha.attributes = FILE_ATTRIBUTE_ARCHIVE;
+    auto missing_id = record(15, L"missing.bin", L"C:\\missing.bin");
+    missing_id.size = 1'015;
+    missing_id.last_write_time = 2'015;
+    auto renamed = record(20, L"beta.bin", L"D:\\renamed-beta.bin");
+    renamed.size = 1'020;
+    renamed.last_write_time = 2'020;
+    renamed.attributes = FILE_ATTRIBUTE_HIDDEN;
+    std::vector<esm::MetadataHydrationWalUpdate> first_updates{
+        esm::make_metadata_hydration_wal_update(alpha),
+        esm::make_metadata_hydration_wal_update(missing_id),
+        esm::make_metadata_hydration_wal_update(renamed)};
+    const auto first = esm::append_metadata_hydration_wal(
+        wal_path, generation, 0, 20, 3, first_updates, false);
+    require(first.ok && first.next_id == 20 && !first.complete,
+            "metadata hydration WAL should append a durable batch cursor");
+
+    auto folder = record(30, L"folder", L"E:\\folder", true);
+    folder.size = 999;
+    folder.last_write_time = 3'030;
+    folder.attributes = FILE_ATTRIBUTE_HIDDEN;
+    const auto folder_update =
+        esm::make_metadata_hydration_wal_update(folder);
+    const auto completed = esm::append_metadata_hydration_wal(
+        wal_path, generation, 20, 30, 1,
+        std::span<const esm::MetadataHydrationWalUpdate>(&folder_update, 1),
+        true);
+    require(completed.ok && completed.complete && completed.next_id == 30,
+            "metadata hydration WAL should persist completion");
+
+    std::vector<esm::FileRecord> restored;
+    auto beta = record(20, L"beta.bin", L"D:\\beta.bin");
+    beta.size = 77;
+    beta.last_write_time = 88;
+    restored.push_back(folder);
+    restored.back().size = 0;
+    restored.back().last_write_time = 0;
+    restored.back().attributes = 0;
+    restored.push_back(beta);
+    restored.push_back(record(10, L"alpha.bin", L"C:\\alpha.bin"));
+    const auto replay = esm::replay_metadata_hydration_wal(
+        wal_path, generation, restored);
+    require(replay.ok && replay.complete && replay.transactions == 2 &&
+                replay.examined == 4 && replay.updates == 4 &&
+                replay.applied == 2 && replay.stale == 2 &&
+                replay.next_id == 30,
+            "metadata hydration WAL should replay matches and reject stale IDs or paths");
+    require(restored[0].id == 10 && restored[0].size == 1'010 &&
+                restored[0].last_write_time == 2'010 &&
+                restored[0].attributes == FILE_ATTRIBUTE_ARCHIVE,
+            "metadata hydration WAL should restore file search metadata");
+    require(restored[1].id == 20 && restored[1].size == 77 &&
+                restored[1].last_write_time == 88,
+            "metadata hydration WAL should not apply a path fingerprint mismatch");
+    require(restored[2].id == 30 && restored[2].directory &&
+                restored[2].size == 999 &&
+                (restored[2].attributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+            "metadata hydration WAL should restore directory attributes");
+
+    auto wrong_generation_records = restored;
+    const auto wrong_generation = esm::replay_metadata_hydration_wal(
+        wal_path, generation + 1, wrong_generation_records);
+    require(!wrong_generation.ok && wrong_generation.generation_mismatch &&
+                wrong_generation.error == ERROR_REVISION_MISMATCH,
+            "metadata hydration WAL should reject a different snapshot generation");
+
+    const auto torn_path = root / "torn.metadata.wal";
+    require(esm::initialize_metadata_hydration_wal(
+                torn_path, generation).ok,
+            "torn-tail WAL fixture should initialize");
+    const auto alpha_update =
+        esm::make_metadata_hydration_wal_update(alpha);
+    require(esm::append_metadata_hydration_wal(
+                torn_path, generation, 0, 10, 1,
+                std::span<const esm::MetadataHydrationWalUpdate>(
+                    &alpha_update, 1),
+                false).ok,
+            "torn-tail WAL fixture should append one transaction");
+    {
+        std::ofstream torn(torn_path, std::ios::binary | std::ios::app);
+        torn.write("TAIL", 4);
+    }
+    std::vector<esm::FileRecord> torn_records{
+        record(10, L"alpha.bin", L"C:\\alpha.bin")};
+    const auto torn_replay = esm::replay_metadata_hydration_wal(
+        torn_path, generation, torn_records);
+    require(torn_replay.ok && torn_replay.torn_tail &&
+                torn_replay.transactions == 1 && torn_replay.next_id == 10 &&
+                torn_replay.discarded_tail_bytes == 4 &&
+                std::filesystem::file_size(torn_path) ==
+                    torn_replay.valid_bytes &&
+                torn_records.front().size == 1'010,
+            "metadata hydration WAL should truncate a torn transaction tail");
+    const auto clean_replay = esm::replay_metadata_hydration_wal(
+        torn_path, generation, torn_records);
+    require(clean_replay.ok && !clean_replay.torn_tail &&
+                clean_replay.transactions == 1,
+            "metadata hydration WAL should replay cleanly after tail recovery");
+
+    std::filesystem::remove_all(root);
+}
+
+void test_mft_auto_state_round_trip() {
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("esm-mft-auto-state-" + std::to_string(suffix));
+    std::filesystem::create_directories(root);
+    const auto snapshot_path = root / "mft-index.snapshot";
+    const auto state_path = esm::mft_auto_state_path(snapshot_path);
+    constexpr std::uint64_t generation = 7'777;
+
+    require(state_path.wstring().ends_with(L".state"),
+            "MFT auto state path should be a snapshot sidecar");
+    esm::MftAutoState state;
+    state.generation = generation;
+    esm::MftAutoVolumeState c;
+    c.volume.root = L"C:\\";
+    c.volume.mount_path = L"C:\\";
+    c.volume.identity =
+        L"\\\\?\\Volume{11111111-1111-1111-1111-111111111111}\\";
+    c.volume.serial_number = 111;
+    c.root_id = 5;
+    c.journal_id = 101;
+    c.cursor = 1'001;
+    c.live = true;
+    state.volumes.push_back(c);
+    esm::MftAutoVolumeState d;
+    d.volume.root = L"D:\\";
+    d.volume.mount_path.clear();
+    d.volume.identity =
+        L"\\\\?\\Volume{22222222-2222-2222-2222-222222222222}\\";
+    d.volume.serial_number = 222;
+    d.volume.removable = true;
+    d.root_id = 6;
+    d.journal_id = 202;
+    d.cursor = 2'002;
+    d.live = false;
+    state.volumes.push_back(d);
+
+    const auto saved = esm::save_mft_auto_state_atomic(state_path, state);
+    require(saved.ok, "MFT auto startup state should save atomically");
+    const auto loaded = esm::load_mft_auto_state(state_path, generation);
+    require(loaded.ok && loaded.state.generation == generation &&
+                loaded.state.volumes.size() == 2,
+            "MFT auto startup state should round-trip its generation and volumes");
+    require(loaded.state.volumes[0].volume.root == L"C:\\" &&
+                loaded.state.volumes[0].root_id == 5 &&
+                loaded.state.volumes[0].journal_id == 101 &&
+                loaded.state.volumes[0].cursor == 1'001 &&
+                loaded.state.volumes[0].live,
+            "MFT auto state should preserve the first USN boundary");
+    require(loaded.state.volumes[1].volume.mount_path.empty() &&
+                loaded.state.volumes[1].volume.removable &&
+                loaded.state.volumes[1].volume.serial_number == 222 &&
+                loaded.state.volumes[1].root_id == 6 &&
+                loaded.state.volumes[1].journal_id == 202 &&
+                loaded.state.volumes[1].cursor == 2'002 &&
+                !loaded.state.volumes[1].live,
+            "MFT auto state should preserve flags, empty mount paths and cursors");
+
+    const auto wrong_generation = esm::load_mft_auto_state(
+        state_path, generation + 1);
+    require(!wrong_generation.ok && wrong_generation.generation_mismatch &&
+                wrong_generation.error == ERROR_REVISION_MISMATCH,
+            "MFT auto state should reject a different snapshot generation");
+
+    const auto corrupt_path = root / "corrupt.state";
+    std::filesystem::copy_file(state_path, corrupt_path);
+    {
+        std::fstream corrupt(corrupt_path,
+                             std::ios::binary | std::ios::in | std::ios::out);
+        require(static_cast<bool>(corrupt),
+                "open MFT auto state corruption fixture");
+        corrupt.seekg(-1, std::ios::end);
+        char byte = 0;
+        corrupt.read(&byte, 1);
+        byte ^= static_cast<char>(0x5a);
+        corrupt.seekp(-1, std::ios::end);
+        corrupt.write(&byte, 1);
+    }
+    const auto corrupted = esm::load_mft_auto_state(
+        corrupt_path, generation);
+    require(!corrupted.ok && corrupted.error == ERROR_INVALID_DATA,
+            "MFT auto state should reject checksum corruption");
+
+    std::filesystem::remove_all(root);
+}
+
+void test_bound_metadata_wal_recovery() {
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("esm-bound-wal-test-" + std::to_string(suffix));
+    std::filesystem::create_directories(root);
+    { std::ofstream(root / "renamed.txt", std::ios::binary) << "bound"; }
+
+    constexpr std::uint64_t generation = 0x12345678;
+    constexpr std::uint64_t journal_id = 77;
+    constexpr std::uint64_t raw_root_id = 5;
+    const std::wstring identity = L"\\\\?\\Volume{bound-wal-test}\\";
+    esm::MetadataWalBinding binding;
+    binding.generation = generation;
+    binding.volume_identity = identity;
+    binding.volume_root = root.wstring();
+    binding.root_id = raw_root_id;
+
+    const auto wal_path = esm::metadata_wal_path(
+        root / "mft-index.snapshot", generation, identity);
+    require(wal_path != esm::metadata_wal_path(
+                root / "mft-index.snapshot", generation + 1, identity),
+            "bound WAL path includes the snapshot generation");
+    require(esm::reset_metadata_wal(wal_path).ok,
+            "bound WAL initialization");
+
+    esm::UsnChangeBatch created;
+    created.next_usn = 200;
+    created.changes.push_back(
+        {12, raw_root_id, 150, USN_REASON_FILE_CREATE,
+         FILE_ATTRIBUTE_ARCHIVE, L"created.txt"});
+    require(esm::append_metadata_wal(
+                wal_path, binding, journal_id, 100, created).ok,
+            "bound WAL create append");
+
+    esm::UsnChangeBatch renamed;
+    renamed.next_usn = 300;
+    renamed.changes.push_back(
+        {12, raw_root_id, 250, USN_REASON_RENAME_NEW_NAME,
+         FILE_ATTRIBUTE_ARCHIVE, L"renamed.txt"});
+    require(esm::append_metadata_wal(
+                wal_path, binding, journal_id, 200, renamed).ok,
+            "bound WAL rename append");
+    {
+        std::ofstream torn(wal_path, std::ios::binary | std::ios::app);
+        torn.write("WAL", 3);
+    }
+
+    const auto scoped_root =
+        esm::namespace_ntfs_file_id(identity, raw_root_id);
+    auto root_record = record(scoped_root, L"", root.wstring(), true);
+    root_record.parent_id = scoped_root;
+    root_record.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> base;
+    base.push_back(std::move(root_record));
+    index.replace(std::move(base));
+
+    const auto replay = esm::replay_metadata_wal(
+        wal_path, binding, journal_id, 100, index);
+    require(replay.ok && replay.torn_tail && replay.transactions == 2 &&
+                replay.changes == 2 && replay.next_usn == 300 &&
+                replay.discarded_tail_bytes == 3,
+            "bound WAL replays transactions and truncates a torn tail");
+    const auto results = index.search(L"renamed.txt");
+    require(results.size() == 1 &&
+                results.front().record.id ==
+                    esm::namespace_ntfs_file_id(identity, 12),
+            "bound WAL applies raw USN changes to the namespaced index");
+
+    auto wrong_binding = binding;
+    wrong_binding.generation += 1;
+    esm::MetadataIndex rejected(0);
+    std::vector<esm::FileRecord> rejected_base;
+    auto rejected_root = record(scoped_root, L"", root.wstring(), true);
+    rejected_root.parent_id = scoped_root;
+    rejected_root.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    rejected_base.push_back(std::move(rejected_root));
+    rejected.replace(std::move(rejected_base));
+    const auto wrong_generation = esm::replay_metadata_wal(
+        wal_path, wrong_binding, journal_id, 100, rejected);
+    require(!wrong_generation.ok &&
+                wrong_generation.error == ERROR_INVALID_DATA,
+            "bound WAL rejects another snapshot generation");
+
+    wrong_binding = binding;
+    wrong_binding.volume_identity += L"other";
+    const auto wrong_volume = esm::replay_metadata_wal(
+        wal_path, wrong_binding, journal_id, 100, rejected);
+    require(!wrong_volume.ok && wrong_volume.error == ERROR_INVALID_DATA,
+            "bound WAL rejects another volume identity");
+
+    std::filesystem::remove_all(root);
+}
+
+void test_index_checkpoint_materialization() {
+    esm::MetadataIndex index(0);
+    std::vector<esm::FileRecord> base;
+    base.push_back(record(10, L"removed.txt", L"D:\\removed.txt"));
+    base.push_back(record(20, L"base.txt", L"D:\\base.txt"));
+    index.replace(std::move(base));
+
+    std::vector<esm::FileRecord> upserts;
+    upserts.push_back(record(20, L"updated.txt", L"D:\\updated.txt"));
+    upserts.push_back(record(30, L"created.txt", L"D:\\created.txt"));
+    index.apply_delta(std::move(upserts), {10});
+
+    const auto snapshot = index.snapshot_records();
+    require(snapshot.size() == 2 && snapshot[0].id == 20 &&
+                snapshot[0].name == L"updated.txt" &&
+                snapshot[1].id == 30 &&
+                snapshot[1].name == L"created.txt",
+            "checkpoint materialization merges overlay and removals in ID order");
+}
+
 void test_metadata_wal_recovery() {
     const auto suffix = std::chrono::steady_clock::now()
                             .time_since_epoch().count();
@@ -2615,7 +3150,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

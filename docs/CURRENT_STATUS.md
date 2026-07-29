@@ -1,4 +1,4 @@
-# 当前状态（2026-07-28）
+# 当前状态（2026-07-29）
 
 本文描述当前 `main` 分支能力，不代表稳定版本承诺。项目目标是接近 Everything 的体验和性能，但目前不能称为完整复刻或完全兼容。
 
@@ -8,9 +8,10 @@
 
 - 自动发现带盘符的本地 NTFS 固定卷。
 - 读取 NTFS MFT，重建父子关系和完整路径。
+- 默认多卷服务在初始 MFT 路径重建后先保存并发布名称/路径索引，再以每批 4,096 条、默认最多 4 个 worker 的有界后台任务逐步补齐大小、修改时间、属性和目录状态；CLI、前台 server 和单卷 MFT 服务仍同步补齐。
 - 多卷记录命名空间合并。
-- USN Journal 增量创建、删除、重命名和更新处理；直接变化项在路径解析后刷新大小、修改时间和属性。
-- 约每 250 ms 跟随 USN Journal，并约每分钟检查挂载卷集合；完整 MFT reconciliation 只在启动建立 live 边界、USN checkpoint 失效/读取失败或卷集合变化时触发。
+- USN Journal 增量创建、删除、重命名和更新处理；直接变化项在路径解析后先使旧大小/时间失效，再刷新大小、修改时间和属性。若文件已删除或不可访问，记录仍可按名称搜索，但旧元数据不会继续参与过滤或后续 generation 复用。
+- 约每 250 ms 跟随 USN Journal，并约每分钟检查挂载卷集合；完整 MFT reconciliation 只在启动建立 live 边界、USN checkpoint 失效/读取失败或卷集合变化时触发。协调器优先追赶 USN，再处理一个后台元数据批次；过期路径结果不会覆盖重命名或删除后的记录。
 - 普通目录递归扫描，以及 `ReadDirectoryChangesW` 触发后的树级重新扫描回退。
 
 ### 持久化
@@ -20,6 +21,8 @@
 - memory-mapped v2 紧凑 snapshot。
 - live checkpoint 的追加 WAL、完整事务重放、撕裂尾部截断和 checkpoint consolidation。
 - Catalog snapshot 保存可直接流式写紧凑节点和名称 arena，避免创建完整临时 `vector<FileRecord>`。
+- 多卷后台补齐新增 generation-bound metadata WAL：每批只追加成功读取项的 ID、路径 fingerprint、大小、修改时间和属性，并持久化 `next_id`/完成状态；启动可重放并从 durable cursor 续跑，不需要导出完整 `vector<FileRecord>`。完整 reconciliation 产生新 generation 时，若当前 live USN 状态仍连续可信，并且 MFT 扫描完成后新旧共有卷可再次追赶到当前 journal 边界，会按 ID/完整路径从当前 live base/overlay 复用已知元数据，并把复用结果直接写入新 snapshot；启动 state 失效、扫描后追赶失败、普通 USN 读取失败或 journal gap 时禁用复用。
+- 多卷状态 sidecar 保存 snapshot generation、卷身份/root file ID、journal ID、原始 USN boundary 和 live 状态。重新发现的卷集合及 USN checkpoint 全部有效时，健康重启跳过立即完整 MFT reconciliation；状态缺失、损坏、generation 不匹配、卷变化或 journal gap 时保留名称 snapshot 提供查询并安排完整修复。
 
 ### 查询与性能路径
 
@@ -59,15 +62,15 @@
 
 ### Everything 查询兼容
 
-已经有布尔、正则、大小/日期/属性、筛选器、书签、历史和 duplicate 的基础能力；本轮补充了 `filelist:` 完整文件名/路径列表，以及 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`、`|`/`< >`、`ext:` 分号列表、数字/大小范围、大小常量、`datemodified:`，以及 `next/coming` 自然周期、`last/past/prev/next/coming<N><单位>`、英文月份/星期名称日期常量；周起点读取 Windows 当前用户区域设置，并区分“上一个完整周期”的 `last/prev` 与滚动阈值 `past`。`filelist:` 已覆盖大小写、变音符号、通配符和 base + overlay 语义；单一正向、无通配符的精确列表会复用现有 raw/accent-folded 名称前缀表，并只为 basename 精确候选重建完整路径，不增加常驻多值哈希索引。带 `*`/`?` 的列表、复杂布尔组合和其他无法安全缩小的形式仍使用完整 evaluator；`child:` 与子项统计查询目前需要按需遍历当前目录关系，功能结果覆盖增量 overlay，但尚无 Everything 等级的常驻专用子项索引。仍缺少 Everything 的其余函数、宏、创建/访问/最近变化时间族、`unknown`、完整区域化日期与范围、属性族、转义细节和完整兼容测试矩阵。初始全盘基线目前通过 `FSCTL_ENUM_USN_DATA` 获取名称/父关系/属性，不含大小和时间；USN 后续直接变化项已刷新元数据，但旧条目的宽泛 `size:` / `dm:` 查询仍可能漏项，需后续增加低内存 NTFS 元数据基线。
+已经有布尔、正则、大小/日期/属性、筛选器、书签、历史和 duplicate 的基础能力；本轮补充了 `filelist:` 完整文件名/路径列表，以及 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:`、`childfoldercount:`、`|`/`< >`、`ext:` 分号列表、数字/大小范围、大小常量、`datemodified:`，以及 `next/coming` 自然周期、`last/past/prev/next/coming<N><单位>`、英文月份/星期名称日期常量；周起点读取 Windows 当前用户区域设置，并区分“上一个完整周期”的 `last/prev` 与滚动阈值 `past`。`filelist:` 已覆盖大小写、变音符号、通配符和 base + overlay 语义；单一正向、无通配符的精确列表会复用现有 raw/accent-folded 名称前缀表，并只为 basename 精确候选重建完整路径，不增加常驻多值哈希索引。带 `*`/`?` 的列表、复杂布尔组合和其他无法安全缩小的形式仍使用完整 evaluator；`child:` 与子项统计查询目前需要按需遍历当前目录关系，功能结果覆盖增量 overlay，但尚无 Everything 等级的常驻专用子项索引。仍缺少 Everything 的其余函数、宏、创建/访问/最近变化时间族、`unknown`、完整区域化日期与范围、属性族、转义细节和完整兼容测试矩阵。初始全盘基线仍通过 `FSCTL_ENUM_USN_DATA` 获取名称/父关系；默认多卷服务先发布名称索引，再按重建路径在后台逐批补齐紧凑索引需要的大小、修改时间、属性和目录状态，因此补齐期间名称查询可用，但 `size:` / `dm:` 结果和对应列会逐步完善。无法访问、枚举后瞬时删除、离线或特殊 NTFS 条目可能保留未知/原值；创建时间、访问时间和 NTFS Change/最近变化时间尚未进入紧凑基础索引。
 
 ### NTFS 语义
 
-能够处理常见 MFT/USN 场景，但 hard-link 的每个目录入口、sequence number 的全部重用边界、reparse/junction/symlink/mount point 策略、权限变化、ADS、离线卷和可移动卷仍不完整。
+能够处理常见 MFT/USN 场景。多卷服务后台补齐按批次检查停止请求，并通过路径一致性校验丢弃 rename/delete 竞争产生的过期结果。真实 3,300,421 条 snapshot 路径样本中，独立元数据 API 阶段成功补齐 3,293,996 条、失败 6,425 条；失败项不会阻断名称索引，但相关大小/修改时间可能未知。hard-link 的每个目录入口、sequence number 的全部重用边界、reparse/junction/symlink/mount point 策略、权限变化、ADS、离线卷和可移动卷仍不完整。
 
 ### WAL/增量持久化
 
-单卷 live 路径具有 WAL 和 checkpoint 恢复；默认多卷服务仍以完整 snapshot 为主，尚未成为统一的 base snapshot + append-only WAL + delta replay + checkpoint consolidation 数据库。多卷 snapshot 当前在完整 MFT reconciliation 时复用同一记录向量，不再每 5 分钟额外物化所有完整路径，因此降低了内存峰值，但 snapshot 新鲜度与完整 reconciliation 周期绑定。
+单卷 live 路径具有 WAL 和 checkpoint 恢复。默认多卷服务仍以完整名称 snapshot 为基线，但后台大小/修改时间/属性已通过独立 generation-bound metadata WAL 持久化，并由状态 sidecar 保存 durable cursor 和启动恢复所需的卷/USN boundary。健康重启可重放元数据并续跑；WAL 损坏时保留名称 snapshot、从 ID 0 重新补齐。完整 reconciliation 创建新 generation 前，只有当前 live USN 状态仍连续可信，并且 MFT 扫描后新旧共有卷完成一次额外 USN catch-up，才会把新 MFT 记录原地按 ID 排序，并从当前 live base/overlay 线性复用 ID、完整路径一致且修改时间已知的大小、时间和属性；后台批次跳过这些已知项，只对新文件、路径变化、删除竞争或旧读取失败项执行文件 I/O。启动 state 失效、扫描后 catch-up 失败、普通 USN 读取失败或 journal gap 会禁用复用，因为旧索引可能漏掉路径不变的内容修改。多卷名称变化和 USN delta 仍未形成通用 append-only WAL，运行期 cursor 也不能覆盖 snapshot 所代表的原始 journal boundary；因此该路径尚不是统一的 base snapshot + delta replay + checkpoint consolidation 数据库。
 
 ### 非 NTFS
 
@@ -150,3 +153,20 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 真实内容查询速度目前不快：2026-07-26 使用约 264,692～264,693 个文档、约 4.63 GiB Xapian 数据库，在后台仍扫描时，`limit=100` 的不同查询单次 Named Pipe 往返为 671.9～5807.3 ms；`limit=10` 的重复样本约 237.8～756.9 ms。样本数不足以形成发布级 p50/p95，但足以否定“已经达到 Everything 式即时匹配”。摘要生成会读取 document data 中的完整正文，是当前最明显的查询慢路径。
 
 仍属于实验状态：没有 SCM 注册、NSIS 集成、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、PDF/Office/OCR、ACL impersonation、网络/云盘/可移动卷 provider、持久任务队列、首次建库吞吐/长期内存/真实 GUI 端到端基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+
+
+## 2026-07-29???/USN delta WAL ? checkpoint consolidation
+
+???? `mft-auto` ?????????????????
+
+- ??/???/??/????????? generation-bound WAL v2?
+- ?????? snapshot generation?volume identity?volume root?root file ID?journal ID ??? USN?
+- durable ?????? USN batch ? WAL write-through + flush ? ?????? ? ???? cursor??
+- ?????? snapshot ? hydration WAL???? state sidecar??? base??????? WAL????? journal catch-up?
+- torn tail ????checkpoint ?????????????/??/? root/journal gap ???????? reconciliation?
+- live base + overlay + tombstone ???? ID ?????? generation checkpoint????? 5 ??? 100,000 ???????? consolidation?
+- snapshot?????? WAL ? state sidecar ??????? generation ???? generation ?? WAL?
+
+????????????????snapshot/state ?????????? generation directory + atomic manifest?checkpoint ?????? `vector<FileRecord>`??????????????????? MFT ?????????? Release ????????????????? UAC??? 2026-07-29 ????????????????
+
+?????????????? hard-link ?????????MFT slot sequence ?????? WAL/hydration ??????????? Everything ??????????????????????????/Xapian ?????

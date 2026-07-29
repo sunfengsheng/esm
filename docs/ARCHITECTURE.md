@@ -63,7 +63,7 @@ flowchart TB
 
 ## 3. 数据模型与文件身份
 
-`FileRecord` 表示可搜索条目，包含路径、名称、目录标志以及可用的大小、修改时间、属性和 NTFS 身份信息。初始多卷名称基线来自 `FSCTL_ENUM_USN_DATA`，该接口不提供大小和时间；当前只为 USN 直接变化项做按路径元数据补齐，完整低内存 NTFS 元数据基线仍是待完成工作。
+`FileRecord` 表示可搜索条目，包含路径、名称、目录标志以及可用的大小、修改时间、属性和 NTFS 身份信息。初始多卷名称基线来自 `FSCTL_ENUM_USN_DATA`，该接口不提供大小和时间；路径重建完成后默认多卷服务先把名称基线写入 snapshot 并发布到 `MetadataIndex`，再从紧凑索引按 ID 有界物化路径、在锁外调用 `GetFileAttributesExW`，逐批合并大小、修改时间、属性和目录状态。CLI、前台 server 和单卷服务仍可在发布前同步补齐。创建时间、访问时间和 NTFS Change 时间仍只在完整单条元数据读取路径中可用，尚未进入紧凑全盘基线。
 
 NTFS 路径重建以文件引用号和父引用号连接 MFT 节点。多卷模式必须把卷身份加入命名空间，避免不同卷上相同文件引用号冲突。
 
@@ -83,10 +83,15 @@ NTFS 路径重建以文件引用号和父引用号连接 MFT 节点。多卷模�
 1. 枚举带盘符的本地 NTFS 固定卷；
 2. 对每个卷读取 MFT；
 3. 重建路径并加卷命名空间；
-4. 合并进 MetadataIndex；
-5. 启动每卷 live 更新；
-6. 约每 250 ms 读取各卷 USN Journal，并约每分钟重新发现挂载卷；USN 本身不携带大小和时间，因此路径解析完成后只对直接创建或发生数据/基础信息变化的条目调用文件元数据读取，目录重命名的未直接变化后代只刷新路径；
-7. 仅在 snapshot 启动后建立 live 边界、USN checkpoint 失效/读取失败或挂载卷集合变化时执行完整 MFT reconciliation，并在该时点刷新机器级 snapshot。
+4. 完整 reconciliation 仅在当前 live USN 状态仍连续可信时复用元数据：MFT 扫描结束后，先让新旧共有卷的旧 live 状态再次追赶到当前 journal 边界，以覆盖扫描前后尚未轮询的原地内容变化；追赶成功后把新 MFT 记录原地按 ID 排序，并与当前 live base/overlay 线性核对。只有文件 ID、完整路径一致且当前修改时间已知时才复用大小、修改时间和属性。启动 state 失效、扫描后追赶失败、普通 USN 读取失败或 journal gap 会禁用复用，避免旧索引漏掉路径不变的内容修改。随后生成非零 persistence generation，把安全复用后的名称/元数据基线写入机器级 snapshot，并初始化同代 metadata WAL 和多卷状态 sidecar；
+5. 发布 `MetadataIndex` 并启动每卷 live 更新，使 Named Pipe 名称查询尽早可用；
+6. 协调器先追赶各卷 USN，再从 `MetadataIndex` 按 ID 顺序检查一个 4,096 条基础记录批次；它只物化该批次中未删除且未被 overlay 替代的路径，在索引锁外使用默认最多 4 个 worker 调用文件元数据 API；
+7. 元数据读取返回 success bitmap；协调器只为成功项构造 ID、路径 fingerprint、大小、修改时间和属性更新，先以 write-through 事务追加并刷新 metadata WAL，再重新获得索引独占锁；仅在 ID 和完整路径仍匹配时合并内存索引。直接 USN 变化项在文件系统读取前先把旧大小和全部时间字段置为未知，读取失败时不会残留可被查询或跨 generation 复用的 stale 元数据。rename/delete、overlay 替换或完整 reconciliation 产生的过期结果计为 `stale` 并丢弃；
+8. 每批之间检查 stop token 和服务停止标志，活动补齐时协调器约等待 10 ms；每检查约 250,000 条写一次 Event Log 进度，完成或停止时写摘要；
+9. 约每 250 ms 读取各卷 USN Journal，并约每分钟重新发现挂载卷；USN 本身不携带大小和时间，因此路径解析完成后只对直接创建或发生数据/基础信息变化的条目调用文件元数据读取，目录重命名的未直接变化后代只刷新路径；
+10. snapshot 启动时先按 generation 重放 metadata WAL，再加载 sidecar、重新发现卷并验证 identity/root file ID/serial/journal ID 和 snapshot 对应的原始 USN boundary；全部有效时先追赶 USN、从 durable ID 继续补齐并跳过立即完整 reconciliation。状态缺失/损坏、generation 不匹配、卷变化或 journal gap 时保留名称 snapshot 提供查询，同时安排完整 MFT reconciliation；新基线创建新 generation 并重置补齐 cursor。
+
+后台元数据任务不会保留第二份全盘路径列表：每轮最多从紧凑基础层物化 4,096 个未知候选，已经具有非零修改时间的 base 项会跳过。为了避免跨 generation 复用后对大量已知项产生空 WAL flush，一批最多向前检查候选上限的 64 倍，但返回和执行文件 I/O 的未知项仍不超过 4,096 条。内部 worker 仍以 64 条记录为领取批次。单个路径读取失败只增加 `metadata_errors` 并保留原值，不会阻断名称查询。WAL 每个 update 约 40 字节，只保存成功项和事务 cursor；如果 WAL 写入失败，服务记录一次警告并继续本次内存补齐，但该批次不能依赖重启恢复。
 
 ### 4.2 单卷 live provider
 
@@ -115,7 +120,7 @@ v2 snapshot 可 memory-map 到进程地址空间。保存时在共享只读视�
 - 纯名称查询不读取完整路径，只有 `match_path` 或显式 `path:` 条件才执行父链重建；
 - 增量 overlay 暂时保留完整 `FileRecord`，compaction 后重新排序基础记录、重建父索引并执行路径组件化。
 
-rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 固定为 40 字节：包含 64 位 ID、大小和修改时间，32 位属性和字符串 offset，16 位路径/名称长度，以及打包在 32 位中的 31 位父记录索引和 1 位 name-only 标志。目录状态直接从 Windows 属性位推导；名称 bigram Bloom 使用 128 位/记录。
+rvalue `replace` 会在紧凑记录和字符串 arena 建好后立即释放源 `vector<FileRecord>`，再构建 posting、Bloom 签名和排序结构，避免百万级源字符串与加速器长期重叠。`CompactRecord` 固定为 40 字节：包含 64 位 ID、大小和修改时间，32 位属性和字符串 offset，16 位路径/名称长度，以及打包在 32 位中的 31 位父记录索引和 1 位 name-only 标志。目录状态直接从 Windows 属性位推导；名称 bigram Bloom 使用 128 位/记录。`metadata_hydration_batch(after_id, limit)` 在共享锁下按 ID 有界物化基础记录，并让 cursor 跨过 removed/overlay 项；`apply_search_metadata` 在独占锁下比较 ID 和路径后只更新紧凑搜索字段，从而允许慢文件系统 I/O 完全发生在索引锁外。
 
 完整路径 Bloom 不再按记录重复保存。每个目录拥有一份 256 位完整目录路径 trigram 签名；`directory_signature_bits` 标记目录记录，`directory_signature_rank_prefix` 通过 rank 把目录记录索引映射到签名索引。普通文件直接通过 `parent_index` 推导共享的父目录签名，不再保存每记录 32 位 owner；只有 orphan、父项异常或完整路径不能由父目录加名称表达的文件才保存稀疏 `PathSignatureFallback`。该 owner 元数据从 O(4N) 数组变为 bitset/rank + sparse fallback。对于不含路径分隔符的 mandatory `path:` 词，候选必须满足“文件名签名可能命中，或共享路径签名可能命中”；含 `\`、`/`、`:` 的词跳过共享签名过滤，最终始终由完整 evaluator 校验，避免跨组件 false negative。
 
@@ -192,13 +197,17 @@ metadata snapshot 包含版本、卷/模式标记、记录和校验信息。替�
 
 如果当前 v2 文件仍被 mapping 使用，Catalog 会先 compact delta 或把不可变基础层物化到自有内存，避免 Windows 因打开 mapping 阻止替换。
 
-### 8.2 WAL
+### 8.2 WAL 与多卷状态 sidecar
 
 单卷 live 路径把增量变化作为带边界和校验的事务追加到 `<checkpoint>.wal`。启动恢复只重放完整事务，不完整尾部会被截断。checkpoint consolidation 把已确认增量合并回基线。
 
+多卷 `mft-auto` 使用三个同代文件：`mft-index.snapshot`、`mft-index.snapshot.metadata.wal` 和 `mft-index.snapshot.state`。snapshot checkpoint 字段携带非零 generation；metadata WAL 文件头必须与它匹配。每个事务包含成功读取的元数据 update、`after_id`、`next_id`、检查数、完成标志和校验和，并在内存合并前执行 write-through append + flush。恢复按 ID 线性应用 update，重新计算当前路径 fingerprint，缺失 ID 或路径不匹配记为 stale；不完整尾部会截断。state sidecar 通过临时文件原子替换并校验整文件，保存同一 generation 以及每卷 identity、root file ID、journal ID、snapshot 原始 USN cursor 和 live 标志。恢复时会重新打开当前卷根目录读取 root file ID；读取失败或与 sidecar 不一致都会使该状态失效并触发完整 reconciliation。
+
+恢复时不能用运行期已推进但未持久化名称 delta 的 USN cursor 改写 snapshot boundary，否则重启会错误跳过只存在于内存的名称变化。因此 sidecar 保存的是与名称 snapshot 同一边界的 cursor；启动验证通过后仍先从该边界追赶 USN，再从 metadata WAL 的 durable ID 继续补齐。
+
 ### 8.3 当前限制
 
-默认多卷 MFT 服务仍使用完整 `mft-index.snapshot`，尚未统一为通用 base snapshot + WAL + delta replay 数据库。多卷服务不再保存每卷 Catalog，也不再每 5 分钟从 Catalog 重新物化完整路径；完整 reconciliation 产生统一记录向量后先写 snapshot，再由 `MetadataIndex` 消费并释放该向量。实时阶段直接把每卷 USN 增量应用到全局索引，因此内存中的搜索结果可实时更新，但磁盘 snapshot 新鲜度仍与完整 reconciliation 周期绑定。
+默认多卷 MFT 服务仍未统一为通用 base snapshot + 名称/USN delta WAL + checkpoint consolidation 数据库。实时阶段直接把每卷 USN 增量应用到全局索引，磁盘名称 snapshot 新鲜度仍与完整 reconciliation 绑定。metadata WAL 只持久化大小、修改时间、属性和补齐 cursor；完整 reconciliation 在 live USN 连续可信时会把当前 live view 中 ID/路径一致且修改时间已知的元数据迁移到新 generation；启动 state 失效、USN 失败或 journal gap 时会禁用迁移。名称/USN delta、旧路径不一致项和未知元数据仍不能跨基线复用。
 
 ## 9. IPC
 
@@ -292,3 +301,63 @@ flowchart LR
 服务创建 shard 后立即启动 Named Pipe；每个根由独立 `std::jthread` 执行后台初次扫描，随后进入该根的递归 `DirectoryWatcher`。多根数据库位于 `<db-root>\volumes\<root-key>\xapian`，路径过滤器在递归遍历和通知消费两处应用，并始终排除数据库目录。启动扫描和 watcher 目前都在 `esm_content_service.exe` 内执行。正式架构计划增加受限 extractor worker、启动 reconciliation、内容正文压缩 sidecar、统一 `FileIdentity(volume + file-id)`、权限过滤和 SCM 生命周期。详细边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
 
 内容 shard 的 writer 在 `commit()` 发布新 revision 时取得独占 revision 锁，查询在打开只读 `Xapian::Database`、取得 MSet、读取 document data 和生成摘要的整个期间持有共享 revision 锁。这样多个查询仍可并行，但不会与本进程的 commit 交叉而得到失效快照。若数据库被外部变化或底层 revision 竞争打断，查询最多重新打开数据库重试 3 次；其余 `Xapian::Error` 在索引边界转换为 `std::runtime_error`。Named Pipe 请求处理、每根扫描/监听工作线程和 `wmain` 还有 `catch (...)` 最后防线，避免 Xapian 不继承 `std::exception` 的异常越过进程边界。该策略优先保证原型稳定性，尚未实现可取消查询、查询优先级或跨 shard 并行执行。
+
+
+## ????/USN WAL v2 ? checkpoint ????
+
+???? NTFS ??????? WAL?
+
+```text
+mft-index.snapshot.names.<generation-hex>.<volume-fingerprint>.wal
+```
+
+???? WAL replay ???????????? checkpoint????????????????????????????????? generation snapshot??????????????checkpoint ????????????????????
+
+????????
+
+```text
+snapshot generation
+volume identity fingerprint
+volume root fingerprint
+root file ID
+journal ID
+start USN -> next USN
+payload checksum
+```
+
+??????
+
+```text
+read_usn_changes
+  -> append transaction with write-through
+  -> FlushFileBuffers
+  -> MetadataIndex::apply_ntfs_changes
+  -> advance in-memory durable cursor
+```
+
+????????
+
+```text
+load snapshot
+  -> replay metadata hydration WAL
+  -> restore and validate per-volume state sidecar
+  -> publish compact/base search index
+  -> replay each volume name/USN WAL without synchronous metadata hydration
+  -> advance per-volume cursor to WAL durable cursor
+  -> continue live journal catch-up
+```
+
+checkpoint consolidation ??? 5 ??? 100,000 ??????????????? `base + overlay - removed`?? ID ?????? generation snapshot????? generation hydration/name WAL???? per-volume state??? snapshot????? WAL ? state ??????? live generation???? WAL ???????hydration WAL ???????????????????? generation ? size/time hydration ?????????
+
+??????????snapshot/state ???????? snapshot ???? state ????????? generation mismatch ?????????? reconciliation??????????? base???????????? manifest ????????? generation directory??? current-manifest?streaming/mapped checkpoint writer ???? generation ???
+
+## NTFS ?????????????
+
+????????? 64 ? `id` ???? NTFS ???????????? MFT file reference ??????????? hard-link ???????
+
+```text
+NtfsObjectIdentity = volume identity + full file reference (record slot + sequence)
+NtfsDirectoryEntryIdentity = object identity + parent object identity + entry name/discriminator
+```
+
+????????????????????? size/time/attributes ????sequence ?????? MFT slot ??? sequence ?????????????? generation WAL?? hydration ???? parent reference ?????`FSCTL_ENUM_USN_DATA` ??????????? hard-link ??????????????????????? provider??? snapshot/WAL schema ???????????

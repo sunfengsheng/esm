@@ -68,6 +68,11 @@
 - [x] USN 创建、删除、重命名和更新基础处理。
 - [x] 多卷固定 NTFS 发现和命名空间。
 - [x] 周期性常规/完整协调基础能力。
+- [x] 初始 MFT 基线原地、有界并行补齐大小和修改时间。
+- [ ] 创建时间、访问时间和 NTFS Change/最近变化时间的低内存基础索引。
+- [x] 首次建库先发布名称索引、后台每批 4,096 条补齐元数据，提供 Event Log 进度并在批次边界响应停止。
+- [x] 将多卷后台补齐结果通过 generation-bound 低内存 metadata WAL 持久化，并保存 durable cursor、完成状态和启动卷/USN sidecar。
+- [x] 跨完整 reconciliation generation 按 ID/完整路径迁移可复用 metadata，并让后台批次跳过已知项。
 - [ ] 每个 hard-link 目录入口的独立表示。
 - [ ] 完整 file reference sequence number 重用处理。
 - [ ] 明确 reparse/junction/symlink traversal 策略。
@@ -152,3 +157,15 @@ P7 下一批工作按以下顺序推进：
 5. 多 root/provider 配置、SCM 服务和安装/恢复策略；
 6. ACL impersonation、真实容量/性能/长期内存基线；
 7. Xapian GPL 分发合规完成后，再考虑把入口合并进主 GUI。
+
+## 2026-07-29 ?????? NTFS ??????
+
+- [x] ?? generation/volume/root-bound ??/USN append-only WAL v2
+- [x] torn-tail ???checksum?journal cursor ???? checkpoint ?????????
+- [x] base + overlay - tombstone checkpoint consolidation ???
+- [ ] generation directory + atomic current manifest + streaming/mapped consolidation
+- [ ] NTFS object identity / directory-entry identity schema ? snapshot/WAL ??
+- [ ] hard-link ???????????????????????
+- [ ] MFT slot sequence ???????? parent?? WAL ?? hydration ??????
+- [ ] ???????? reconciliation ???????????
+- [ ] ?? Everything ???????????????????????

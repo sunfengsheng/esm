@@ -297,3 +297,90 @@ esm_content_service.exe --all-fixed \
 包含 `child:` 的最新 NSIS 安装包大小为 2,538,445 字节，SHA-256 为 `CE748F2A783C8D4DB6657C14441E2CFF36A0C9B6F478E4D16C9338FBA4E055F3`；静默提权安装退出码为 0，构建版与 `C:\Program Files\everything_sm\esm_service.exe` 哈希一致。安装后的 PID 27928 稳定样本为 466,415,616 字节 Working Set、462,663,680 字节 Private Bytes。本次安装没有高频采样启动峰值；前一安装服务启动阶段曾观察到约 1.64 GiB Working Set / Private Bytes。
 
 稳定样本不能替代启动峰值。更早的首次重建流程还观察过约 2.7 GiB 峰值，因此当前仍需优化 snapshot 载入、repair/reconciliation 与索引替换期间的临时结构，不能声称内存已达到 Everything。
+
+## 11. 初始 NTFS 元数据补齐真实路径样本（2026-07-28）
+
+### 11.1 测试方法
+
+从本机 `C:\ProgramData\everything_sm\indexes\mft-index.snapshot` 读取 3,300,421 条真实记录，用临时 `metadata_probe.exe` 把样本记录的大小和修改时间清零，再调用本轮新增的 `hydrate_file_search_metadata_records` 对记录中的真实绝对路径执行 `GetFileAttributesExW`。下列耗时只覆盖元数据 API 阶段，不包含 snapshot 载入、MFT 枚举、路径重建、`MetadataIndex` 构建、snapshot 保存、IPC 或 GUI；文件系统缓存状态未严格控制，因此不能视为首次整机建库 SLA。
+
+### 11.2 全量样本
+
+4 个 worker 的结果：
+
+```text
+attempted=3,300,421
+hydrated=3,293,996
+errors=6,425
+elapsed=75,682 ms
+throughput=43,609 records/s
+```
+
+失败项包括无法访问、枚举后瞬时消失和不能由当前重建路径读取的条目；实现保留这些记录原值并继续发布名称索引。
+
+### 11.3 10 万条 worker 对照
+
+同一机器后续缓存较暖的 100,001 条样本：
+
+| worker | 阶段耗时 | 观察吞吐 |
+|---:|---:|---:|
+| 1 | 4,516 ms | 22,143 records/s |
+| 2 | 2,695 ms | 37,106 records/s |
+| 4 | 1,679 ms | 59,559 records/s |
+| 8 | 1,083 ms | 92,337 records/s |
+| 12 | 1,299 ms | 76,983 records/s |
+
+首次相对冷的同规模 4-worker 样本为 11,112 ms / 8,999 records/s。后续对照明显受到缓存变暖影响，只用于观察并行扩展趋势，不能与冷启动直接横向比较。默认值保持每卷 4 个 worker，避免多卷同时建库时线程数和随机元数据读取负载失控。
+
+
+### 11.4 两阶段服务验证方法与边界
+
+默认多卷服务现在把“可查询时间”和“元数据完成时间”拆开：名称基线进入 `MetadataIndex` 后即可接受 Named Pipe 查询，大小/修改时间随后按 4,096 条检查批次、默认最多 4 个 worker 补齐，活动批次之间约等待 10 ms。实现验证使用 Release 构建的 `esm_tests`，覆盖 ID 顺序分页、removed/overlay 跳过、元数据合并，以及 rename/delete 后旧路径结果被计为 stale 且不能覆盖新记录；这属于正确性测试，不是端到端性能基准。
+
+本轮尚未在清空 snapshot 的真实全新安装上记录“服务开始”到“名称索引发布”和“后台元数据完成”两个墙钟时间，因此不提供新的首次建库数值，也不声称元数据瞬间完整。后续真实测试应固定卷集合、文件数、机器、电源方案和缓存条件，并分别记录：
+
+1. SCM 启动到 Event Log 出现 `name index published` 的时间；
+2. 同期 Named Pipe 名称查询 p50/p95；
+3. `Background metadata hydration completed` 的总耗时、`hydrated/errors/stale`；
+4. 补齐期间 `size:` / `dm:` 结果收敛过程、USN 延迟、停止延迟、CPU、磁盘队列和 Private Bytes 峰值。
+
+原 3,300,421 条、75,682 ms 数据只代表独立文件元数据 API 阶段，可用于估计后台工作量，不能直接当作新服务流程的首次可查询时间或完整端到端耗时。后台补齐只保留有限批次路径，预期避免第二份全盘路径向量；该内存结论仍需在真实全新建库和 reconciliation 中采样验证。
+
+### 11.5 Metadata WAL 正确性验证与性能边界
+
+本轮 Release 单元测试覆盖 generation 初始化、事务追加/replay、大小/时间/属性恢复、durable `next_id`/完成状态、缺失 ID、路径 fingerprint stale、generation mismatch、事务尾部撕裂截断及再次 replay。固定 update 编码约 40 字节；单个 4,096 条批次在全部成功时约产生 160 KiB update payload，另有事务头/尾。每批使用 write-through append 并调用 `FlushFileBuffers`，因此持久性会引入额外磁盘 flush 延迟。
+
+这些只是 Release 正确性测试和格式规模估算，不是整机端到端性能基准。本轮尚未测量真实 SCM 重启恢复时间、每批 flush 开销、补齐期间 USN 延迟、磁盘队列、冷缓存吞吐或长期 WAL 增长，也没有建立新的启动/查询 SLA。后续基准必须分别报告 snapshot load、WAL replay、USN catch-up、metadata hydration 和 GUI/IPC 时间，不能把单元测试或合成 payload 大小夸大为真实用户体验。
+### 11.6 跨 generation 元数据复用的测试方法与边界
+
+完整 reconciliation 只在旧 live USN 状态连续可信时执行复用：新 MFT 扫描完成后，先把新旧共有卷的旧 live 状态追赶到当前 journal 边界，覆盖扫描前后尚未轮询的原地内容变化；再把新 MFT 记录原地按 ID 排序，并在当前 `MetadataIndex` 的共享锁下按 ID 线性前进。base 记录通过完整路径再次校验，overlay 优先于 base，removed、路径不一致和修改时间为 0 的来源不会复用。启动 state 失效、扫描后预追赶失败、普通 USN 读取失败或 journal gap 会将整代标记为 `metadata reuse=disabled`，因为单靠 ID/路径无法识别漏记的原地内容修改。成功项只复制大小、修改时间、属性和目录标志，新 snapshot 随后直接保存这些值，不创建第二份全盘路径向量。后台 `metadata_hydration_batch()` 会跳过修改时间已知的 base 项；稀疏情况下单批最多检查返回上限的 64 倍，但文件 I/O 候选仍最多 4,096 条，以减少只推进 cursor 的空 WAL 事务和 `FlushFileBuffers` 次数。
+
+本轮验证方法仅为 `build-ucrt-vendor-final` Release 正确性测试：构造无序新基线，覆盖 matching base、matching overlay、路径变化、removed、来源未知和新 ID，检查排序、复用统计及未知项保持未修改；同时验证后台批次跳过已知 base 元数据，并验证直接 USN 变化后的文件元数据读取失败会把旧大小/修改时间置为未知。该测试没有使用真实百万级 MFT、SCM 服务、磁盘 flush 或并发 USN 压力，因此不能声称 reconciliation 时间、启动时间、Private Bytes 或磁盘写入已经改善到某个实测数值。后续真实基准应记录 `reused metadata/unknown/stale`、原地排序与线性核对时间、新 snapshot 保存时间、WAL 事务数、补齐文件 I/O 数、USN catch-up 延迟和峰值内存，并与未复用版本在同一 snapshot/卷集合上对照。
+
+
+## 2026-07-29 ???? reconciliation ????
+
+?? Release ?? `esm_reconcile_benchmark`?????????????????????????????????? NTFS ????? `FSCTL_ENUM_USN_DATA`?????
+
+1. ?? NTFS ????
+2. ???? MFT/USN ????? size/time hydration??
+3. ?? reserve ??????? ID namespacing?
+4. `MetadataIndex` base ???
+5. `snapshot_records()` checkpoint ???
+6. ?? atomic snapshot writer ???
+7. ???? 10 ms ?? Working Set ? Private Bytes?
+
+??????????MFT ???????????checkpoint ???????? `flush` ???????????????????????????????????????? `million_scale=1/0`?????????? 1,000,000 ??????????
+
+????????
+
+```powershell
+cmake --build build-ucrt-vendor-final --config Release `
+  --target esm_service esm_tests esm_reconcile_benchmark -j 4
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+ctest --test-dir build-ucrt-vendor-final -C Release --output-on-failure
+```
+
+2026-07-29 ????? Release ?????2/2 CTest ??????????????? MFT ??????? `records=0` ???????????????????????? UAC????????????????????????????????????????????????????????
+
+??????????????? MFT + ??? index/checkpoint????????? GUI?Named Pipe?????????? metadata hydration????? Everything ?????????????????????????? checkpoint ???? `vector<FileRecord>`???????????????? streaming/mapped consolidation ?????????????

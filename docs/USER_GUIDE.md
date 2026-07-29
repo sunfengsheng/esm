@@ -22,8 +22,8 @@
 
 1. 安装完成后启动 `everything_sm`。
 2. 等待状态栏显示搜索服务已连接。
-3. 第一次创建 MFT 索引可能需要几十秒，取决于文件数量和磁盘速度。
-4. 后续启动会先读取 `C:\ProgramData\everything_sm\indexes\mft-index.snapshot`，再在后台校准当前卷状态。
+3. 第一次创建 MFT 索引会先完成名称/路径枚举并发布名称索引；状态栏连接后即可搜索名称。大小、修改时间和属性随后在后台分批补齐，可能需要几十秒到数分钟，取决于文件数量、磁盘速度和缓存状态。
+4. 补齐期间“大小”“修改时间”列以及 `size:` / `dm:` 过滤结果会逐步完善；停止服务时后台任务会在当前有限批次完成后退出。后续健康启动会先读取名称 snapshot、重放同代 metadata WAL，再从已刷盘 cursor 继续补齐；卷集合或 USN boundary 无效时仍先提供名称结果，并在后台执行完整 reconciliation。
 5. 在搜索框输入内容，结果会随输入变化。
 
 全局快捷键 `Ctrl+Alt+Space` 可显示搜索窗口。如果该组合键已被其他软件注册，当前版本不会强制抢占。
@@ -105,7 +105,7 @@ dm:today
 C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 ```
 
-同目录还可能包含 WAL 或临时/checkpoint 文件。此目录由服务账户维护。
+同目录还会保存 `mft-index.snapshot.metadata.wal` 和 `mft-index.snapshot.state`；三者属于同一 generation，应一起备份，不要手工混用不同代文件。目录中也可能出现临时/checkpoint 文件，均由服务账户维护。
 
 ### 当前用户 GUI 数据
 
@@ -172,10 +172,11 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 
 ### 9.5 文件大小或修改时间没有显示
 
-- 目录大小默认不计算。
-- 结果首先来自轻量名称目录，大小和修改时间可能由后台延迟加载。
-- 无权限、离线、已删除、断开的网络/云占位文件可能无法读取元数据。
-- 如果长时间为空，刷新查询或确认文件仍存在；同时查看服务是否处于可用状态。
+- 目录大小默认不计算，目录“大小”列保持为 0/空白是预期行为。
+- 默认多卷服务会在路径重建后先发布名称索引，再按批次补齐普通文件的大小和修改时间；因此名称可能已经搜到，而“大小”“修改时间”列或 `size:` / `dm:` 结果仍在逐步出现。健康重启会 replay metadata WAL 并从 durable cursor 续跑；state/journal 验证失败时先提供已有名称结果，再后台 reconciliation。新的完整 reconciliation 创建 generation 时，如果旧 live USN 状态仍连续可信，并且 MFT 扫描后新旧共有卷可再次完成 USN 追赶，会复用文件 ID、完整路径一致且已经具有修改时间的元数据，因此不会无条件重读所有文件；启动 state 失效、扫描后追赶失败、普通 USN 读取失败或 journal gap 时会安全地禁用复用。新文件、重命名、删除竞争、旧读取失败和其他未知项仍会继续后台补齐。
+- 无权限、离线、枚举后已删除、特殊 NTFS 条目以及断开的网络/云占位文件可能无法读取元数据，此时名称仍可搜索，但大小/修改时间可能为空或未知。直接 USN 变化后的重新读取若失败，服务会使旧大小/时间失效，而不是继续用 stale 值参与 `size:` / `dm:` 过滤。
+- 服务 Event Log 的 `Background metadata hydration progress/completed` 会报告 `examined`、`attempted`、`hydrated`、`errors`、`applied`、`stale` 和 `elapsed`；出现 completed 表示本轮遍历结束。大量 errors 时先确认卷在线、SYSTEM 账户可访问且文件没有被批量删除；少量 stale 通常表示补齐期间发生了重命名或删除。
+- 创建时间、访问时间和 NTFS Change/最近变化时间尚未作为完整全盘基线提供。
 
 ## 10. 当前限制
 

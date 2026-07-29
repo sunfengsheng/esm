@@ -68,8 +68,11 @@ struct LiveStartResult {
     std::int64_t bootstrap_usn{};
     std::size_t entries{};
     std::size_t scan_errors{};
+    std::size_t metadata_hydrated{};
+    std::size_t metadata_errors{};
     std::chrono::milliseconds snapshot_load_elapsed{};
     std::chrono::milliseconds enumeration_elapsed{};
+    std::chrono::milliseconds metadata_elapsed{};
     std::chrono::milliseconds index_elapsed{};
     std::chrono::milliseconds snapshot_save_elapsed{};
     LivePollResult catch_up;

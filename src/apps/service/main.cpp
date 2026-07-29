@@ -1,7 +1,11 @@
 #include "esm/index.hpp"
+#include "esm/file_metadata.hpp"
 #include "esm/live_index.hpp"
 #include "esm/journal_checkpoint.hpp"
 #include "esm/metadata_snapshot.hpp"
+#include "esm/metadata_hydration_wal.hpp"
+#include "esm/metadata_wal.hpp"
+#include "esm/mft_auto_state.hpp"
 #include "esm/named_pipe.hpp"
 #include "esm/ntfs_enumerator.hpp"
 #include "esm/usn_journal.hpp"
@@ -34,6 +38,11 @@ constexpr auto snapshot_refresh_interval = std::chrono::minutes(5);
 constexpr std::size_t snapshot_refresh_changes = 100'000;
 constexpr auto mft_reconciliation_interval = std::chrono::minutes(1);
 constexpr auto mft_live_poll_interval = std::chrono::milliseconds(250);
+constexpr auto metadata_hydration_poll_interval = std::chrono::milliseconds(10);
+constexpr std::size_t metadata_hydration_batch_size = 4'096;
+constexpr std::size_t metadata_hydration_progress_interval = 250'000;
+constexpr auto mft_delta_checkpoint_interval = std::chrono::minutes(5);
+constexpr std::size_t mft_delta_checkpoint_changes = 100'000;
 constexpr wchar_t mft_auto_snapshot_name[] = L"mft-index.snapshot";
 constexpr wchar_t mft_auto_snapshot_marker[] =
     L"everything_sm-mft-multi-v1";
@@ -166,6 +175,23 @@ struct MultiVolumeBuildResult {
     DWORD error{ERROR_SUCCESS};
 };
 
+struct BackgroundMetadataHydration {
+    bool active{};
+    std::uint64_t after_id{};
+    std::size_t examined{};
+    std::size_t attempted{};
+    std::size_t hydrated{};
+    std::size_t errors{};
+    std::size_t applied{};
+    std::size_t stale{};
+    std::uint64_t generation{};
+    std::filesystem::path wal_path;
+    bool wal_enabled{};
+    bool wal_warning_logged{};
+    std::size_t next_progress_report{metadata_hydration_progress_interval};
+    std::chrono::steady_clock::time_point started{};
+};
+
 std::wstring join_volumes(const std::vector<std::wstring>& volumes) {
     std::wstring result;
     for (const auto& volume : volumes) {
@@ -189,8 +215,29 @@ bool same_mounted_volumes(
     return true;
 }
 
+esm::MetadataWalBinding metadata_wal_binding(
+    const VolumeLiveState& state, std::uint64_t generation) {
+    esm::MetadataWalBinding binding;
+    binding.generation = generation;
+    binding.volume_identity = state.volume.identity;
+    binding.volume_root = state.volume.root;
+    binding.root_id = state.root_id;
+    return binding;
+}
+
+std::filesystem::path volume_metadata_wal_path(
+    const std::filesystem::path& snapshot_path,
+    const VolumeLiveState& state,
+    std::uint64_t generation) {
+    return esm::metadata_wal_path(snapshot_path, generation,
+                                  state.volume.identity);
+}
+
 DWORD catch_up_volume(VolumeLiveState& state,
-                      esm::MetadataIndex& index) {
+                      esm::MetadataIndex& index,
+                      const std::filesystem::path& snapshot_path,
+                      std::uint64_t generation,
+                      std::size_t* applied_changes = nullptr) {
     if (!state.live) return ERROR_NOT_SUPPORTED;
     const auto journal = esm::query_usn_journal(state.volume.root);
     if (!journal.available) return journal.error;
@@ -207,11 +254,47 @@ DWORD catch_up_volume(VolumeLiveState& state,
         if (batch.error != ERROR_SUCCESS) return batch.error;
         if (batch.next_usn <= state.cursor) return ERROR_INVALID_DATA;
 
+        const auto appended = esm::append_metadata_wal(
+            volume_metadata_wal_path(snapshot_path, state, generation),
+            metadata_wal_binding(state, generation), state.journal_id,
+            state.cursor, batch);
+        if (!appended.ok) return appended.error;
+
         index.apply_ntfs_changes(state.volume.identity,
                                  state.volume.root,
                                  state.root_id,
                                  batch);
         state.cursor = batch.next_usn;
+        if (applied_changes != nullptr) {
+            *applied_changes += batch.changes.size();
+        }
+    }
+    return ERROR_SUCCESS;
+}
+
+DWORD catch_up_metadata_reuse_sources(
+    std::vector<VolumeLiveState>& previous,
+    const std::vector<VolumeLiveState>& rebuilt,
+    esm::MetadataIndex& index,
+    const std::filesystem::path& snapshot_path,
+    std::uint64_t generation,
+    std::wstring& failed_volume) {
+    for (auto& state : previous) {
+        const auto current = std::find_if(
+            rebuilt.begin(), rebuilt.end(), [&](const VolumeLiveState& item) {
+                return item.volume.identity == state.volume.identity;
+            });
+        if (current == rebuilt.end()) continue;
+        if (!state.live || !current->live) {
+            failed_volume = state.volume.root;
+            return ERROR_NOT_SUPPORTED;
+        }
+        const auto error = catch_up_volume(
+            state, index, snapshot_path, generation);
+        if (error != ERROR_SUCCESS) {
+            failed_volume = state.volume.root;
+            return error;
+        }
     }
     return ERROR_SUCCESS;
 }
@@ -222,7 +305,9 @@ VolumeBuildResult build_volume_live_state(esm::NtfsVolumeInfo volume) {
 
     const auto boundary =
         esm::query_usn_journal(result.state.volume.root);
-    auto scan = esm::enumerate_ntfs_volume(result.state.volume.root);
+    auto scan = esm::enumerate_ntfs_volume(
+        result.state.volume.root,
+        {.hydrate_search_metadata = false});
     if (scan.records.empty() && scan.errors != 0) {
         result.error = ERROR_READ_FAULT;
         return result;
@@ -325,6 +410,289 @@ MultiVolumeBuildResult build_all_ntfs_volumes() {
     return result;
 }
 
+std::uint64_t create_snapshot_generation() noexcept {
+    FILETIME current_time{};
+    GetSystemTimeAsFileTime(&current_time);
+    ULARGE_INTEGER timestamp{};
+    timestamp.LowPart = current_time.dwLowDateTime;
+    timestamp.HighPart = current_time.dwHighDateTime;
+    LARGE_INTEGER performance_counter{};
+    (void)QueryPerformanceCounter(&performance_counter);
+    static std::atomic_uint64_t sequence{1};
+    auto generation = timestamp.QuadPart ^
+        static_cast<std::uint64_t>(performance_counter.QuadPart) ^
+        (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32U) ^
+        sequence.fetch_add(1, std::memory_order_relaxed);
+    if (generation == 0) generation = 1;
+    return generation;
+}
+
+bool ordinal_equal_case_insensitive(std::wstring_view left,
+                                    std::wstring_view right) noexcept {
+    if (left.size() > static_cast<std::size_t>(
+            (std::numeric_limits<int>::max)()) ||
+        right.size() > static_cast<std::size_t>(
+            (std::numeric_limits<int>::max)())) {
+        return false;
+    }
+    return CompareStringOrdinal(
+               left.data(), static_cast<int>(left.size()), right.data(),
+               static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+}
+
+esm::MftAutoState make_mft_auto_state(
+    std::uint64_t generation,
+    const std::vector<VolumeLiveState>& states) {
+    esm::MftAutoState result;
+    result.generation = generation;
+    result.volumes.reserve(states.size());
+    for (const auto& state : states) {
+        esm::MftAutoVolumeState saved;
+        saved.volume = state.volume;
+        saved.root_id = state.root_id;
+        saved.journal_id = state.journal_id;
+        saved.cursor = state.cursor;
+        saved.live = state.live;
+        result.volumes.push_back(std::move(saved));
+    }
+    return result;
+}
+
+struct MftAutoRestoreResult {
+    bool ok{};
+    DWORD error{ERROR_SUCCESS};
+    std::vector<VolumeLiveState> states;
+};
+
+MftAutoRestoreResult restore_mft_auto_states(
+    const std::filesystem::path& path,
+    std::uint64_t generation) {
+    MftAutoRestoreResult result;
+    const auto loaded = esm::load_mft_auto_state(path, generation);
+    if (!loaded.ok) {
+        result.error = loaded.error;
+        return result;
+    }
+    const auto discovered = esm::discover_mounted_ntfs_volumes();
+    if (discovered.error != ERROR_SUCCESS) {
+        result.error = discovered.error;
+        return result;
+    }
+    if (loaded.state.volumes.size() != discovered.volumes.size()) {
+        result.error = ERROR_INVALID_DATA;
+        return result;
+    }
+
+    result.states.reserve(loaded.state.volumes.size());
+    for (const auto& saved : loaded.state.volumes) {
+        const auto current = std::find_if(
+            discovered.volumes.begin(), discovered.volumes.end(),
+            [&](const esm::NtfsVolumeInfo& volume) {
+                return ordinal_equal_case_insensitive(
+                    saved.volume.identity, volume.identity);
+            });
+        if (current == discovered.volumes.end() || !saved.live ||
+            !ordinal_equal_case_insensitive(saved.volume.root,
+                                            current->root) ||
+            saved.volume.serial_number != current->serial_number) {
+            result.error = ERROR_INVALID_DATA;
+            result.states.clear();
+            return result;
+        }
+        const auto current_root_id =
+            esm::query_ntfs_root_file_id(current->root);
+        if (current_root_id == 0 || saved.root_id == 0 ||
+            current_root_id != saved.root_id) {
+            result.error = ERROR_INVALID_DATA;
+            result.states.clear();
+            return result;
+        }
+        const auto journal = esm::query_usn_journal(current->root);
+        if (!journal.available ||
+            esm::validate_checkpoint(
+                journal, {saved.journal_id, saved.cursor}) !=
+                esm::CheckpointStatus::valid) {
+            result.error = journal.available ? ERROR_INVALID_DATA
+                                             : journal.error;
+            result.states.clear();
+            return result;
+        }
+
+        VolumeLiveState restored;
+        restored.volume = *current;
+        restored.root_id = current_root_id;
+        restored.journal_id = saved.journal_id;
+        restored.cursor = saved.cursor;
+        restored.live = true;
+        result.states.push_back(std::move(restored));
+    }
+    result.ok = true;
+    result.error = ERROR_SUCCESS;
+    return result;
+}
+
+struct MftAutoWalReplayResult {
+    bool ok{};
+    DWORD error{ERROR_SUCCESS};
+    std::size_t transactions{};
+    std::size_t changes{};
+    std::uint64_t discarded_tail_bytes{};
+};
+
+MftAutoWalReplayResult replay_mft_auto_metadata_wals(
+    const std::filesystem::path& snapshot_path,
+    std::uint64_t generation,
+    std::vector<VolumeLiveState>& states,
+    esm::MetadataIndex& index) {
+    MftAutoWalReplayResult result;
+    for (auto& state : states) {
+        const auto replay = esm::replay_metadata_wal(
+            volume_metadata_wal_path(snapshot_path, state, generation),
+            metadata_wal_binding(state, generation), state.journal_id,
+            state.cursor, index);
+        if (!replay.ok) {
+            result.error = replay.error;
+            return result;
+        }
+        const auto journal = esm::query_usn_journal(state.volume.root);
+        if (!journal.available || replay.next_usn > journal.next_usn ||
+            esm::validate_checkpoint(
+                journal, {state.journal_id, replay.next_usn}) !=
+                esm::CheckpointStatus::valid) {
+            result.error = journal.available ? ERROR_INVALID_DATA
+                                             : journal.error;
+            return result;
+        }
+        state.cursor = replay.next_usn;
+        result.transactions += replay.transactions;
+        result.changes += replay.changes;
+        result.discarded_tail_bytes += replay.discarded_tail_bytes;
+    }
+    result.ok = true;
+    return result;
+}
+
+void remove_generation_metadata_wals(
+    const std::filesystem::path& snapshot_path,
+    std::uint64_t generation,
+    const std::vector<VolumeLiveState>& states) {
+    if (generation == 0) return;
+    for (const auto& state : states) {
+        std::error_code ignored;
+        std::filesystem::remove(
+            volume_metadata_wal_path(snapshot_path, state, generation),
+            ignored);
+    }
+}
+
+void start_background_metadata_hydration(
+    BackgroundMetadataHydration& state,
+    std::uint64_t generation,
+    const std::filesystem::path& wal_path,
+    bool wal_enabled,
+    std::uint64_t after_id = 0) {
+    state = {};
+    state.active = true;
+    state.after_id = after_id;
+    state.generation = generation;
+    state.wal_path = wal_path;
+    state.wal_enabled = wal_enabled;
+    state.next_progress_report = metadata_hydration_progress_interval;
+    state.started = std::chrono::steady_clock::now();
+}
+
+std::wstring background_metadata_hydration_summary(
+    std::wstring_view prefix,
+    const BackgroundMetadataHydration& state) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - state.started);
+    return std::wstring(prefix) + L": examined=" +
+           std::to_wstring(state.examined) + L", attempted=" +
+           std::to_wstring(state.attempted) + L", hydrated=" +
+           std::to_wstring(state.hydrated) + L", errors=" +
+           std::to_wstring(state.errors) + L", applied=" +
+           std::to_wstring(state.applied) + L", stale=" +
+           std::to_wstring(state.stale) + L", WAL=" +
+           (state.wal_enabled ? L"enabled" : L"disabled") + L", elapsed=" +
+           std::to_wstring(elapsed.count()) + L" ms";
+}
+
+void run_background_metadata_hydration_batch(
+    esm::MetadataIndex& index,
+    BackgroundMetadataHydration& state) {
+    if (!state.active) return;
+
+    const auto before_id = state.after_id;
+    auto batch = index.metadata_hydration_batch(
+        before_id, metadata_hydration_batch_size);
+    state.examined += batch.examined;
+
+    std::vector<std::uint8_t> succeeded(batch.records.size());
+    std::vector<esm::MetadataHydrationWalUpdate> updates;
+    if (!batch.records.empty()) {
+        const auto hydrated = esm::hydrate_file_search_metadata_records(
+            batch.records, 0, succeeded);
+        state.attempted += hydrated.attempted;
+        state.hydrated += hydrated.hydrated;
+        state.errors += hydrated.errors;
+
+        updates.reserve(hydrated.hydrated);
+        std::size_t write = 0;
+        for (std::size_t index = 0; index < batch.records.size(); ++index) {
+            if (succeeded[index] == 0) continue;
+            updates.push_back(
+                esm::make_metadata_hydration_wal_update(
+                    batch.records[index]));
+            if (write != index) {
+                batch.records[write] = std::move(batch.records[index]);
+            }
+            ++write;
+        }
+        batch.records.resize(write);
+    }
+
+    if (state.wal_enabled) {
+        const auto appended = esm::append_metadata_hydration_wal(
+            state.wal_path, state.generation, before_id, batch.next_id,
+            batch.examined, updates, batch.complete);
+        if (!appended.ok) {
+            state.wal_enabled = false;
+            if (!state.wal_warning_logged) {
+                state.wal_warning_logged = true;
+                log_event(
+                    EVENTLOG_WARNING_TYPE,
+                    L"Metadata hydration WAL append failed, error=" +
+                        std::to_wstring(appended.error) +
+                        L"; continuing in memory until the next snapshot");
+            }
+        }
+    }
+
+    if (!batch.records.empty()) {
+        const auto applied = index.apply_search_metadata(batch.records);
+        state.applied += applied.applied;
+        state.stale += applied.stale;
+    }
+    state.after_id = batch.next_id;
+
+    if (batch.complete) {
+        log_event(EVENTLOG_INFORMATION_TYPE,
+                  background_metadata_hydration_summary(
+                      L"Background metadata hydration completed", state));
+        state.active = false;
+        return;
+    }
+
+    if (state.examined >= state.next_progress_report) {
+        log_event(EVENTLOG_INFORMATION_TYPE,
+                  background_metadata_hydration_summary(
+                      L"Background metadata hydration progress", state));
+        while (state.next_progress_report <= state.examined) {
+            state.next_progress_report += metadata_hydration_progress_interval;
+        }
+    }
+}
+
 bool valid_mft_auto_snapshot(const esm::MetadataSnapshot& snapshot) {
     return snapshot.volume == mft_auto_snapshot_marker &&
            !snapshot.records.empty();
@@ -332,13 +700,56 @@ bool valid_mft_auto_snapshot(const esm::MetadataSnapshot& snapshot) {
 
 esm::MetadataSnapshotIoResult save_mft_auto_snapshot(
     const std::filesystem::path& path,
-    std::vector<esm::FileRecord>& records) {
+    std::vector<esm::FileRecord>& records,
+    std::uint64_t generation) {
     esm::MetadataSnapshot snapshot;
+    snapshot.checkpoint.journal_id = generation;
     snapshot.root_id = 1;
     snapshot.volume = mft_auto_snapshot_marker;
     snapshot.records.swap(records);
     const auto result = esm::save_metadata_snapshot_atomic(path, snapshot);
     snapshot.records.swap(records);
+    return result;
+}
+
+struct MftAutoPersistenceResult {
+    esm::MetadataSnapshotIoResult snapshot;
+    esm::MetadataHydrationWalResult hydration_wal;
+    esm::MftAutoStateIoResult state;
+    bool metadata_wals_ok{};
+    DWORD metadata_wal_error{ERROR_SUCCESS};
+
+    [[nodiscard]] bool committed() const noexcept {
+        return snapshot.ok && metadata_wals_ok && state.ok;
+    }
+};
+
+MftAutoPersistenceResult persist_mft_auto_generation(
+    const std::filesystem::path& snapshot_path,
+    std::vector<esm::FileRecord>& records,
+    const std::vector<VolumeLiveState>& states,
+    std::uint64_t generation) {
+    MftAutoPersistenceResult result;
+    result.snapshot = save_mft_auto_snapshot(
+        snapshot_path, records, generation);
+    if (!result.snapshot.ok) return result;
+
+    result.hydration_wal = esm::initialize_metadata_hydration_wal(
+        esm::metadata_hydration_wal_path(snapshot_path), generation);
+    result.metadata_wals_ok = true;
+    for (const auto& state : states) {
+        const auto reset = esm::reset_metadata_wal(
+            volume_metadata_wal_path(snapshot_path, state, generation));
+        if (!reset.ok) {
+            result.metadata_wals_ok = false;
+            result.metadata_wal_error = reset.error;
+            break;
+        }
+    }
+    if (!result.metadata_wals_ok) return result;
+    result.state = esm::save_mft_auto_state_atomic(
+        esm::mft_auto_state_path(snapshot_path),
+        make_mft_auto_state(generation, states));
     return result;
 }
 
@@ -359,16 +770,152 @@ void run_mft_auto_service() {
 
     const auto snapshot_path =
         configuration.data_directory / mft_auto_snapshot_name;
+    const auto hydration_wal_path =
+        esm::metadata_hydration_wal_path(snapshot_path);
+    const auto state_path = esm::mft_auto_state_path(snapshot_path);
     esm::MetadataIndex index;
     bool loaded_snapshot = false;
+    bool startup_rebuild_required = true;
+    bool initial_hydration_scheduled = false;
+    bool initial_hydration_wal_ready = false;
+    bool initial_hydration_complete = false;
+    std::uint64_t initial_hydration_after_id = 0;
+    std::uint64_t current_generation = 0;
+    std::vector<VolumeLiveState> initial_states;
+
     auto loaded = esm::load_metadata_snapshot(snapshot_path);
     if (loaded.ok && valid_mft_auto_snapshot(loaded.snapshot)) {
         const auto count = loaded.snapshot.records.size();
+        current_generation = loaded.snapshot.checkpoint.journal_id;
+        if (current_generation != 0) {
+            const auto replay = esm::replay_metadata_hydration_wal(
+                hydration_wal_path, current_generation,
+                loaded.snapshot.records);
+            if (replay.ok) {
+                initial_hydration_wal_ready = true;
+                initial_hydration_complete = replay.complete;
+                initial_hydration_after_id = replay.next_id;
+                log_event(
+                    EVENTLOG_INFORMATION_TYPE,
+                    L"Replayed metadata hydration WAL: transactions=" +
+                        std::to_wstring(replay.transactions) + L", updates=" +
+                        std::to_wstring(replay.updates) + L", applied=" +
+                        std::to_wstring(replay.applied) + L", stale=" +
+                        std::to_wstring(replay.stale) + L", next ID=" +
+                        std::to_wstring(replay.next_id));
+                if (replay.torn_tail) {
+                    log_event(
+                        EVENTLOG_WARNING_TYPE,
+                        L"Recovered a torn metadata hydration WAL tail; "
+                        L"discarded bytes=" +
+                            std::to_wstring(replay.discarded_tail_bytes));
+                }
+            } else {
+                if (std::filesystem::exists(hydration_wal_path)) {
+                    log_event(
+                        EVENTLOG_WARNING_TYPE,
+                        L"Metadata hydration WAL could not be replayed, "
+                        L"error=" + std::to_wstring(replay.error) +
+                            L"; restarting metadata hydration from ID 0");
+                }
+                const auto initialized =
+                    esm::initialize_metadata_hydration_wal(
+                        hydration_wal_path, current_generation);
+                initial_hydration_wal_ready = initialized.ok;
+                if (!initialized.ok) {
+                    log_event(
+                        EVENTLOG_WARNING_TYPE,
+                        L"Metadata hydration WAL reset failed, error=" +
+                            std::to_wstring(initialized.error) +
+                            L"; metadata will be restored in memory only");
+                }
+            }
+
+            auto restored = restore_mft_auto_states(
+                state_path, current_generation);
+            if (restored.ok) {
+                initial_states = std::move(restored.states);
+                startup_rebuild_required = false;
+                log_event(
+                    EVENTLOG_INFORMATION_TYPE,
+                    L"Validated multi-volume snapshot state and USN "
+                    L"boundaries for " +
+                        std::to_wstring(initial_states.size()) + L" volumes");
+            } else {
+                log_event(
+                    EVENTLOG_WARNING_TYPE,
+                    L"Multi-volume snapshot state is unavailable or stale, "
+                    L"error=" + std::to_wstring(restored.error) +
+                        L"; scheduling an MFT reconciliation");
+            }
+        } else {
+            log_event(
+                EVENTLOG_INFORMATION_TYPE,
+                L"Loaded a legacy multi-volume snapshot without a generation; "
+                L"scheduling an MFT reconciliation");
+        }
+
         index.replace(std::move(loaded.snapshot.records));
         loaded_snapshot = true;
-        log_event(EVENTLOG_INFORMATION_TYPE,
-                  L"Loaded " + std::to_wstring(count) +
-                      L" entries from the multi-volume MFT snapshot");
+        if (!startup_rebuild_required) {
+            const auto replayed = replay_mft_auto_metadata_wals(
+                snapshot_path, current_generation, initial_states, index);
+            if (replayed.ok) {
+                if (replayed.changes != 0) {
+                    initial_hydration_complete = false;
+                    initial_hydration_after_id = 0;
+                }
+                log_event(
+                    EVENTLOG_INFORMATION_TYPE,
+                    L"Replayed multi-volume name/USN WALs: transactions=" +
+                        std::to_wstring(replayed.transactions) + L", changes=" +
+                        std::to_wstring(replayed.changes));
+                if (replayed.discarded_tail_bytes != 0) {
+                    log_event(
+                        EVENTLOG_WARNING_TYPE,
+                        L"Recovered torn multi-volume name/USN WAL tails; "
+                        L"discarded bytes=" +
+                            std::to_wstring(replayed.discarded_tail_bytes));
+                }
+            } else {
+                // replay_mft_auto_metadata_wals applies one volume at a time.
+                // If a later volume fails validation, discard every partial
+                // replay before publishing queries. Reloading the immutable
+                // checkpoint is cheaper than retaining a second multi-million
+                // record vector solely for rollback.
+                startup_rebuild_required = true;
+                initial_states.clear();
+                const auto fallback = esm::load_metadata_snapshot(snapshot_path);
+                if (fallback.ok && valid_mft_auto_snapshot(fallback.snapshot) &&
+                    fallback.snapshot.checkpoint.journal_id ==
+                        current_generation) {
+                    index.replace(std::move(fallback.snapshot.records));
+                    initial_hydration_complete = false;
+                    initial_hydration_after_id = 0;
+                    log_event(
+                        EVENTLOG_WARNING_TYPE,
+                        L"Multi-volume name/USN WAL replay failed, error=" +
+                            std::to_wstring(replayed.error) +
+                            L"; rolled back partial replay to the durable "
+                            L"checkpoint and scheduled reconciliation");
+                } else {
+                    loaded_snapshot = false;
+                    current_generation = 0;
+                    log_event(
+                        EVENTLOG_ERROR_TYPE,
+                        L"Multi-volume name/USN WAL replay failed and the "
+                        L"durable checkpoint could not be reloaded; performing "
+                        L"a synchronous MFT rebuild");
+                }
+            }
+        }
+        initial_hydration_scheduled = loaded_snapshot &&
+            !startup_rebuild_required && !initial_hydration_complete;
+        if (loaded_snapshot) {
+            log_event(EVENTLOG_INFORMATION_TYPE,
+                      L"Loaded " + std::to_wstring(count) +
+                          L" entries from the multi-volume MFT snapshot");
+        }
     } else if (loaded.ok) {
         log_event(EVENTLOG_WARNING_TYPE,
                   L"Ignoring an incompatible multi-volume MFT snapshot");
@@ -378,7 +925,6 @@ void run_mft_auto_service() {
                       std::to_wstring(loaded.error));
     }
 
-    std::vector<VolumeLiveState> initial_states;
     if (!loaded_snapshot) {
         auto startup = std::async(std::launch::async,
                                   build_all_ntfs_volumes);
@@ -407,32 +953,63 @@ void run_mft_auto_service() {
             return;
         }
         const auto count = built.records.size();
+        current_generation = create_snapshot_generation();
         // Persist while the reconciliation records already exist, then let the
         // index consume and release them before allocating its accelerators.
         // This avoids retaining a second multi-million-record path vector.
-        const auto saved =
-            save_mft_auto_snapshot(snapshot_path, built.records);
-        if (!saved.ok) {
+        const auto persisted = persist_mft_auto_generation(
+            snapshot_path, built.records, built.states, current_generation);
+        if (!persisted.snapshot.ok) {
             log_event(EVENTLOG_WARNING_TYPE,
                       L"Initial multi-volume MFT snapshot save failed, error=" +
-                          std::to_wstring(saved.error));
+                          std::to_wstring(persisted.snapshot.error));
+        } else {
+            if (!persisted.hydration_wal.ok) {
+                log_event(
+                    EVENTLOG_WARNING_TYPE,
+                    L"Initial metadata hydration WAL creation failed, error=" +
+                        std::to_wstring(persisted.hydration_wal.error));
+            }
+            if (!persisted.state.ok) {
+                log_event(
+                    EVENTLOG_WARNING_TYPE,
+                    L"Initial multi-volume startup state save failed, error=" +
+                        std::to_wstring(persisted.state.error));
+            }
         }
         index.replace(std::move(built.records));
         initial_states = std::move(built.states);
+        startup_rebuild_required = false;
+        initial_hydration_scheduled = true;
+        initial_hydration_wal_ready = persisted.hydration_wal.ok;
         log_event(EVENTLOG_INFORMATION_TYPE,
                   L"Indexed " + std::to_wstring(count) + L" entries on " +
-                      join_volumes(built.volumes));
+                      join_volumes(built.volumes) +
+                      L"; name index published; background metadata "
+                      L"hydration scheduled");
     }
 
     release_transient_process_memory();
     report_service_status(SERVICE_RUNNING);
     std::jthread coordinator(
-        [&, states = std::move(initial_states), loaded_snapshot]
+        [&, states = std::move(initial_states), startup_rebuild_required,
+         initial_hydration_scheduled, initial_hydration_wal_ready,
+         initial_hydration_after_id, current_generation]
         (std::stop_token token) mutable {
-        bool rebuild_required = loaded_snapshot || states.empty();
+        bool rebuild_required = startup_rebuild_required || states.empty();
+        bool metadata_reuse_allowed =
+            !startup_rebuild_required && !states.empty();
+        BackgroundMetadataHydration metadata_hydration;
+        if (initial_hydration_scheduled) {
+            start_background_metadata_hydration(
+                metadata_hydration, current_generation, hydration_wal_path,
+                initial_hydration_wal_ready, initial_hydration_after_id);
+        }
         auto next_reconciliation_attempt = std::chrono::steady_clock::now();
         auto next_volume_discovery = std::chrono::steady_clock::now() +
                                      mft_reconciliation_interval;
+        auto last_delta_checkpoint = std::chrono::steady_clock::now();
+        std::size_t changes_since_checkpoint = 0;
         while (!token.stop_requested() &&
                !runtime.stop.load(std::memory_order_relaxed)) {
             const auto now = std::chrono::steady_clock::now();
@@ -442,25 +1019,107 @@ void run_mft_auto_service() {
                     !built.records.empty()) {
                     const auto count = built.records.size();
                     const auto volumes = join_volumes(built.volumes);
+                    bool reuse_attempted = false;
+                    if (metadata_reuse_allowed) {
+                        std::wstring failed_volume;
+                        const auto catch_up_error =
+                            catch_up_metadata_reuse_sources(
+                                states, built.states, index, snapshot_path,
+                                current_generation, failed_volume);
+                        if (catch_up_error == ERROR_SUCCESS) {
+                            reuse_attempted = true;
+                        } else {
+                            metadata_reuse_allowed = false;
+                            log_event(
+                                EVENTLOG_WARNING_TYPE,
+                                L"Pre-reconciliation USN catch-up failed for " +
+                                    failed_volume + L", error=" +
+                                    std::to_wstring(catch_up_error) +
+                                    L"; disabling metadata reuse for this "
+                                    L"generation");
+                        }
+                    }
+                    esm::MetadataReuseStats reused_metadata;
+                    reused_metadata.examined = count;
+                    if (reuse_attempted) {
+                        reused_metadata =
+                            index.reuse_search_metadata(built.records);
+                    } else {
+                        reused_metadata.unknown = count;
+                    }
                     // Reuse the records already produced by reconciliation for
                     // persistence. Generating another full-path snapshot from
                     // the live catalogs caused the service to jump back into
                     // the multi-gigabyte range every five minutes.
-                    const auto saved =
-                        save_mft_auto_snapshot(snapshot_path, built.records);
-                    if (!saved.ok) {
+                    const auto old_generation = current_generation;
+                    const auto old_states = states;
+                    const auto next_generation =
+                        create_snapshot_generation();
+                    const auto persisted = persist_mft_auto_generation(
+                        snapshot_path, built.records, built.states,
+                        next_generation);
+                    if (!persisted.snapshot.ok) {
                         log_event(EVENTLOG_WARNING_TYPE,
                                   L"Multi-volume MFT snapshot save failed, "
-                                  L"error=" + std::to_wstring(saved.error));
+                                  L"error=" +
+                                      std::to_wstring(
+                                          persisted.snapshot.error));
+                    } else {
+                        if (!persisted.hydration_wal.ok) {
+                            log_event(
+                                EVENTLOG_WARNING_TYPE,
+                                L"Metadata hydration WAL creation failed, "
+                                L"error=" +
+                                    std::to_wstring(
+                                        persisted.hydration_wal.error));
+                        }
+                        if (!persisted.metadata_wals_ok) {
+                            log_event(
+                                EVENTLOG_WARNING_TYPE,
+                                L"Multi-volume name/USN WAL initialization "
+                                L"failed, error=" +
+                                    std::to_wstring(
+                                        persisted.metadata_wal_error));
+                        }
+                        if (!persisted.state.ok) {
+                            log_event(
+                                EVENTLOG_WARNING_TYPE,
+                                L"Multi-volume startup state save failed, "
+                                L"error=" +
+                                    std::to_wstring(persisted.state.error));
+                        }
                     }
                     index.replace(std::move(built.records));
                     states = std::move(built.states);
+                    current_generation = next_generation;
+                    if (persisted.committed()) {
+                        remove_generation_metadata_wals(
+                            snapshot_path, old_generation, old_states);
+                    }
+                    changes_since_checkpoint = 0;
+                    last_delta_checkpoint = std::chrono::steady_clock::now();
                     rebuild_required = false;
+                    metadata_reuse_allowed = std::all_of(
+                        states.begin(), states.end(),
+                        [](const VolumeLiveState& state) { return state.live; });
+                    start_background_metadata_hydration(
+                        metadata_hydration, current_generation,
+                        hydration_wal_path, persisted.hydration_wal.ok);
                     next_volume_discovery = std::chrono::steady_clock::now() +
                                             mft_reconciliation_interval;
                     log_event(EVENTLOG_INFORMATION_TYPE,
                               L"Reconciled " + volumes + L" with " +
-                                  std::to_wstring(count) + L" entries");
+                                  std::to_wstring(count) +
+                                  L" entries; metadata reuse=" +
+                                  (reuse_attempted ? L"trusted" : L"disabled") +
+                                  L", reused=" +
+                                  std::to_wstring(reused_metadata.reused) +
+                                  L", unknown=" +
+                                  std::to_wstring(reused_metadata.unknown) +
+                                  L", stale=" +
+                                  std::to_wstring(reused_metadata.stale) +
+                                  L"; name index published; background metadata "
+                                  L"hydration scheduled for unresolved entries");
                     release_transient_process_memory();
                 } else {
                     next_reconciliation_attempt =
@@ -474,10 +1133,10 @@ void run_mft_auto_service() {
 
             if (!rebuild_required) {
                 for (auto& state : states) {
-                    if (!state.live) {
-                        continue;
-                    }
-                    const auto error = catch_up_volume(state, index);
+                    if (!state.live) continue;
+                    const auto error = catch_up_volume(
+                        state, index, snapshot_path, current_generation,
+                        &changes_since_checkpoint);
                     if (error != ERROR_SUCCESS) {
                         log_event(EVENTLOG_WARNING_TYPE,
                                   L"USN polling failed for " +
@@ -485,13 +1144,66 @@ void run_mft_auto_service() {
                                       std::to_wstring(error) +
                                       L"; scheduling an MFT reconciliation");
                         rebuild_required = true;
+                        metadata_reuse_allowed = false;
                         next_reconciliation_attempt =
                             std::chrono::steady_clock::now();
                         break;
                     }
                 }
 
-                if (!rebuild_required && now >= next_volume_discovery) {
+                const auto checkpoint_now =
+                    std::chrono::steady_clock::now();
+                if (!rebuild_required && changes_since_checkpoint != 0 &&
+                    (changes_since_checkpoint >=
+                         mft_delta_checkpoint_changes ||
+                     checkpoint_now - last_delta_checkpoint >=
+                         mft_delta_checkpoint_interval)) {
+                    const auto old_generation = current_generation;
+                    const auto old_states = states;
+                    auto checkpoint_records = index.snapshot_records();
+                    const auto next_generation =
+                        create_snapshot_generation();
+                    const auto persisted = persist_mft_auto_generation(
+                        snapshot_path, checkpoint_records, states,
+                        next_generation);
+                    if (persisted.committed()) {
+                        const auto count = checkpoint_records.size();
+                        index.replace(std::move(checkpoint_records));
+                        current_generation = next_generation;
+                        changes_since_checkpoint = 0;
+                        last_delta_checkpoint = checkpoint_now;
+                        remove_generation_metadata_wals(
+                            snapshot_path, old_generation, old_states);
+                        start_background_metadata_hydration(
+                            metadata_hydration, current_generation,
+                            hydration_wal_path, persisted.hydration_wal.ok);
+                        log_event(
+                            EVENTLOG_INFORMATION_TYPE,
+                            L"Consolidated multi-volume checkpoint: entries=" +
+                                std::to_wstring(count) + L", old generation=" +
+                                std::to_wstring(old_generation) +
+                                L", new generation=" +
+                                std::to_wstring(current_generation));
+                        release_transient_process_memory();
+                    } else {
+                        last_delta_checkpoint = checkpoint_now;
+                        log_event(
+                            EVENTLOG_WARNING_TYPE,
+                            L"Multi-volume checkpoint consolidation failed; "
+                            L"snapshot error=" +
+                                std::to_wstring(persisted.snapshot.error) +
+                                L", name WAL error=" +
+                                std::to_wstring(
+                                    persisted.metadata_wal_error) +
+                                L", state error=" +
+                                std::to_wstring(persisted.state.error) +
+                                L"; retaining the active generation and WALs");
+                    }
+                }
+
+                if (!rebuild_required &&
+                    std::chrono::steady_clock::now() >=
+                        next_volume_discovery) {
                     const auto discovery =
                         esm::discover_mounted_ntfs_volumes();
                     if (discovery.error == ERROR_SUCCESS &&
@@ -514,7 +1226,24 @@ void run_mft_auto_service() {
                 }
             }
 
-            std::this_thread::sleep_for(mft_live_poll_interval);
+            if (!rebuild_required && metadata_hydration.active &&
+                !token.stop_requested() &&
+                !runtime.stop.load(std::memory_order_relaxed)) {
+                run_background_metadata_hydration_batch(
+                    index, metadata_hydration);
+            }
+
+            std::this_thread::sleep_for(
+                !rebuild_required && metadata_hydration.active
+                    ? metadata_hydration_poll_interval
+                    : mft_live_poll_interval);
+        }
+        if (metadata_hydration.active) {
+            log_event(EVENTLOG_INFORMATION_TYPE,
+                      background_metadata_hydration_summary(
+                          L"Background metadata hydration stopped before "
+                          L"completion",
+                          metadata_hydration));
         }
     });
 
@@ -566,7 +1295,10 @@ void run_mft_service() {
     log_event(EVENTLOG_INFORMATION_TYPE,
               L"Search service started with " +
                   std::to_wstring(index.size()) +
-                  L" entries via MFT enumeration");
+                  L" entries via MFT enumeration; metadata hydrated=" +
+                  std::to_wstring(scan.metadata_hydrated) + L", errors=" +
+                  std::to_wstring(scan.metadata_errors) + L", elapsed=" +
+                  std::to_wstring(scan.metadata_elapsed.count()) + L" ms");
     report_service_status(SERVICE_RUNNING);
 
     std::atomic<DWORD> reconciliation_error{ERROR_SUCCESS};

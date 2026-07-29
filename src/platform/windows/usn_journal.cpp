@@ -1,4 +1,4 @@
-﻿#include "esm/usn_journal.hpp"
+#include "esm/usn_journal.hpp"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -28,7 +28,8 @@ struct ReadUsnJournalDataV1 {
     WORD min_major_version;
     WORD max_major_version;
 };
-static_assert(sizeof(READ_USN_JOURNAL_DATA) == 40);
+static_assert(sizeof(READ_USN_JOURNAL_DATA) == 40 ||
+              sizeof(READ_USN_JOURNAL_DATA) == sizeof(ReadUsnJournalDataV1));
 static_assert(offsetof(ReadUsnJournalDataV1, journal_id) == 32);
 static_assert(offsetof(ReadUsnJournalDataV1, min_major_version) == 40);
 static_assert(sizeof(ReadUsnJournalDataV1) == 48);

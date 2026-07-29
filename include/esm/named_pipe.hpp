@@ -49,12 +49,23 @@ using PipeSearchDiagnosticsSink =
 
 [[nodiscard]] std::wstring normalize_pipe_name(std::wstring_view name);
 
+// Returns the SID of the account that owns the current process token. The
+// string form is suitable for an SDDL ACE and for persisting in an SCM command
+// line. error is ERROR_SUCCESS only when a non-empty SID is returned.
+[[nodiscard]] std::wstring current_process_user_sid(std::uint32_t& error);
+
+// Builds the local-only search Pipe DACL. SYSTEM and administrators retain
+// full control; only the selected user SID receives query read/write access.
+[[nodiscard]] std::wstring local_pipe_security_sddl(
+    std::wstring_view allowed_user_sid);
+
 // Creates one local-only pipe instance, serves exactly one search request,
 // writes one response, then disconnects.
 [[nodiscard]] std::uint32_t serve_named_pipe_search_once(
     std::wstring_view pipe_name,
     const MetadataIndex& index,
-    const PipeSearchDiagnosticsSink& diagnostics = {});
+    const PipeSearchDiagnosticsSink& diagnostics = {},
+    std::wstring_view allowed_user_sid = {});
 
 // Runs multiple local pipe instances concurrently until stop becomes true.
 // Setting stop wakes workers blocked in ConnectNamedPipe and joins them before
@@ -64,7 +75,8 @@ using PipeSearchDiagnosticsSink =
     const MetadataIndex& index,
     std::atomic_bool& stop,
     std::size_t worker_count = 4,
-    PipeSearchDiagnosticsSink diagnostics = {});
+    PipeSearchDiagnosticsSink diagnostics = {},
+    std::wstring_view allowed_user_sid = {});
 
 [[nodiscard]] PipeSearchResult query_named_pipe_search(
     std::wstring_view pipe_name,

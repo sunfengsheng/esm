@@ -18,6 +18,10 @@
 
 推荐保持“安装多卷 NTFS 索引服务”选中。服务会发现带盘符的本地 NTFS 固定卷，将 `C:`、`D:`、`E:` 等卷合并为一个搜索目录。
 
+安装服务时会记录当前安装用户的 Windows SID。默认查询 Pipe 只允许该用户、SYSTEM 和 Administrators 连接，因此开始菜单和桌面快捷方式只创建给当前安装用户；另一位本机普通用户需要重新安装/重新绑定服务，当前版本不支持共享多用户查询。
+
+如果服务安装或启动失败，安装器会提供重试；选择取消后会查询并清理可能残留的服务，只有 SCM 明确报告服务不存在时才继续为兼容模式，并在 `everything_sm.ini` 写入 `service_mode=compatibility`。SCM 状态查询失败、清理失败或正式卸载无法停止/删除服务时，流程会停止并返回非零退出码，避免留下仍注册的服务。兼容模式只递归扫描安装页配置的一个目录，不等于多卷 MFT 服务。
+
 ## 3. 第一次启动
 
 1. 安装完成后启动 `everything_sm`。
@@ -135,7 +139,7 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
    & 'C:\Program Files\everything_sm\esm_service.exe' start
    ```
 3. 若服务配置损坏，先停止并重新安装多卷服务。
-4. 检查 Windows 事件查看器中的 `everything_sm` 服务事件。
+4. 检查 Windows 事件查看器 Application 日志中的 `everything_sm` 服务事件；正式安装会注册 message source，Message 应显示可读文本。旧安装的服务 ImagePath 如果缺少用户 SID 或运行参数损坏，新版服务会报告明确停止错误；重新运行安装包可迁移配置，不应再长期停留在 1053/“服务未及时响应”状态。
 5. 确认 GUI 连接的是 `everything_sm_service`，而不是已经不存在的自定义 Pipe。
 
 ### 9.2 只能搜到 C 盘
@@ -181,7 +185,7 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 
 ## 10. 当前限制
 
-当前版本尚未提供完整 Everything 查询函数、ETP 协议、Windows 原生预览处理器、完整 Shell 右键扩展、按用户权限模拟查询、签名二进制和自动升级。详情见 [CURRENT_STATUS.md](CURRENT_STATUS.md)。
+当前版本尚未提供完整 Everything 查询函数、ETP 协议、Windows 原生预览处理器、完整 Shell 右键扩展、per-request 用户模拟/文件 ACL 过滤、共享多用户安装、签名二进制和自动升级。主程序 portable ZIP 也已暂停发布，因为单根兼容扫描不能可靠替代多卷索引。详情见 [CURRENT_STATUS.md](CURRENT_STATUS.md)。
 
 ## 11. 独立文件内容搜索
 

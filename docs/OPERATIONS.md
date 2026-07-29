@@ -131,13 +131,15 @@ Pipe 名标准化为：
 - 单次结果上限 1000；
 - 精确读写、连接阶段超时和有限重试；
 - SYSTEM/Administrators 完全控制；
-- Authenticated Users 可进行本地 Pipe 读写查询。
+- 前台 server 默认只授权当前进程 token 的用户 SID；
+- SCM 服务安装时捕获执行安装的用户 SID，把 SID 持久化到服务 ImagePath，并只向该 SID 授予 Pipe 读写查询；
+- 不再向通用 Authenticated Users (`AU`) 授予访问。
 
-尚未实现 per-request impersonation 和按用户 ACL 过滤结果。因此该服务不应部署为远程多用户文件权限边界。
+这仍是单用户连接缓解：服务以 SYSTEM 构建全机索引，尚未实现 per-request impersonation 和按用户 ACL 过滤结果。管理员仍可连接；其他本机用户不能使用默认 Pipe。该服务不应部署为远程或共享多用户文件权限边界，更换主要使用用户后应重新安装服务以刷新允许 SID。
 
 ## 5. 日志和诊断
 
-服务使用 Windows Event Log 写入错误、警告和主要生命周期事件。多卷建库/协调会先记录 `name index published; background metadata hydration scheduled`；后台任务每检查约 250,000 条记录进度，并在完成或服务停止时报告 `examined`、`attempted`、`hydrated`、`errors`、`applied`、`stale`、`elapsed` 以及 `WAL=enabled`/`WAL=disabled`。`hydrated` 是文件系统读取成功数，`applied` 是路径仍匹配并完成合并的记录数；读取失败保留原值，过期路径计为 `stale`。WAL 写入失败会记录警告并继续内存补齐，但该批次不能保证在重启后恢复。可在事件查看器的 Windows 日志中查找来源 `everything_sm`，或用 PowerShell：
+服务使用 Windows Event Log 写入错误、警告和主要生命周期事件。安装流程会注册 `everything_sm` Application Event source，并把 `EventMessageFile` 指向带内嵌 message table 的 `esm_service.exe`；正常安装后的事件查看器 Message 应为可读文本，而不是空消息。多卷建库/协调会先记录 `name index published; background metadata hydration scheduled`；后台任务每检查约 250,000 条记录进度，并在完成或服务停止时报告 `examined`、`attempted`、`hydrated`、`errors`、`applied`、`stale`、`elapsed` 以及 `WAL=enabled`/`WAL=disabled`。`hydrated` 是文件系统读取成功数，`applied` 是路径仍匹配并完成合并的记录数；读取失败保留原值，过期路径计为 `stale`。WAL 写入失败会记录警告并继续内存补齐，但该批次不能保证在重启后恢复。可在事件查看器的 Windows 日志中查找来源 `everything_sm`，或用 PowerShell：
 
 文件名 SCM 服务还会对成功且连接后总耗时不少于 100 ms 的查询记录 `Slow search:` 警告。为避免连续输入或自动客户端刷满 Application 日志，同一服务进程最多每 5 秒记录一条，期间被抑制的慢查询数会在下一条的 `suppressed_since_last` 字段汇总。字段包括 `total_ms`、`read_ms`、`decode_ms`、`search_ms`、`encode_ms`、`write_ms`、结果数、limit、query 字符数、排序和匹配 flags。日志结构刻意不保存原始 query、文件名或路径。100 ms 是当前固定保守阈值，不是性能 SLA；`total_ms` 从服务端接受连接后开始，不包含客户端排队等待、GUI 防抖、窗口消息调度、ListView 绘制或 Shell 图标加载。
 
@@ -206,7 +208,7 @@ Get-Volume | Select-Object DriveLetter,FileSystem,DriveType,HealthStatus
 
 ## 7. 升级和卸载
 
-NSIS 安装程序在覆盖二进制前会停止并卸载旧服务，再安装新服务。当前没有后台自动升级和数据库 schema 自动迁移承诺，因此升级前应备份 ProgramData 索引目录。
+NSIS 安装程序先通过 SCM 确认旧服务存在，再在覆盖二进制前停止并卸载；只有 `sc query` 返回 1060 才按“服务不存在”继续，其他 SCM 查询错误会中止且返回非零退出码。若 SCM 中有服务但旧服务管理程序缺失，或停止/卸载失败，安装器会停止流程而不覆盖二进制。新服务安装或启动失败会提示重试；取消后会再次查询并清理可能残留的服务，只有确认服务不存在时才写入 `service_mode=compatibility`。服务管理命令在 `DeleteService` 已报告 marked-for-delete 时仍会等待 SCM 完成真实删除，降低立即重装竞态。正式卸载同样不会忽略服务状态查询、停止或删除失败。当前仍没有旧二进制备份、完整事务回滚、后台自动升级或数据库 schema 自动迁移承诺，因此升级前应备份 ProgramData 索引目录。旧 GUI/前台 server 仍按进程名终止，可能影响其他目录下同名开发进程。
 
 卸载：
 
@@ -219,13 +221,16 @@ NSIS 安装程序在覆盖二进制前会停止并卸载旧服务，再安装新
 ## 8. 发布前运维检查
 
 - 干净机器安装会触发 UAC；
-- 服务被正确注册为 delayed-auto；
+- 服务被正确注册为 automatic + delayed-auto，并配置 5 秒、30 秒、5 分钟三级重启；
+- `sc.exe qsidtype everything_sm` 显示 unrestricted service SID，`sc.exe qfailure everything_sm` 显示 failure actions；
+- Event source 注册表项存在，Event Viewer 中 `everything_sm` 消息可读；
+- 服务 ImagePath 包含目标安装用户的 `S-1-...` SID，Pipe DACL 不包含 `AU`；
 - C/D 等 NTFS 卷均可搜索；
 - 重启 Windows 后可从 snapshot 快速可用；
 - 新建、重命名、移动和删除可由 USN 增量反映；
 - 服务停止期间的变化可在重启协调后恢复；
 - 卸载不会遗留运行中的进程或服务；
-- 安装包和 portable zip 的 SHA-256 已生成。
+- NSIS 安装包及其 SHA-256 已生成；portable ZIP 当前暂停发布，不能列入发布附件。
 
 ## 9. 实验内容服务运行说明
 

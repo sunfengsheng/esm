@@ -12,6 +12,7 @@
 #include "esm/volume_discovery.hpp"
 
 #include <windows.h>
+#include "service_messages.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,12 +28,15 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
 constexpr wchar_t service_name[] = L"everything_sm";
 constexpr wchar_t service_display_name[] = L"everything_sm Search Service";
 constexpr wchar_t default_pipe_name[] = L"everything_sm";
+constexpr wchar_t event_log_key[] =
+    L"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\everything_sm";
 constexpr std::uint64_t slow_query_threshold_microseconds = 100'000;
 constexpr auto slow_query_log_interval = std::chrono::seconds(5);
 constexpr DWORD service_wait_timeout_ms = 120'000;
@@ -75,10 +79,13 @@ struct ServiceConfiguration {
     std::filesystem::path checkpoint;
     std::filesystem::path data_directory;
     std::wstring pipe_name;
+    std::wstring allowed_user_sid;
 };
 
 ServiceRuntime runtime;
 ServiceConfiguration configuration;
+DWORD startup_configuration_error{ERROR_SUCCESS};
+std::wstring startup_configuration_message;
 
 void release_transient_process_memory() {
     // Full MFT reconciliation and snapshot generation temporarily allocate
@@ -96,7 +103,8 @@ void log_event(WORD type, std::wstring_view message) {
     if (source == nullptr) return;
     std::wstring stable(message);
     LPCWSTR strings[] = {stable.c_str()};
-    ReportEventW(source, type, 0, 1, nullptr, 1, 0, strings, nullptr);
+    ReportEventW(source, type, 0, ESM_EVENT_MESSAGE, nullptr, 1, 0, strings,
+                 nullptr);
     DeregisterEventSource(source);
 }
 
@@ -670,13 +678,15 @@ void run_background_metadata_hydration_batch(
 
         updates.reserve(hydrated.hydrated);
         std::size_t write = 0;
-        for (std::size_t index = 0; index < batch.records.size(); ++index) {
-            if (succeeded[index] == 0) continue;
+        for (std::size_t record_index = 0;
+             record_index < batch.records.size(); ++record_index) {
+            if (succeeded[record_index] == 0) continue;
             updates.push_back(
                 esm::make_metadata_hydration_wal_update(
-                    batch.records[index]));
-            if (write != index) {
-                batch.records[write] = std::move(batch.records[index]);
+                    batch.records[record_index]));
+            if (write != record_index) {
+                batch.records[write] =
+                    std::move(batch.records[record_index]);
             }
             ++write;
         }
@@ -1281,7 +1291,7 @@ void run_mft_auto_service() {
 
     const auto pipe_error = esm::serve_named_pipe_search(
         configuration.pipe_name, index, runtime.stop, 4,
-        log_pipe_search_diagnostics);
+        log_pipe_search_diagnostics, configuration.allowed_user_sid);
     report_service_status(SERVICE_STOP_PENDING, ERROR_SUCCESS, 30'000);
     coordinator.request_stop();
     if (coordinator.joinable()) coordinator.join();
@@ -1364,7 +1374,7 @@ void run_mft_service() {
 
     const auto pipe_error = esm::serve_named_pipe_search(
         configuration.pipe_name, index, runtime.stop, 4,
-        log_pipe_search_diagnostics);
+        log_pipe_search_diagnostics, configuration.allowed_user_sid);
     report_service_status(SERVICE_STOP_PENDING, ERROR_SUCCESS, 30'000);
     reconciler.request_stop();
     if (reconciler.joinable()) reconciler.join();
@@ -1457,7 +1467,7 @@ void run_live_service() {
     report_service_status(SERVICE_RUNNING);
     const auto pipe_error = esm::serve_named_pipe_search(
         configuration.pipe_name, session.index(), runtime.stop, 4,
-        log_pipe_search_diagnostics);
+        log_pipe_search_diagnostics, configuration.allowed_user_sid);
 
     report_service_status(SERVICE_STOP_PENDING, ERROR_SUCCESS, 30'000);
     follower.request_stop();
@@ -1485,6 +1495,40 @@ void run_live_service() {
     report_service_status(SERVICE_STOPPED);
 }
 
+DWORD validate_service_configuration(std::wstring& message) {
+    if (startup_configuration_error != ERROR_SUCCESS) {
+        message = startup_configuration_message;
+        return startup_configuration_error;
+    }
+    if (configuration.pipe_name.empty()) {
+        message = L"Service ImagePath is missing the Pipe name; reinstall everything_sm";
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (configuration.allowed_user_sid.empty()) {
+        message = L"Service ImagePath is missing the allowed user SID; reinstall everything_sm to migrate its security configuration";
+        return ERROR_INVALID_SID;
+    }
+    if (esm::local_pipe_security_sddl(configuration.allowed_user_sid).empty()) {
+        message = L"Service ImagePath contains an invalid allowed user SID; reinstall everything_sm";
+        return ERROR_INVALID_SID;
+    }
+    if (configuration.mode == ServiceMode::mft_auto &&
+        configuration.data_directory.empty()) {
+        message = L"Service ImagePath is missing the MFT-auto data directory; reinstall everything_sm";
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (configuration.mode == ServiceMode::mft && configuration.volume.empty()) {
+        message = L"Service ImagePath is missing the NTFS volume; reinstall everything_sm";
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (configuration.mode == ServiceMode::live &&
+        (configuration.volume.empty() || configuration.checkpoint.empty())) {
+        message = L"Service ImagePath is missing the live volume or checkpoint path; reinstall everything_sm";
+        return ERROR_INVALID_PARAMETER;
+    }
+    return ERROR_SUCCESS;
+}
+
 void WINAPI service_main(DWORD, LPWSTR*) {
     runtime.handle = RegisterServiceCtrlHandlerExW(
         service_name, service_control_handler, nullptr);
@@ -1492,6 +1536,14 @@ void WINAPI service_main(DWORD, LPWSTR*) {
 
     runtime.stop.store(false, std::memory_order_relaxed);
     report_service_status(SERVICE_START_PENDING, ERROR_SUCCESS, 120'000);
+    std::wstring configuration_failure;
+    const auto configuration_error =
+        validate_service_configuration(configuration_failure);
+    if (configuration_error != ERROR_SUCCESS) {
+        log_event(EVENTLOG_ERROR_TYPE, configuration_failure);
+        report_service_status(SERVICE_STOPPED, configuration_error);
+        return;
+    }
     if (configuration.mode == ServiceMode::mft)
         run_mft_service();
     else if (configuration.mode == ServiceMode::mft_auto)
@@ -1591,8 +1643,111 @@ DWORD wait_for_state(SC_HANDLE service, DWORD desired,
     }
 }
 
+DWORD register_event_log_source(const std::filesystem::path& executable) {
+    HKEY key = nullptr;
+    DWORD disposition = 0;
+    auto error = RegCreateKeyExW(HKEY_LOCAL_MACHINE, event_log_key, 0, nullptr,
+                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                                 nullptr, &key, &disposition);
+    if (error != ERROR_SUCCESS) return error;
+
+    const auto path = executable.wstring();
+    error = RegSetValueExW(
+        key, L"EventMessageFile", 0, REG_EXPAND_SZ,
+        reinterpret_cast<const BYTE*>(path.c_str()),
+        static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t)));
+    if (error == ERROR_SUCCESS) {
+        constexpr DWORD types = EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE |
+                                EVENTLOG_INFORMATION_TYPE;
+        error = RegSetValueExW(
+            key, L"TypesSupported", 0, REG_DWORD,
+            reinterpret_cast<const BYTE*>(&types), sizeof(types));
+    }
+    RegCloseKey(key);
+    if (error != ERROR_SUCCESS)
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, event_log_key);
+    return error;
+}
+
+DWORD unregister_event_log_source() {
+    const auto error = RegDeleteTreeW(HKEY_LOCAL_MACHINE, event_log_key);
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+        return ERROR_SUCCESS;
+    return error;
+}
+
+DWORD configure_service_runtime(SC_HANDLE service) {
+    SERVICE_DESCRIPTIONW description{};
+    description.lpDescription = const_cast<LPWSTR>(
+        L"Indexes NTFS file metadata and serves local low-latency searches.");
+    if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION,
+                               &description))
+        return GetLastError();
+
+    SERVICE_DELAYED_AUTO_START_INFO delayed{TRUE};
+    if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                               &delayed))
+        return GetLastError();
+
+    SC_ACTION actions[] = {
+        {SC_ACTION_RESTART, 5'000},
+        {SC_ACTION_RESTART, 30'000},
+        {SC_ACTION_RESTART, 300'000},
+    };
+    SERVICE_FAILURE_ACTIONSW failure_actions{};
+    failure_actions.dwResetPeriod = 86'400;
+    failure_actions.cActions = static_cast<DWORD>(std::size(actions));
+    failure_actions.lpsaActions = actions;
+    if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS,
+                               &failure_actions))
+        return GetLastError();
+
+    SERVICE_FAILURE_ACTIONS_FLAG failure_flag{TRUE};
+    if (!ChangeServiceConfig2W(service,
+                               SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                               &failure_flag))
+        return GetLastError();
+
+    SERVICE_SID_INFO sid_info{SERVICE_SID_TYPE_UNRESTRICTED};
+    if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_SERVICE_SID_INFO,
+                               &sid_info))
+        return GetLastError();
+    return ERROR_SUCCESS;
+}
+
+DWORD delete_service_and_wait(SC_HANDLE manager, ServiceHandle& service,
+                              DWORD timeout_ms = 30'000) {
+    if (service.value == nullptr) return ERROR_INVALID_HANDLE;
+    if (!DeleteService(service.value)) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_SERVICE_MARKED_FOR_DELETE) return error;
+    }
+    CloseServiceHandle(service.value);
+    service.value = nullptr;
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        SC_HANDLE pending = OpenServiceW(
+            manager, service_name, SERVICE_QUERY_STATUS);
+        if (pending == nullptr) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_SERVICE_DOES_NOT_EXIST)
+                return ERROR_SUCCESS;
+            if (error != ERROR_SERVICE_MARKED_FOR_DELETE)
+                return error;
+        } else {
+            CloseServiceHandle(pending);
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+            return ERROR_TIMEOUT;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 DWORD install_service(const ServiceConfiguration& config) {
     std::filesystem::path checkpoint;
+    std::filesystem::path data_directory;
     if (config.mode == ServiceMode::live) {
         const auto comparison = esm::compare_path_volumes(
             config.volume, config.checkpoint);
@@ -1604,7 +1759,21 @@ DWORD install_service(const ServiceConfiguration& config) {
         }
         checkpoint = std::filesystem::absolute(config.checkpoint)
                          .lexically_normal();
+    } else if (config.mode == ServiceMode::mft_auto) {
+        std::error_code create_error;
+        data_directory = std::filesystem::absolute(config.data_directory)
+                             .lexically_normal();
+        std::filesystem::create_directories(data_directory, create_error);
+        if (create_error) return static_cast<DWORD>(create_error.value());
     }
+
+    std::uint32_t sid_error = ERROR_SUCCESS;
+    auto allowed_user_sid = config.allowed_user_sid;
+    if (allowed_user_sid.empty())
+        allowed_user_sid = esm::current_process_user_sid(sid_error);
+    if (allowed_user_sid.empty()) return static_cast<DWORD>(sid_error);
+    if (esm::local_pipe_security_sddl(allowed_user_sid).empty())
+        return ERROR_INVALID_SID;
 
     const auto executable = executable_path();
     if (executable.empty()) return GetLastError();
@@ -1612,51 +1781,55 @@ DWORD install_service(const ServiceConfiguration& config) {
     if (config.mode == ServiceMode::mft) {
         command += L" service-mft " +
                    quote_argument(config.volume.wstring()) + L" " +
-                   quote_argument(config.pipe_name);
+                   quote_argument(config.pipe_name) + L" " +
+                   quote_argument(allowed_user_sid);
     } else if (config.mode == ServiceMode::mft_auto) {
-        std::error_code create_error;
-        const auto data_directory = std::filesystem::absolute(
-            config.data_directory).lexically_normal();
-        std::filesystem::create_directories(data_directory, create_error);
-        if (create_error)
-            return static_cast<DWORD>(create_error.value());
         command += L" service-mft-auto " +
                    quote_argument(data_directory.wstring()) + L" " +
-                   quote_argument(config.pipe_name);
+                   quote_argument(config.pipe_name) + L" " +
+                   quote_argument(allowed_user_sid);
     } else {
         command += L" service " + quote_argument(config.volume.wstring()) +
                    L" " + quote_argument(checkpoint.wstring()) + L" " +
-                   quote_argument(config.pipe_name);
+                   quote_argument(config.pipe_name) + L" " +
+                   quote_argument(allowed_user_sid);
     }
 
     ServiceHandle manager{OpenSCManagerW(
-        nullptr, nullptr, SC_MANAGER_CREATE_SERVICE)};
+        nullptr, nullptr, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT)};
     if (manager.value == nullptr) return GetLastError();
     ServiceHandle service{CreateServiceW(
         manager.value, service_name, service_display_name,
         SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, command.c_str(),
+        SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, command.c_str(),
         nullptr, nullptr, nullptr, nullptr, nullptr)};
     if (service.value == nullptr) return GetLastError();
 
-    SERVICE_DESCRIPTIONW description{};
-    description.lpDescription = const_cast<LPWSTR>(
-        L"Indexes NTFS file metadata and serves local low-latency searches.");
-    ChangeServiceConfig2W(service.value, SERVICE_CONFIG_DESCRIPTION,
-                          &description);
+    DWORD error = register_event_log_source(executable);
+    if (error == ERROR_SUCCESS)
+        error = configure_service_runtime(service.value);
+    if (error != ERROR_SUCCESS) {
+        const DWORD rollback_error =
+            delete_service_and_wait(manager.value, service);
+        const DWORD event_error = unregister_event_log_source();
+        if (rollback_error != ERROR_SUCCESS) return rollback_error;
+        if (event_error != ERROR_SUCCESS) return event_error;
+        return error;
+    }
+
     const wchar_t* mode_name = config.mode == ServiceMode::mft_auto
         ? L"mft-auto" : (config.mode == ServiceMode::mft ? L"mft" : L"live");
     std::wcout << L"Installed " << service_display_name << L"\n"
                << L"  mode: " << mode_name << L"\n";
     if (config.mode == ServiceMode::mft_auto)
-        std::wcout << L"  data directory: "
-                   << std::filesystem::absolute(config.data_directory)
-                          .lexically_normal().wstring() << L"\n";
+        std::wcout << L"  data directory: " << data_directory.wstring()
+                   << L"\n";
     else
         std::wcout << L"  volume: " << config.volume.wstring() << L"\n";
     if (config.mode == ServiceMode::live)
         std::wcout << L"  checkpoint: " << checkpoint.wstring() << L"\n";
-    std::wcout << L"  pipe: " << config.pipe_name << L"\n";
+    std::wcout << L"  pipe: " << config.pipe_name << L"\n"
+               << L"  allowed user SID: " << allowed_user_sid << L"\n";
     return ERROR_SUCCESS;
 }
 
@@ -1717,8 +1890,15 @@ DWORD uninstall_service() {
     ServiceHandle manager;
     ServiceHandle service;
     error = open_service_with_access(DELETE, manager, service);
-    if (error != ERROR_SUCCESS) return error;
-    if (!DeleteService(service.value)) return GetLastError();
+    if (error != ERROR_SUCCESS && error != ERROR_SERVICE_DOES_NOT_EXIST)
+        return error;
+    if (error == ERROR_SUCCESS) {
+        error = delete_service_and_wait(manager.value, service);
+        if (error != ERROR_SUCCESS) return error;
+    }
+
+    const auto event_error = unregister_event_log_source();
+    if (event_error != ERROR_SUCCESS) return event_error;
     std::wcout << L"Uninstalled " << service_display_name << L"\n";
     return ERROR_SUCCESS;
 }
@@ -1754,85 +1934,92 @@ DWORD status_service() {
 void usage() {
     std::wcout
         << L"Usage:\n"
-        << L"  esm_service install <volume> <checkpoint-file> [pipe-name]\n"
-        << L"  esm_service install-mft <volume> [pipe-name]\n"
-        << L"  esm_service install-mft-auto <data-directory> [pipe-name]\n"
+        << L"  esm_service install <volume> <checkpoint-file> [pipe-name] [allowed-user-sid]\n"
+        << L"  esm_service install-mft <volume> [pipe-name] [allowed-user-sid]\n"
+        << L"  esm_service install-mft-auto <data-directory> [pipe-name] [allowed-user-sid]\n"
         << L"  esm_service uninstall\n"
         << L"  esm_service start\n"
         << L"  esm_service stop\n"
         << L"  esm_service status\n";
+}
+
+void reject_service_configuration(DWORD error, std::wstring message) {
+    startup_configuration_error = error;
+    startup_configuration_message = std::move(message);
+}
+
+int dispatch_service(bool show_usage_when_interactive) {
+    SERVICE_TABLE_ENTRYW table[] = {
+        {const_cast<LPWSTR>(service_name), service_main},
+        {nullptr, nullptr},
+    };
+    if (StartServiceCtrlDispatcherW(table)) return 0;
+
+    const DWORD error = GetLastError();
+    if (error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT &&
+        show_usage_when_interactive) {
+        usage();
+        return 2;
+    }
+    print_error(L"StartServiceCtrlDispatcher", error);
+    return 1;
 }
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     if (argc < 2) {
-        SERVICE_TABLE_ENTRYW table[] = {
-            {const_cast<LPWSTR>(service_name), service_main},
-            {nullptr, nullptr},
-        };
-        if (!StartServiceCtrlDispatcherW(table)) {
-            const DWORD error = GetLastError();
-            if (error != ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
-                print_error(L"StartServiceCtrlDispatcher", error);
-            else
-                usage();
-            return 1;
-        }
-        return 0;
+        reject_service_configuration(
+            ERROR_INVALID_PARAMETER,
+            L"Service ImagePath is missing runtime arguments; reinstall everything_sm");
+        return dispatch_service(true);
     }
 
     const std::wstring_view command(argv[1]);
     if (command == L"service") {
-        if (argc < 4 || argc > 5) return 2;
-        configuration.mode = ServiceMode::live;
-        configuration.volume = argv[2];
-        configuration.checkpoint = argv[3];
-        configuration.pipe_name = argc == 5 ? argv[4] : default_pipe_name;
-        SERVICE_TABLE_ENTRYW table[] = {
-            {const_cast<LPWSTR>(service_name), service_main},
-            {nullptr, nullptr},
-        };
-        if (!StartServiceCtrlDispatcherW(table)) {
-            print_error(L"StartServiceCtrlDispatcher", GetLastError());
-            return 1;
+        if (argc != 6) {
+            reject_service_configuration(
+                argc == 5 ? ERROR_INVALID_SID : ERROR_INVALID_PARAMETER,
+                L"Service ImagePath is missing or has invalid runtime arguments; reinstall everything_sm to migrate its security configuration");
+        } else {
+            configuration.mode = ServiceMode::live;
+            configuration.volume = argv[2];
+            configuration.checkpoint = argv[3];
+            configuration.pipe_name = argv[4];
+            configuration.allowed_user_sid = argv[5];
         }
-        return 0;
+        return dispatch_service(true);
     }
     if (command == L"service-mft-auto") {
-        if (argc < 3 || argc > 4) return 2;
-        configuration.mode = ServiceMode::mft_auto;
-        configuration.data_directory = argv[2];
-        configuration.pipe_name = argc == 4 ? argv[3] : default_pipe_name;
-        SERVICE_TABLE_ENTRYW table[] = {
-            {const_cast<LPWSTR>(service_name), service_main},
-            {nullptr, nullptr},
-        };
-        if (!StartServiceCtrlDispatcherW(table)) {
-            print_error(L"StartServiceCtrlDispatcher", GetLastError());
-            return 1;
+        if (argc != 5) {
+            reject_service_configuration(
+                argc == 4 ? ERROR_INVALID_SID : ERROR_INVALID_PARAMETER,
+                L"Service ImagePath is missing or has invalid runtime arguments; reinstall everything_sm to migrate its security configuration");
+        } else {
+            configuration.mode = ServiceMode::mft_auto;
+            configuration.data_directory = argv[2];
+            configuration.pipe_name = argv[3];
+            configuration.allowed_user_sid = argv[4];
         }
-        return 0;
+        return dispatch_service(true);
     }
     if (command == L"service-mft") {
-        if (argc < 3 || argc > 4) return 2;
-        configuration.mode = ServiceMode::mft;
-        configuration.volume = argv[2];
-        configuration.pipe_name = argc == 4 ? argv[3] : default_pipe_name;
-        SERVICE_TABLE_ENTRYW table[] = {
-            {const_cast<LPWSTR>(service_name), service_main},
-            {nullptr, nullptr},
-        };
-        if (!StartServiceCtrlDispatcherW(table)) {
-            print_error(L"StartServiceCtrlDispatcher", GetLastError());
-            return 1;
+        if (argc != 5) {
+            reject_service_configuration(
+                argc == 4 ? ERROR_INVALID_SID : ERROR_INVALID_PARAMETER,
+                L"Service ImagePath is missing or has invalid runtime arguments; reinstall everything_sm to migrate its security configuration");
+        } else {
+            configuration.mode = ServiceMode::mft;
+            configuration.volume = argv[2];
+            configuration.pipe_name = argv[3];
+            configuration.allowed_user_sid = argv[4];
         }
-        return 0;
+        return dispatch_service(true);
     }
 
     DWORD error = ERROR_INVALID_PARAMETER;
     if (command == L"install") {
-        if (argc < 4 || argc > 5) {
+        if (argc < 4 || argc > 6) {
             usage();
             return 2;
         }
@@ -1840,27 +2027,30 @@ int wmain(int argc, wchar_t** argv) {
         config.mode = ServiceMode::live;
         config.volume = argv[2];
         config.checkpoint = argv[3];
-        config.pipe_name = argc == 5 ? argv[4] : default_pipe_name;
+        config.pipe_name = argc >= 5 ? argv[4] : default_pipe_name;
+        if (argc == 6) config.allowed_user_sid = argv[5];
         error = install_service(config);
     } else if (command == L"install-mft-auto") {
-        if (argc < 3 || argc > 4) {
+        if (argc < 3 || argc > 5) {
             usage();
             return 2;
         }
         ServiceConfiguration config;
         config.mode = ServiceMode::mft_auto;
         config.data_directory = argv[2];
-        config.pipe_name = argc == 4 ? argv[3] : default_pipe_name;
+        config.pipe_name = argc >= 4 ? argv[3] : default_pipe_name;
+        if (argc == 5) config.allowed_user_sid = argv[4];
         error = install_service(config);
     } else if (command == L"install-mft") {
-        if (argc < 3 || argc > 4) {
+        if (argc < 3 || argc > 5) {
             usage();
             return 2;
         }
         ServiceConfiguration config;
         config.mode = ServiceMode::mft;
         config.volume = argv[2];
-        config.pipe_name = argc == 4 ? argv[3] : default_pipe_name;
+        config.pipe_name = argc >= 4 ? argv[3] : default_pipe_name;
+        if (argc == 5) config.allowed_user_sid = argv[4];
         error = install_service(config);
     } else if (command == L"uninstall") {
         if (argc != 2) return 2;
@@ -1875,8 +2065,10 @@ int wmain(int argc, wchar_t** argv) {
         if (argc != 2) return 2;
         error = status_service();
     } else {
-        usage();
-        return 2;
+        reject_service_configuration(
+            ERROR_INVALID_PARAMETER,
+            L"Service ImagePath contains an unknown command; reinstall everything_sm");
+        return dispatch_service(true);
     }
 
     if (error != ERROR_SUCCESS) {

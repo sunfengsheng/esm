@@ -34,15 +34,18 @@ struct LocalSecurityDescriptor {
 
 bool make_pipe_security_attributes(LocalSecurityDescriptor& descriptor,
                                    SECURITY_ATTRIBUTES& attributes,
+                                   std::wstring_view allowed_user_sid,
                                    std::uint32_t& error) {
-    // The transport is query-only and PIPE_REJECT_REMOTE_CLIENTS prevents
-    // network clients. SYSTEM and administrators retain full control, while
-    // authenticated local users receive only the read/write access required
-    // to exchange request and response frames with an elevated service.
-    constexpr wchar_t sddl[] =
-        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+    std::wstring sid(allowed_user_sid);
+    if (sid.empty()) sid = current_process_user_sid(error);
+    if (sid.empty()) return false;
+    const auto sddl = local_pipe_security_sddl(sid);
+    if (sddl.empty()) {
+        error = ERROR_INVALID_SID;
+        return false;
+    }
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, SDDL_REVISION_1, &descriptor.value, nullptr)) {
+            sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr)) {
         error = GetLastError();
         return false;
     }
@@ -197,6 +200,53 @@ const wchar_t* sort_field_name(SortField field) {
 }
 } // namespace
 
+std::wstring current_process_user_sid(std::uint32_t& error) {
+    Handle token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.value)) {
+        error = GetLastError();
+        return {};
+    }
+
+    DWORD required = 0;
+    GetTokenInformation(token.value, TokenUser, nullptr, 0, &required);
+    error = GetLastError();
+    if (required == 0 || error != ERROR_INSUFFICIENT_BUFFER) return {};
+
+    std::vector<std::uint8_t> buffer(required);
+    if (!GetTokenInformation(token.value, TokenUser, buffer.data(),
+                             required, &required)) {
+        error = GetLastError();
+        return {};
+    }
+    const auto* user = reinterpret_cast<const TOKEN_USER*>(buffer.data());
+    if (user->User.Sid == nullptr || !IsValidSid(user->User.Sid)) {
+        error = ERROR_INVALID_SID;
+        return {};
+    }
+
+    LPWSTR sid_text = nullptr;
+    if (!ConvertSidToStringSidW(user->User.Sid, &sid_text)) {
+        error = GetLastError();
+        return {};
+    }
+    std::wstring sid(sid_text);
+    LocalFree(sid_text);
+    error = ERROR_SUCCESS;
+    return sid;
+}
+
+std::wstring local_pipe_security_sddl(
+    std::wstring_view allowed_user_sid) {
+    if (allowed_user_sid.empty()) return {};
+    const std::wstring sid_text(allowed_user_sid);
+    PSID sid = nullptr;
+    if (!ConvertStringSidToSidW(sid_text.c_str(), &sid)) return {};
+    const bool valid = IsValidSid(sid) != FALSE;
+    LocalFree(sid);
+    if (!valid) return {};
+    return L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;" + sid_text + L")";
+}
+
 std::wstring format_pipe_search_diagnostics(
     const PipeSearchDiagnostics& diagnostics) {
     const auto milliseconds = [](std::uint64_t microseconds) {
@@ -233,12 +283,14 @@ std::wstring normalize_pipe_name(std::wstring_view name) {
 
 std::uint32_t serve_named_pipe_search_once(
     std::wstring_view pipe_name, const MetadataIndex& index,
-    const PipeSearchDiagnosticsSink& diagnostics_sink) {
+    const PipeSearchDiagnosticsSink& diagnostics_sink,
+    std::wstring_view allowed_user_sid) {
     const auto normalized = normalize_pipe_name(pipe_name);
     LocalSecurityDescriptor descriptor;
     SECURITY_ATTRIBUTES security{};
     std::uint32_t security_error = ERROR_SUCCESS;
-    if (!make_pipe_security_attributes(descriptor, security, security_error))
+    if (!make_pipe_security_attributes(descriptor, security, allowed_user_sid,
+                                       security_error))
         return security_error;
 
     Handle pipe{CreateNamedPipeW(
@@ -348,22 +400,34 @@ std::uint32_t serve_named_pipe_search_once(
 std::uint32_t serve_named_pipe_search(
     std::wstring_view pipe_name, const MetadataIndex& index,
     std::atomic_bool& stop, std::size_t worker_count,
-    PipeSearchDiagnosticsSink diagnostics) {
+    PipeSearchDiagnosticsSink diagnostics,
+    std::wstring_view allowed_user_sid) {
     if (worker_count == 0) return ERROR_INVALID_PARAMETER;
+
+    std::uint32_t security_error = ERROR_SUCCESS;
+    std::wstring stable_allowed_user_sid(allowed_user_sid);
+    if (stable_allowed_user_sid.empty())
+        stable_allowed_user_sid = current_process_user_sid(security_error);
+    if (stable_allowed_user_sid.empty()) return security_error;
+    if (local_pipe_security_sddl(stable_allowed_user_sid).empty())
+        return ERROR_INVALID_SID;
 
     std::atomic<std::uint32_t> fatal_error{ERROR_SUCCESS};
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
-        workers.emplace_back([&, pipe = std::wstring(pipe_name)] {
+        workers.emplace_back(
+            [&, pipe = std::wstring(pipe_name),
+             allowed_sid = stable_allowed_user_sid] {
             while (!stop.load(std::memory_order_relaxed)) {
-                const auto error =
-                    serve_named_pipe_search_once(pipe, index, diagnostics);
+                const auto error = serve_named_pipe_search_once(
+                    pipe, index, diagnostics, allowed_sid);
                 if (stop.load(std::memory_order_relaxed)) break;
                 // Client disconnects and malformed requests affect only that
                 // connection. Pipe creation/security failures are host-fatal.
                 if (error == ERROR_ACCESS_DENIED ||
                     error == ERROR_INVALID_NAME ||
+                    error == ERROR_INVALID_SID ||
                     error == ERROR_NOT_ENOUGH_MEMORY) {
                     std::uint32_t expected = ERROR_SUCCESS;
                     fatal_error.compare_exchange_strong(expected, error);

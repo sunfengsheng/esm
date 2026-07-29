@@ -6,6 +6,13 @@
 
 ### Added
 
+- 为所有 Windows EXE 增加由 CMake 项目版本统一生成的 VERSIONINFO；为 `esm_service.exe` 嵌入 Event Log message table，安装服务时注册 `everything_sm` Application Event source，使生命周期、恢复和慢查询事件可显示可读消息。 同时兼容 Windows SDK 将 `READ_USN_JOURNAL_DATA` 映射为 V1 的 48 字节布局，为全部 C++ target 统一启用 MSVC `/utf-8`，并修复 GUI 参数名与 Windows SDK `small` 定义冲突及 64 位控件 ID 转换，恢复 MSVC/Windows SDK 全目标构建路径；目录 watcher 测试对杀毒/索引器造成的短暂 sharing violation 采用最长 2 秒的有界重试，避免把环境竞争误判为产品失败。
+- Windows 自动测试临时目录清理仅对 `ERROR_SHARING_VIOLATION`/`ERROR_ACCESS_DENIED` 执行最长 2 秒的有界重试；scanner 测试在扫描前显式关闭并校验输出流。持续句柄占用、超时或其他错误仍使测试失败，不用无限重试掩盖句柄泄漏。
+- SCM 服务安装新增自动启动、延迟启动、服务 SID、失败时 5 秒/30 秒/5 分钟三级重启以及 24 小时失败计数重置；任一关键服务配置或 Event source 注册失败都会删除本次创建的服务并返回失败。旧 ImagePath 缺少 SID 或运行参数损坏时仍先连接 SCM，再以明确 Win32 状态停止并写事件，不再表现为 1053/“服务未及时响应启动或控制请求”。
+- 文件名搜索 Pipe DACL 从所有本机 Authenticated Users 收紧为安装服务时捕获的用户 SID；SYSTEM 和 Administrators 保留完全控制。Pipe host 会在创建 worker 前一次性解析并校验 SID，避免错误安全配置进入快速重试。新增 SID/DACL 与无效 SID 启动拒绝测试。该措施是单用户发布缓解，尚不等于 per-request impersonation 或按文件 ACL 过滤。
+- 主 NSIS 安装器在升级前仅对 SCM 中真实存在的服务执行停止/卸载，并把 `ERROR_SERVICE_DOES_NOT_EXIST` 与其他 SCM 查询失败分开处理；服务安装/启动失败时会确认并清理可能残留的服务，只有确认服务不存在后才记录兼容模式。启动失败后的服务清理、正式卸载和升级卸载都会等待 SCM 真正删除服务，删除已进入 marked-for-delete 状态时继续等待；所有中止路径返回非零退出码。快捷方式改为当前安装用户范围。
+- 暂停 CI 和 GitHub Release 的主程序 portable ZIP，避免无 SCM 的 portable 包静默只扫描默认 `C:\`；当前只发布管理员 NSIS 安装包及其 SHA-256。
+
 - 文件名 Named Pipe 查询新增协议外分阶段诊断，记录读取、解析、索引搜索、编码、写回和总耗时；SCM 服务对成功且总耗时不少于 100 ms 的请求以最多每 5 秒一条的频率写入 Windows Event Log，并汇总被抑制条数。诊断仅保存查询字符数、选项和结果数，不记录查询文本、文件名或路径，并保持 IPC v1 wire format 不变。
 - 新增 `esm_gui_pipeline_benchmark`，用于对比完整 `SearchResult` 深复制与轻量元数据请求交接的合成成本；新增连续输入防抖边界和结果元数据原位应用测试。
 - 为独立内容搜索应用新增专属紫蓝色文档/放大镜图标，并把 GUI 资源、NSIS 安装图标和卸载图标切换到该资源；保留可重复生成的 SVG/PNG/ICO 源文件和脚本。

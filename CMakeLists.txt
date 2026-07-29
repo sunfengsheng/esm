@@ -1,11 +1,33 @@
 cmake_minimum_required(VERSION 3.25)
-project(everything_sm VERSION 0.1.0 LANGUAGES CXX)
+project(everything_sm VERSION 0.1.0 LANGUAGES CXX RC)
 option(ESM_BUILD_TESTS "Build unit tests" ON)
 option(ESM_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(ESM_BUILD_CONTENT_SEARCH "Build the isolated Xapian content-search prototype" OFF)
+
+set(ESM_VERSION_TWEAK "${PROJECT_VERSION_TWEAK}")
+if(ESM_VERSION_TWEAK STREQUAL "")
+  set(ESM_VERSION_TWEAK 0)
+endif()
+set(ESM_GENERATED_RESOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/resources")
+file(MAKE_DIRECTORY "${ESM_GENERATED_RESOURCE_DIR}")
+
+function(esm_add_windows_version_resource target description filename)
+  set(ESM_TARGET_NAME "${target}")
+  set(ESM_FILE_DESCRIPTION "${description}")
+  set(ESM_ORIGINAL_FILENAME "${filename}")
+  set(resource "${ESM_GENERATED_RESOURCE_DIR}/${target}_version.rc")
+  configure_file(cmake/version.rc.in "${resource}" @ONLY)
+  target_sources(${target} PRIVATE "${resource}")
+endfunction()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+if(MSVC)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
 add_library(esm_core
     src/core/index.cpp
     src/core/gui_settings.cpp
@@ -34,14 +56,18 @@ target_include_directories(esm_core PUBLIC include)
 target_link_libraries(esm_core PUBLIC advapi32)
 target_compile_definitions(esm_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
-  target_compile_options(esm_core PRIVATE /W4 /permissive- /utf-8)
+  target_compile_options(esm_core PRIVATE /W4)
 else()
   target_compile_options(esm_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_executable(esm_cli src/apps/cli/main.cpp)
 target_link_libraries(esm_cli PRIVATE esm_core)
+esm_add_windows_version_resource(
+  esm_cli "everything_sm command-line client" "esm_cli.exe")
 add_executable(esm_server src/apps/server/main.cpp)
 target_link_libraries(esm_server PRIVATE esm_core)
+esm_add_windows_version_resource(
+  esm_server "everything_sm foreground search server" "esm_server.exe")
 add_executable(esm_service src/apps/service/main.cpp)
 add_executable(esm_launcher WIN32
     src/apps/launcher/main.cpp
@@ -49,12 +75,40 @@ add_executable(esm_launcher WIN32
 )
 target_link_libraries(esm_launcher PRIVATE advapi32)
 target_link_libraries(esm_service PRIVATE esm_core advapi32)
+esm_add_windows_version_resource(
+  esm_service "everything_sm Windows search service" "esm_service.exe")
+esm_add_windows_version_resource(
+  esm_launcher "everything_sm launcher" "esm_launcher.exe")
 add_executable(esm_gui WIN32
     src/apps/gui/main.cpp
     src/apps/gui/dialogs.cpp
     src/apps/gui/resources.rc
 )
 target_link_libraries(esm_gui PRIVATE esm_core comctl32 comdlg32 shell32 ole32 uuid)
+esm_add_windows_version_resource(
+  esm_gui "everything_sm desktop search" "esm_gui.exe")
+
+find_program(ESM_MESSAGE_COMPILER NAMES windmc mc)
+if(NOT ESM_MESSAGE_COMPILER)
+  message(FATAL_ERROR "A Windows message compiler (windmc or mc) is required")
+endif()
+set(ESM_MESSAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/service_messages")
+set(ESM_MESSAGE_RC "${ESM_MESSAGE_DIR}/service_messages.rc")
+set(ESM_MESSAGE_HEADER "${ESM_MESSAGE_DIR}/service_messages.h")
+set(ESM_MESSAGE_BIN "${ESM_MESSAGE_DIR}/MSG00409.bin")
+add_custom_command(
+  OUTPUT "${ESM_MESSAGE_RC}" "${ESM_MESSAGE_HEADER}" "${ESM_MESSAGE_BIN}"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${ESM_MESSAGE_DIR}"
+  COMMAND "${ESM_MESSAGE_COMPILER}"
+          -h "${ESM_MESSAGE_DIR}" -r "${ESM_MESSAGE_DIR}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/apps/service/service_messages.mc"
+  DEPENDS src/apps/service/service_messages.mc
+  VERBATIM
+)
+target_sources(esm_service PRIVATE
+  "${ESM_MESSAGE_RC}" "${ESM_MESSAGE_HEADER}" "${ESM_MESSAGE_BIN}")
+target_include_directories(esm_service PRIVATE "${ESM_MESSAGE_DIR}")
+
 if(MINGW)
   target_link_options(esm_cli PRIVATE -static)
   target_link_options(esm_server PRIVATE -static)
@@ -109,6 +163,13 @@ if(ESM_BUILD_CONTENT_SEARCH)
   )
   target_link_libraries(esm_content_cli PRIVATE esm_content_protocol)
 
+  esm_add_windows_version_resource(
+    esm_content_service "everything_sm content search service" "esm_content_service.exe")
+  esm_add_windows_version_resource(
+    esm_content "everything_sm content search" "esm_content.exe")
+  esm_add_windows_version_resource(
+    esm_content_cli "everything_sm content search client" "esm_content_cli.exe")
+
   if(ESM_BUILD_TESTS)
     add_executable(esm_content_tests tests/content_test.cpp)
     target_link_libraries(esm_content_tests PRIVATE
@@ -127,8 +188,7 @@ if(ESM_BUILD_CONTENT_SEARCH)
   endif()
   foreach(ESM_CONTENT_TARGET IN LISTS ESM_CONTENT_TARGETS)
     if(MSVC)
-      target_compile_options(${ESM_CONTENT_TARGET}
-          PRIVATE /W4 /permissive- /utf-8)
+      target_compile_options(${ESM_CONTENT_TARGET} PRIVATE /W4)
     else()
       target_compile_options(${ESM_CONTENT_TARGET}
           PRIVATE -Wall -Wextra -Wpedantic)

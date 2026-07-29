@@ -34,6 +34,23 @@
 #include <vector>
 namespace {
 void require(bool condition, const char* message) { if (!condition) throw std::runtime_error(message); }
+
+void remove_test_tree_with_retry(const std::filesystem::path& root) {
+    std::error_code error;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    do {
+        std::filesystem::remove_all(root, error);
+        if (!error) return;
+        if (error.value() != ERROR_SHARING_VIOLATION &&
+            error.value() != ERROR_ACCESS_DENIED)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    throw std::runtime_error(
+        "temporary test tree cleanup failed: " + error.message());
+}
 esm::FileRecord record(std::uint64_t id, std::wstring name, std::wstring path, bool directory = false) {
     esm::FileRecord value;
     value.id = id;
@@ -221,7 +238,7 @@ void test_multi_volume_snapshot_round_trip() {
             "multi-volume snapshot should round-trip");
     require(loaded.snapshot.volume != L"everything_sm-mft-multi-v2",
             "snapshot marker mismatch should be detectable");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_gui_settings() {
@@ -966,7 +983,7 @@ void test_direct_ntfs_change_metadata_hydration() {
                 rebuilt.front().last_write_time == 0,
             "invalidated USN metadata is not reused by reconciliation");
 
-    std::filesystem::remove_all(root_path);
+    remove_test_tree_with_retry(root_path);
 }
 
 void test_shared_directory_path_signatures() {
@@ -1155,7 +1172,7 @@ void test_efu_round_trip() {
                     actual[i].directory == expected[i].directory,
                 "EFU round trip record fields");
     }
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_saved_search_round_trip() {
@@ -1715,7 +1732,7 @@ void test_search_metadata_batch_hydration() {
     require(rejected_wrong_size,
             "search metadata batch rejects a mismatched success bitmap");
 
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_file_metadata_hydration() {
@@ -1747,7 +1764,7 @@ void test_file_metadata_hydration() {
     require(!esm::hydrate_file_metadata(missing) && missing.size == 77 &&
                 missing.last_write_time == 88,
             "failed metadata hydration preserves indexed values");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_ipc_protocol_round_trip() {
@@ -1850,6 +1867,30 @@ void test_pipe_search_diagnostics_format() {
             "pipe diagnostics should expose bounded phase metadata");
 }
 
+void test_named_pipe_security_policy() {
+    std::uint32_t error = ERROR_SUCCESS;
+    const auto sid = esm::current_process_user_sid(error);
+    require(error == ERROR_SUCCESS && sid.starts_with(L"S-1-"),
+            "current process SID should be available in string form");
+
+    const auto sddl = esm::local_pipe_security_sddl(sid);
+    require(!sddl.empty() && sddl.find(sid) != std::wstring::npos,
+            "pipe DACL should grant the selected user SID");
+    require(sddl.find(L";;;AU") == std::wstring::npos &&
+                sddl.find(L";;;SY") != std::wstring::npos &&
+                sddl.find(L";;;BA") != std::wstring::npos,
+            "pipe DACL should exclude all authenticated users while retaining system administrators");
+    require(esm::local_pipe_security_sddl(L"not-a-sid").empty(),
+            "pipe DACL should reject malformed SID strings");
+
+    esm::MetadataIndex index;
+    std::atomic_bool stop{false};
+    require(esm::serve_named_pipe_search(
+                L"everything_sm_invalid_sid_test", index, stop, 1, {},
+                L"not-a-sid") == ERROR_INVALID_SID,
+            "pipe server should reject malformed SID before starting workers");
+}
+
 void test_named_pipe_search() {
     const auto suffix = std::chrono::steady_clock::now()
                             .time_since_epoch().count();
@@ -1905,7 +1946,7 @@ void test_named_pipe_search() {
                 diagnostics.total_microseconds >=
                     diagnostics.search_microseconds,
             "named pipe search publishes protocol-independent phase timings");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_named_pipe_diagnostics_exception_isolated() {
@@ -2252,7 +2293,7 @@ void test_journal_replay_transaction() {
             "replay checkpoint journal id");
     require(checkpoint.checkpoint.next_usn == batch.next_usn,
             "replay checkpoint next usn");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_journal_checkpoint() {
@@ -2305,7 +2346,7 @@ void test_journal_checkpoint() {
     { std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
       file.seekp(16); const char corrupt = '\x7f'; file.write(&corrupt, 1); }
     require(!esm::load_checkpoint(path).ok, "corrupt checkpoint rejected");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_metadata_snapshot() {
@@ -2391,7 +2432,7 @@ void test_metadata_snapshot() {
     invalid.root_id = 0;
     require(!esm::save_metadata_snapshot_atomic(snapshot_path, invalid).ok,
             "invalid metadata snapshot rejected");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 
@@ -2495,7 +2536,7 @@ void test_mapped_metadata_snapshot() {
     std::filesystem::resize_file(snapshot_path, original_size - 1);
     require(!esm::load_metadata_snapshot_mapped(snapshot_path).ok,
             "truncated compact mapped snapshot rejected");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 
@@ -2548,7 +2589,7 @@ void test_streaming_catalog_snapshot() {
         root / L"pending.metadata", {91, 701}, 1, L"D:", restored);
     require(!rejected.ok && rejected.error == ERROR_INVALID_STATE,
             "streaming snapshot rejects uncompacted overlay");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_metadata_hydration_wal_recovery() {
@@ -2670,7 +2711,7 @@ void test_metadata_hydration_wal_recovery() {
                 clean_replay.transactions == 1,
             "metadata hydration WAL should replay cleanly after tail recovery");
 
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_mft_auto_state_round_trip() {
@@ -2757,7 +2798,7 @@ void test_mft_auto_state_round_trip() {
     require(!corrupted.ok && corrupted.error == ERROR_INVALID_DATA,
             "MFT auto state should reject checksum corruption");
 
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_bound_metadata_wal_recovery() {
@@ -2852,7 +2893,7 @@ void test_bound_metadata_wal_recovery() {
     require(!wrong_volume.ok && wrong_volume.error == ERROR_INVALID_DATA,
             "bound WAL rejects another volume identity");
 
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_index_checkpoint_materialization() {
@@ -2946,7 +2987,7 @@ void test_metadata_wal_recovery() {
     const auto reset = esm::reset_metadata_wal(wal_path);
     require(reset.ok && std::filesystem::file_size(wal_path) == 0,
             "WAL consolidation reset");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_snapshot_wal_checkpoint_crash_recovery() {
@@ -3014,7 +3055,7 @@ void test_snapshot_wal_checkpoint_crash_recovery() {
     require(esm::reset_metadata_wal(wal_path).ok &&
                 std::filesystem::file_size(wal_path) == 0,
             "checkpoint consolidation resets WAL after durable snapshot");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 struct ChildProcess {
@@ -3157,7 +3198,7 @@ void test_scan_server_reconciliation() {
                     exit_code == 0,
                 "scan server stops cleanly after CTRL_BREAK");
     }
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_directory_watcher() {
@@ -3232,11 +3273,28 @@ void test_directory_watcher() {
 
     const auto alpha = root / "alpha.txt";
     const auto beta = root / "beta.txt";
-    { std::ofstream(alpha) << "alpha"; }
+    {
+        std::ofstream output(alpha, std::ios::binary | std::ios::trunc);
+        output << "alpha";
+        output.close();
+        require(output.good(), "watcher test file should close before rename");
+    }
     wait_for_change(esm::DirectoryChangeAction::added, L"alpha.txt",
                     "watcher reports file creation");
 
-    std::filesystem::rename(alpha, beta);
+    std::error_code rename_error;
+    const auto rename_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(2);
+    do {
+        std::filesystem::rename(alpha, beta, rename_error);
+        if (!rename_error ||
+            (rename_error.value() != ERROR_SHARING_VIOLATION &&
+             rename_error.value() != ERROR_ACCESS_DENIED))
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < rename_deadline);
+    require(!rename_error,
+            "watcher test rename should outlive transient file scanners");
     wait_for_change(esm::DirectoryChangeAction::renamed_old_name,
                     L"alpha.txt", "watcher reports old rename name");
     wait_for_change(esm::DirectoryChangeAction::renamed_new_name,
@@ -3262,7 +3320,7 @@ void test_directory_watcher() {
                 std::chrono::seconds(2),
             "directory watcher cancellation should not deadlock");
     require(!overflowed, "small watcher test should not overflow");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 
 void test_scanner() {
@@ -3271,8 +3329,21 @@ void test_scanner() {
     const auto root = std::filesystem::temp_directory_path() /
         ("esm-test-" + std::to_string(suffix));
     std::filesystem::create_directories(root / "nested");
-    { std::ofstream(root / "alpha.txt") << "alpha";
-      std::ofstream(root / "nested" / "beta.md") << "beta"; }
+    {
+        std::ofstream alpha_output(root / "alpha.txt",
+                                   std::ios::binary | std::ios::trunc);
+        alpha_output << "alpha";
+        alpha_output.close();
+        require(alpha_output.good(),
+                "scanner alpha test file should close before scanning");
+
+        std::ofstream beta_output(root / "nested" / "beta.md",
+                                  std::ios::binary | std::ios::trunc);
+        beta_output << "beta";
+        beta_output.close();
+        require(beta_output.good(),
+                "scanner beta test file should close before scanning");
+    }
 
     const auto scan = esm::scan_directories({root});
     const auto second_scan = esm::scan_directories({root});
@@ -3310,12 +3381,12 @@ void test_scanner() {
             "scanner populates file size");
     require(alpha.last_write_time > 116444736000000000ll,
             "scanner uses Windows FILETIME timestamps");
-    std::filesystem::remove_all(root);
+    remove_test_tree_with_retry(root);
 }
 }
 int main() {
     try {
-        test_interactive_search_timing(); test_result_metadata_pipeline(); test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_pipe_search_diagnostics_format(); test_named_pipe_search(); test_named_pipe_diagnostics_exception_isolated(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_interactive_search_timing(); test_result_metadata_pipeline(); test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_pipe_search_diagnostics_format(); test_named_pipe_security_policy(); test_named_pipe_search(); test_named_pipe_diagnostics_exception_isolated(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

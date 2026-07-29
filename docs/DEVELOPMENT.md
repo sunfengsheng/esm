@@ -5,7 +5,7 @@
 - C++20
 - CMake 3.25+
 - Windows API / NTFS API
-- MinGW-w64 UCRT64（当前 CI 工具链）
+- MinGW-w64 UCRT64（当前 CI 工具链）或 MSVC + Windows SDK（辅助兼容构建）
 - NSIS 3.x（安装包）
 - PowerShell（构建、检查和 GUI 冒烟测试）
 
@@ -158,11 +158,17 @@ git status --short
 2. 安装 MSYS2 UCRT64；
 3. 配置和编译 Release；
 4. 运行测试；
-5. 构建 NSIS 安装包和 portable zip；
-6. 上传 artifact；
+5. 构建 NSIS 安装包；
+6. 上传安装包及 SHA-256 artifact；
 7. `vMAJOR.MINOR.PATCH` tag 发布 GitHub Release。
 
 当前未完成代码签名、自动升级和稳定 SDK 兼容承诺。
+
+主程序暂不生成 portable ZIP。原因是 portable 不注册多卷 SCM 服务，而当前 launcher/server 回退只能表达单个 `scan_root`；恢复 portable 发布前必须先实现明确的多根 provider/配置和对应自动测试，不能用默认 `C:\` 冒充全机索引。
+
+CMake 对全部 MSVC C++ target 统一应用 `/permissive-` 和 `/utf-8`；核心库及独立内容搜索 target 另外启用高警告级别。缺少 `/utf-8` 时 GUI 中的 UTF-8 中文字符串可能被 ACP 误解析，Windows SDK 中的旧 `small` 定义也不得用作源代码标识符。Windows EXE 版本资源由 `cmake/version.rc.in` 从 CMake 项目版本统一生成。`esm_service.exe` 还依赖 Windows message compiler（MSYS2 `windmc` 或 Windows SDK `mc.exe`）从 `src/apps/service/service_messages.mc` 生成 message table；缺少 message compiler 时配置应失败，而不是产出 Event Viewer 无法解释的服务二进制。Windows SDK `mc.exe` 与 `windmc` 都必须生成 `service_messages.h`、`service_messages.rc` 和 `MSG00409.bin`；修改 `.mc` 后至少用当前发布工具链验证一次生成和链接。目录 watcher 自动测试在 Windows 杀毒或索引器短暂占用刚创建文件时，仅对 `ERROR_SHARING_VIOLATION`/`ERROR_ACCESS_DENIED` 做最长 2 秒的有界重命名重试；这只是测试环境去抖，不应解释为 watcher 或搜索链路的性能指标。
+
+Windows 测试的临时目录清理使用相同错误白名单和 2 秒上限；scanner 测试还会在扫描前显式关闭并检查输出流。超过上限、持续句柄占用或其他错误仍必须使测试失败，不能用无限重试掩盖产品句柄泄漏。这些措施只是测试环境去抖，不应解释为 watcher、scanner 或搜索链路的性能指标。
 
 ## 10. 构建独立内容搜索原型
 

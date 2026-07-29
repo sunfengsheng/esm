@@ -42,13 +42,13 @@
 
 ### 服务与 IPC
 
-- Windows SCM 服务安装、启动、停止、状态和卸载。
+- Windows SCM 服务安装、启动、停止、状态和卸载；删除命令在 `DeleteService` 已报告 marked-for-delete 时仍会关闭句柄并等待 SCM 完成真实删除，避免升级立即重装竞态。
 - 本地 Named Pipe 版本化二进制协议。
 - 4 MiB payload、1000 结果上限、连接阶段超时/有限重试、精确读写。
 - 4 个并发 Pipe worker；每个已接收请求在 IPC v1 协议外记录读取、解析、索引搜索、编码、写回和总耗时。
 - SCM 服务对成功且总耗时不少于 100 ms 的请求以最多每 5 秒一条的频率写 Windows Event Log，并在下一条记录中汇总被抑制数量；诊断只包含查询字符数、请求选项、结果数和耗时，不保存查询文本、文件名或路径。
 - 当前客户端 `timeout_ms` 只限制连接 Pipe 的等待；连接成功后的同步读写和已进入 `MetadataIndex::search` 的服务端工作尚不能协作取消。GUI generation 会丢弃过期响应，但不会中断服务端 evaluator。
-- 拒绝远程客户端并设置显式 DACL。
+- 拒绝远程客户端并设置显式 DACL；前台 server 默认绑定当前进程用户 SID，SCM 服务把安装用户 SID 持久化到 ImagePath，仅向该用户授予 Pipe 查询读写，SYSTEM/Administrators 保留完全控制。SID/SDDL 会在 Pipe worker 启动前一次性校验，无效安全配置立即失败。旧 ImagePath 缺少 SID、包含未知命令或运行参数损坏时，服务会先向 SCM 注册并报告明确的停止错误及 Event Log 消息，不再让 SCM 等待到 1053 超时。
 
 ### GUI
 
@@ -82,7 +82,7 @@
 
 ### 安全和发布
 
-已有本地 Pipe DACL、NSIS、服务自启动、CI artifact、tag release 和受限慢查询 Event Log 诊断；仍缺 per-request impersonation、按用户搜索权限隔离、代码签名、自动升级、崩溃报告、文件日志轮转和稳定 SDK。
+已有绑定安装用户 SID 的本地 Pipe DACL、NSIS、服务自动/延迟启动、三级 SCM 故障重启、可读 Event Log message source、统一 EXE 版本资源、CI artifact、tag release 和受限慢查询诊断；仍缺 per-request impersonation、按文件 ACL 过滤、多用户安装模型、代码签名、自动升级、崩溃报告、文件日志轮转和稳定 SDK。
 
 ### 测试运行库基线
 
@@ -143,7 +143,19 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 
 ## 6. 发布判断
 
-当前可用于开发验证和个人机器试用，但还不应作为具备完整权限隔离、稳定升级、签名供应链和跨 provider 支持的企业级发布。任何状态变化都必须同步更新本文件和 `CHANGELOG.md`。
+2026-07-29 发布加固已完成代码与本机构建验证：
+
+- 主程序 EXE 统一从 CMake `project(VERSION)` 生成文件/产品版本资源；
+- 服务二进制嵌入 message table，安装/卸载路径负责注册/删除 `HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\everything_sm`；
+- 服务安装配置 automatic + delayed start、服务 SID 和 5 秒/30 秒/5 分钟故障重启；关键配置失败会回滚本次服务创建；
+- 文件名 Pipe 不再授权 `AU`，改为安装用户 SID + SYSTEM + Administrators；测试覆盖当前进程 SID、显式 DACL 和无效 SID；
+- NSIS 会区分 `mft-auto` 与 `compatibility` 安装状态，服务失败时要求重试或明确降级，并把快捷方式限制在安装用户；
+- CI 暂停生成 portable ZIP，只上传主 NSIS 安装包和校验文件。
+
+上述变更要求同时通过 MinGW Release、MSVC/Windows SDK 全目标构建、`esm_tests` 和 NSIS 编译；MSVC target 统一使用 `/utf-8`，并避开 Windows SDK `small` 标识符冲突。尚未在干净 Windows 用户/多用户矩阵中完成提升安装、SCM recovery、Event Viewer 消息和升级失败注入的端到端发布验证。安装器仍使用按进程名 `taskkill` 关闭旧 GUI/前台 server，也没有旧二进制备份与完整事务回滚。
+
+
+当前可用于开发验证和单用户个人机器试用；经过本轮加固后，默认本机 Pipe 不再向所有 Authenticated Users 开放，但仍不能作为具备 per-request ACL 过滤、多用户权限隔离、完整事务升级、签名供应链和跨 provider 支持的企业级发布。任何状态变化都必须同步更新本文件和 `CHANGELOG.md`。
 
 ## 7. 独立内容搜索原型（2026-07-26）
 

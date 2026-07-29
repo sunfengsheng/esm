@@ -235,9 +235,11 @@ struct App {
 App *app(HWND window) {
   return reinterpret_cast<App *>(GetWindowLongPtrW(window, GWLP_USERDATA));
 }
-HICON load_app_icon(HINSTANCE instance, bool small) {
-  const int width = GetSystemMetrics(small ? SM_CXSMICON : SM_CXICON);
-  const int height = GetSystemMetrics(small ? SM_CYSMICON : SM_CYICON);
+HICON load_app_icon(HINSTANCE instance, bool use_small_icon) {
+  const int width =
+      GetSystemMetrics(use_small_icon ? SM_CXSMICON : SM_CXICON);
+  const int height =
+      GetSystemMetrics(use_small_icon ? SM_CYSMICON : SM_CYICON);
   auto icon = reinterpret_cast<HICON>(LoadImageW(
       instance, MAKEINTRESOURCEW(IDI_ESM_APP), IMAGE_ICON, width, height,
       LR_DEFAULTCOLOR | LR_SHARED));
@@ -551,7 +553,7 @@ void remember(App &a, const std::wstring &q) {
   if (a.history.size() > 100)
     a.history.resize(100);
   if (a.search) {
-    const auto existing = SendMessageW(a.search, CB_FINDSTRINGEXACT, -1,
+    const auto existing = SendMessageW(a.search, CB_FINDSTRINGEXACT, static_cast<WPARAM>(-1),
                                        reinterpret_cast<LPARAM>(q.c_str()));
     if (existing != CB_ERR)
       SendMessageW(a.search, CB_DELETESTRING, existing, 0);
@@ -1846,7 +1848,6 @@ void start_metadata_hydration(App &a) {
         const auto worker_count = std::min<std::size_t>(
             requests.size(), std::clamp<std::size_t>(available == 0 ? 1 : available,
                                                      1, 4));
-        constexpr std::size_t claim_size = 16;
         std::vector<std::jthread> workers;
         workers.reserve(worker_count);
         for (std::size_t worker = 0; worker < worker_count; ++worker) {
@@ -1855,10 +1856,10 @@ void start_metadata_hydration(App &a) {
               if (cancel->load(std::memory_order_relaxed))
                 break;
               const auto begin =
-                  next.fetch_add(claim_size, std::memory_order_relaxed);
+                  next.fetch_add(16, std::memory_order_relaxed);
               if (begin >= requests.size())
                 break;
-              const auto end = std::min(begin + claim_size, requests.size());
+              const auto end = std::min(begin + 16, requests.size());
               for (auto index = begin; index < end; ++index) {
                 if (cancel->load(std::memory_order_relaxed))
                   break;
@@ -2820,7 +2821,7 @@ void controls(App &a) {
       0, WC_COMBOBOXW, nullptr,
       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN |
           CBS_AUTOHSCROLL,
-      0, 0, 0, 360, a.window, reinterpret_cast<HMENU>(SEARCH_ID), nullptr,
+      0, 0, 0, 360, a.window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(SEARCH_ID)), nullptr,
       nullptr);
   COMBOBOXINFO combo_info{sizeof(combo_info)};
   if (GetComboBoxInfo(a.search, &combo_info))
@@ -2833,7 +2834,7 @@ void controls(App &a) {
   a.filter = CreateWindowExW(
       0, WC_COMBOBOXW, nullptr,
       WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-      0, 0, 0, 240, a.window, reinterpret_cast<HMENU>(FILTER_ID), nullptr,
+      0, 0, 0, 240, a.window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(FILTER_ID)), nullptr,
       nullptr);
   constexpr const wchar_t *filter_names[] = {
       L"\u6240\u6709", L"\u97f3\u9891", L"\u538b\u7f29\u6587\u4ef6", L"\u6587\u6863", L"\u53ef\u6267\u884c\u6587\u4ef6", L"\u6587\u4ef6\u5939", L"\u56fe\u7247", L"\u89c6\u9891"};
@@ -2844,15 +2845,15 @@ void controls(App &a) {
       CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT |
                           LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
-                      0, 0, 0, 0, a.window, (HMENU)LIST_ID, nullptr, nullptr);
+                      0, 0, 0, 0, a.window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(LIST_ID)), nullptr, nullptr);
   a.preview = CreateWindowExW(
       WS_EX_CLIENTEDGE, WC_EDITW, nullptr,
       WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL |
           WS_VSCROLL | WS_HSCROLL,
-      0, 0, 0, 0, a.window, (HMENU)PREVIEW_ID, nullptr, nullptr);
+      0, 0, 0, 0, a.window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(PREVIEW_ID)), nullptr, nullptr);
   a.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"\u8bf7\u8f93\u5165\u67e5\u8be2",
                              WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0,
-                             a.window, (HMENU)STATUS_ID, nullptr, nullptr);
+                             a.window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(STATUS_ID)), nullptr, nullptr);
   SendMessageW(a.search, CB_SETCUEBANNER, 0,
                reinterpret_cast<LPARAM>(L"搜索文件和文件夹"));
   if (a.search_edit)

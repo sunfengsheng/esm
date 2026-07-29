@@ -27,6 +27,10 @@
 
 安装程序默认把程序安装到 `C:\Program Files\everything_sm`，把多卷索引存放到 `C:\ProgramData\everything_sm\indexes`。服务会自动发现带盘符的本地 NTFS 固定卷，包括 `C:`、`D:`、`E:` 等，不只搜索 C 盘。
 
+服务安装时会把发起安装的 Windows 用户 SID 写入 SCM 命令行，查询 Pipe 只允许该用户、SYSTEM 和 Administrators 访问；这适合当前单用户桌面发布，但还不是企业多用户权限隔离。安装器会配置 delayed-auto 和三级故障重启，并注册可读的 Windows Application Event Log source。若服务安装或启动失败，安装器会要求重试或明确继续为“兼容模式”，不会把它描述成完整服务安装成功。
+
+当前正式产物只包含需要 UAC 的 NSIS 安装包和 SHA-256；portable ZIP 已暂停发布，因为现有无服务回退只能配置一个扫描根，不能可靠表达 C/D/E 多卷语义。
+
 详细说明和故障排查见 [用户手册](docs/USER_GUIDE.md)。
 
 ### 从源码构建

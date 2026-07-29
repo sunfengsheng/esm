@@ -100,32 +100,12 @@ jobs:
           }
           .\packaging\build-installer.ps1 -BuildDirectory build-ci -Version $version -SkipBuild
 
-      - name: Build portable archive
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem -LiteralPath dist -Filter 'everything_sm-*-setup.exe' | Select-Object -First 1
-          if (-not $installer -or $installer.Name -notmatch '^everything_sm-(.+)-setup\.exe$') {
-            throw 'Unable to determine package version from installer name.'
-          }
-          $version = $Matches[1]
-          $stage = Join-Path $env:RUNNER_TEMP "everything_sm-$version-windows-x64"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          'esm_gui.exe','esm_launcher.exe','esm_server.exe','esm_service.exe','esm_cli.exe' | ForEach-Object {
-            Copy-Item -LiteralPath (Join-Path 'build-ci' $_) -Destination $stage
-          }
-          Copy-Item -LiteralPath README.md -Destination $stage
-          $archive = Join-Path (Resolve-Path dist) "everything_sm-$version-windows-x64.zip"
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal -Force
-          $hash = Get-FileHash -LiteralPath $archive -Algorithm SHA256
-          Set-Content -LiteralPath "$archive.sha256" -Encoding ascii -Value "$($hash.Hash)  $([IO.Path]::GetFileName($archive))"
-
       - name: Upload Windows packages
         uses: actions/upload-artifact@v7
         with:
           name: everything_sm-windows-${{ github.run_number }}
           path: |
             dist/*.exe
-            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
           compression-level: 0

@@ -73,6 +73,7 @@ Var ScanRootField
 Var ServiceCheckbox
 Var ServiceDataRoot
 Var ServiceDataDir
+Var ServiceInstallState
 Function .onInit
   ${IfNot} ${RunningX64}
     MessageBox MB_OK|MB_ICONSTOP "everything_sm 当前安装包仅支持 64 位 Windows。"
@@ -83,6 +84,7 @@ Function .onInit
   ${GetRoot} "$WINDIR" $0
   StrCpy $ScanRoot "$0\"
   StrCpy $InstallService "1"
+  StrCpy $ServiceInstallState "compatibility"
   ReadEnvStr $ServiceDataRoot "ProgramData"
   ${If} $ServiceDataRoot == ""
     StrCpy $ServiceDataRoot "$0\ProgramData"
@@ -132,15 +134,40 @@ FunctionEnd
 Section "安装 everything_sm" SEC_MAIN
   SectionIn RO
   SetRegView 64
-  SetShellVarContext all
 
-  ; Stop an older installed copy before replacing binaries.
-  IfFileExists "$INSTDIR\esm_service.exe" 0 +3
+  ; Only touch the service when SCM confirms that it exists. Compatibility-only
+  ; installs also contain esm_service.exe but do not register an SCM service.
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" query everything_sm'
+  Pop $0
+  ${If} $0 == "0"
+    IfFileExists "$INSTDIR\esm_service.exe" upgrade_stop_retry 0
+      MessageBox MB_OK|MB_ICONSTOP "SCM 中存在 everything_sm 服务，但安装目录缺少 esm_service.exe。为避免覆盖仍在运行或无法恢复的服务，本次升级已停止；请先修复或手动移除旧服务。"
+      SetErrorLevel 1
+      Quit
+    upgrade_stop_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" stop'
     Pop $0
-  IfFileExists "$INSTDIR\esm_service.exe" 0 +3
+    ${If} $0 != "0"
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法停止旧版 everything_sm 服务（错误码 $0）。请选择“重试”，或取消安装以保留现有版本。" IDRETRY upgrade_stop_retry
+      SetErrorLevel 1
+      Quit
+    ${EndIf}
+    upgrade_uninstall_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
     Pop $0
+    ${If} $0 != "0"
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法卸载旧版 everything_sm 服务（错误码 $0）。请选择“重试”，或取消安装以保留现有版本。" IDRETRY upgrade_uninstall_retry
+      SetErrorLevel 1
+      Quit
+    ${EndIf}
+  ${ElseIf} $0 != "1060"
+    MessageBox MB_OK|MB_ICONSTOP "无法确认旧版 everything_sm 服务状态（SCM 查询错误码 $0）。本次升级已停止，避免在服务状态未知时覆盖程序。"
+    SetErrorLevel 1
+    Quit
+  ${EndIf}
+
+  ; These process-name fallbacks are retained until the GUI exposes a
+  ; path-scoped graceful shutdown command. The limitation is documented.
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_gui.exe'
   Pop $0
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_server.exe'
@@ -156,31 +183,62 @@ Section "安装 everything_sm" SEC_MAIN
   File /oname=esm_cli.exe "${BUILD_DIR}\esm_cli.exe"
   File /oname=README.md "${PROJECT_ROOT}\README.md"
 
-  WriteINIStr "$INSTDIR\everything_sm.ini" "search" "scan_root" "$ScanRoot"
-  WriteINIStr "$INSTDIR\everything_sm.ini" "search" "pipe_name" "${PRODUCT_PIPE}"
-
+  StrCpy $ServiceInstallState "compatibility"
   ${If} $InstallService == ${BST_CHECKED}
     CreateDirectory "$ServiceDataRoot\everything_sm"
     CreateDirectory "$ServiceDataDir"
+    service_install_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" install-mft-auto "$ServiceDataDir" "${PRODUCT_PIPE}"'
     Pop $0
-    ${If} $0 == "0"
-      nsExec::ExecToLog '"$SYSDIR\sc.exe" config everything_sm start= delayed-auto'
+    ${If} $0 != "0"
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务安装失败（错误码 $0）。请选择“重试”；取消后会先确认并清理可能残留的服务，再明确安装为兼容模式。" IDRETRY service_install_retry
+      nsExec::ExecToLog '"$SYSDIR\sc.exe" query everything_sm'
       Pop $1
-      nsExec::ExecToLog '"$INSTDIR\esm_service.exe" start'
+      ${If} $1 == "0"
+        service_install_cleanup_retry:
+        nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
+        Pop $1
+        ${If} $1 != "0"
+          MessageBox MB_RETRYCANCEL|MB_ICONSTOP "服务安装失败后仍存在残留服务，清理返回错误码 $1。请选择“重试”；取消将停止安装。" IDRETRY service_install_cleanup_retry
+          SetErrorLevel 1
+          Quit
+        ${EndIf}
+      ${ElseIf} $1 != "1060"
+        MessageBox MB_OK|MB_ICONSTOP "服务安装失败后无法确认 SCM 清理状态（查询错误码 $1）。本次安装已停止。"
+        SetErrorLevel 1
+        Quit
+      ${EndIf}
+      Goto service_configuration_done
+    ${EndIf}
+
+    service_start_retry:
+    nsExec::ExecToLog '"$INSTDIR\esm_service.exe" start'
+    Pop $0
+    ${If} $0 != "0"
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务启动失败（错误码 $0）。请选择“重试”；取消后会移除失败服务并使用兼容模式。" IDRETRY service_start_retry
+      service_cleanup_retry:
+      nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
       Pop $1
       ${If} $1 != "0"
-        MessageBox MB_OK|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务已安装，但启动失败（错误码 $1）。启动器将自动使用兼容模式。"
+        MessageBox MB_RETRYCANCEL|MB_ICONSTOP "失败服务清理未完成（错误码 $1）。请选择“重试”；取消将停止安装，避免把残留服务误报为兼容模式。" IDRETRY service_cleanup_retry
+        SetErrorLevel 1
+        Quit
       ${EndIf}
-    ${Else}
-      MessageBox MB_OK|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务安装失败（错误码 $0）。核心程序仍已安装，将自动使用兼容模式。"
+      Goto service_configuration_done
     ${EndIf}
+    StrCpy $ServiceInstallState "mft-auto"
   ${EndIf}
+  service_configuration_done:
+
+  WriteINIStr "$INSTDIR\everything_sm.ini" "search" "scan_root" "$ScanRoot"
+  WriteINIStr "$INSTDIR\everything_sm.ini" "search" "pipe_name" "${PRODUCT_PIPE}"
+  WriteINIStr "$INSTDIR\everything_sm.ini" "search" "service_mode" "$ServiceInstallState"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "ScanRoot" "$ScanRoot"
+  WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "ServiceMode" "$ServiceInstallState"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayName" "${PRODUCT_NAME}"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
@@ -190,6 +248,12 @@ Section "安装 everything_sm" SEC_MAIN
   WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "NoRepair" 1
 
+  ; Remove legacy all-users shortcuts, then expose the single-user service only
+  ; to the account whose SID was captured during installation.
+  SetShellVarContext all
+  Delete "$DESKTOP\everything_sm.lnk"
+  RMDir /r "$SMPROGRAMS\everything_sm"
+  SetShellVarContext current
   CreateDirectory "$SMPROGRAMS\everything_sm"
   CreateShortcut "$SMPROGRAMS\everything_sm\everything_sm.lnk" "$INSTDIR\esm_launcher.exe" "" "$INSTDIR\esm_gui.exe" 0 SW_SHOWNORMAL "" "快速文件搜索"
   CreateShortcut "$SMPROGRAMS\everything_sm\卸载 everything_sm.lnk" "$INSTDIR\Uninstall.exe"
@@ -198,7 +262,7 @@ SectionEnd
 
 Function un.onInit
   SetRegView 64
-  SetShellVarContext all
+  SetShellVarContext current
   ReadEnvStr $ServiceDataRoot "ProgramData"
   ${If} $ServiceDataRoot == ""
     ${GetRoot} "$WINDIR" $0
@@ -208,14 +272,36 @@ FunctionEnd
 
 Section "Uninstall"
   SetRegView 64
-  SetShellVarContext all
+  SetShellVarContext current
 
-  IfFileExists "$INSTDIR\esm_service.exe" 0 +3
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" query everything_sm'
+  Pop $0
+  ${If} $0 == "0"
+    IfFileExists "$INSTDIR\esm_service.exe" uninstall_stop_retry 0
+      MessageBox MB_OK|MB_ICONSTOP "SCM 中仍存在 everything_sm 服务，但卸载程序找不到 esm_service.exe。为避免留下不可恢复的服务，本次卸载已停止。"
+      SetErrorLevel 1
+      Quit
+    uninstall_stop_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" stop'
     Pop $0
-  IfFileExists "$INSTDIR\esm_service.exe" 0 +3
+    ${If} $0 != "0"
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法停止 everything_sm 服务（错误码 $0）。请选择“重试”，或取消卸载。" IDRETRY uninstall_stop_retry
+      SetErrorLevel 1
+      Quit
+    ${EndIf}
+    uninstall_service_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
     Pop $0
+    ${If} $0 != "0"
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法删除 everything_sm 服务（错误码 $0）。请选择“重试”，或取消卸载。" IDRETRY uninstall_service_retry
+      SetErrorLevel 1
+      Quit
+    ${EndIf}
+  ${ElseIf} $0 != "1060"
+    MessageBox MB_OK|MB_ICONSTOP "无法确认 everything_sm 服务状态（SCM 查询错误码 $0）。本次卸载已停止。"
+    SetErrorLevel 1
+    Quit
+  ${EndIf}
 
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_gui.exe'
   Pop $0
@@ -226,6 +312,10 @@ Section "Uninstall"
 
   Delete "$DESKTOP\everything_sm.lnk"
   RMDir /r "$SMPROGRAMS\everything_sm"
+  SetShellVarContext all
+  Delete "$DESKTOP\everything_sm.lnk"
+  RMDir /r "$SMPROGRAMS\everything_sm"
+  SetShellVarContext current
 
   DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
   DeleteRegKey HKLM "${PRODUCT_DIR_REGKEY}"

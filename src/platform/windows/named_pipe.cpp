@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -154,7 +156,74 @@ Handle connect_to_pipe(std::wstring_view pipe_name,
         }
     }
 }
+
+std::uint64_t elapsed_microseconds(
+    std::chrono::steady_clock::time_point started,
+    std::chrono::steady_clock::time_point finished =
+        std::chrono::steady_clock::now()) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(finished - started)
+            .count());
+}
+
+void publish_diagnostics(const PipeSearchDiagnosticsSink& sink,
+                         const PipeSearchDiagnostics& diagnostics) noexcept {
+    if (!sink) return;
+    try {
+        sink(diagnostics);
+    } catch (...) {
+        // Diagnostics must never terminate a pipe worker or make search fail.
+    }
+}
+
+const wchar_t* sort_field_name(SortField field) {
+    switch (field) {
+    case SortField::relevance: return L"relevance";
+    case SortField::name: return L"name";
+    case SortField::path: return L"path";
+    case SortField::size: return L"size";
+    case SortField::last_write_time: return L"last_write_time";
+    case SortField::attributes: return L"attributes";
+    case SortField::extension: return L"extension";
+    case SortField::type: return L"type";
+    case SortField::creation_time: return L"creation_time";
+    case SortField::last_access_time: return L"last_access_time";
+    case SortField::change_time: return L"change_time";
+    case SortField::run_count: return L"run_count";
+    case SortField::last_open_time: return L"last_open_time";
+    case SortField::file_list_name: return L"file_list_name";
+    }
+    return L"unknown";
+}
 } // namespace
+
+std::wstring format_pipe_search_diagnostics(
+    const PipeSearchDiagnostics& diagnostics) {
+    const auto milliseconds = [](std::uint64_t microseconds) {
+        return static_cast<double>(microseconds) / 1000.0;
+    };
+    std::wostringstream message;
+    message << std::fixed << std::setprecision(3)
+            << L"Slow search: request=" << diagnostics.request_id
+            << L", total_ms=" << milliseconds(diagnostics.total_microseconds)
+            << L", read_ms=" << milliseconds(diagnostics.read_microseconds)
+            << L", decode_ms=" << milliseconds(diagnostics.decode_microseconds)
+            << L", search_ms=" << milliseconds(diagnostics.search_microseconds)
+            << L", encode_ms=" << milliseconds(diagnostics.encode_microseconds)
+            << L", write_ms=" << milliseconds(diagnostics.write_microseconds)
+            << L", results=" << diagnostics.result_count
+            << L", limit=" << diagnostics.requested_limit
+            << L", query_chars=" << diagnostics.query_characters
+            << L", sort=" << sort_field_name(diagnostics.sort)
+            << (diagnostics.descending ? L" desc" : L" asc")
+            << L", flags="
+            << (diagnostics.case_sensitive ? L"case," : L"")
+            << (diagnostics.match_path ? L"path," : L"name,")
+            << (diagnostics.whole_word ? L"whole-word," : L"")
+            << (diagnostics.match_diacritics ? L"diacritics" : L"fold-diacritics")
+            << L", error=" << diagnostics.error;
+    return message.str();
+}
 
 std::wstring normalize_pipe_name(std::wstring_view name) {
     constexpr std::wstring_view prefix = L"\\\\.\\pipe\\";
@@ -162,8 +231,9 @@ std::wstring normalize_pipe_name(std::wstring_view name) {
     return std::wstring(prefix) + std::wstring(name);
 }
 
-std::uint32_t serve_named_pipe_search_once(std::wstring_view pipe_name,
-                                           const MetadataIndex& index) {
+std::uint32_t serve_named_pipe_search_once(
+    std::wstring_view pipe_name, const MetadataIndex& index,
+    const PipeSearchDiagnosticsSink& diagnostics_sink) {
     const auto normalized = normalize_pipe_name(pipe_name);
     LocalSecurityDescriptor descriptor;
     SECURITY_ATTRIBUTES security{};
@@ -183,15 +253,22 @@ std::uint32_t serve_named_pipe_search_once(std::wstring_view pipe_name,
         if (error != ERROR_PIPE_CONNECTED) return error;
     }
 
+    const auto request_started = std::chrono::steady_clock::now();
+    PipeSearchDiagnostics diagnostics;
     IpcFrame frame;
     std::string protocol_error;
     std::uint32_t io_error = ERROR_SUCCESS;
+    const auto read_started = std::chrono::steady_clock::now();
     if (!read_frame(pipe.value, frame, protocol_error, io_error)) {
         DisconnectNamedPipe(pipe.value);
         return io_error;
     }
+    diagnostics.read_microseconds = elapsed_microseconds(read_started);
+    diagnostics.request_id = frame.header.request_id;
 
     IpcSearchResponse response;
+    bool decode_timing_recorded = false;
+    const auto decode_started = std::chrono::steady_clock::now();
     if (frame.header.type != IpcMessageType::search_request) {
         response.error = ERROR_INVALID_DATA;
     } else {
@@ -199,47 +276,79 @@ std::uint32_t serve_named_pipe_search_once(std::wstring_view pipe_name,
         if (!decode_search_request(frame.payload, request, protocol_error)) {
             response.error = ERROR_INVALID_DATA;
         } else {
+            diagnostics.requested_limit = request.limit;
+            diagnostics.query_characters = request.query.size();
+            diagnostics.case_sensitive = request.case_sensitive;
+            diagnostics.match_path = request.match_path;
+            diagnostics.whole_word = request.whole_word;
+            diagnostics.match_diacritics = request.match_diacritics;
+            diagnostics.sort = request.sort;
+            diagnostics.descending = request.descending;
+            diagnostics.decode_microseconds = elapsed_microseconds(decode_started);
+            decode_timing_recorded = true;
+
             SearchOptions options;
             options.limit = request.limit;
             options.case_sensitive = request.case_sensitive;
             options.match_path = request.match_path;
             options.whole_word = request.whole_word;
-    options.match_diacritics = request.match_diacritics;
+            options.match_diacritics = request.match_diacritics;
             options.sort = request.sort;
             options.descending = request.descending;
-            const auto started = std::chrono::steady_clock::now();
+            const auto search_started = std::chrono::steady_clock::now();
             response.results = index.search(request.query, options);
             // Keep the query hot path metadata-only. Filesystem stat calls can
             // block on sleeping disks, unavailable volumes, cloud placeholders,
             // or antivirus and must not delay the first result batch. The GUI
             // hydrates returned rows asynchronously after typing settles.
-            response.elapsed_microseconds = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - started).count());
+            diagnostics.search_microseconds =
+                elapsed_microseconds(search_started);
+            response.elapsed_microseconds = diagnostics.search_microseconds;
         }
     }
+    if (!decode_timing_recorded)
+        diagnostics.decode_microseconds = elapsed_microseconds(decode_started);
 
+    std::vector<std::uint8_t> response_frame;
     try {
+        const auto encode_started = std::chrono::steady_clock::now();
         const auto payload = encode_search_response(response);
-        const auto response_frame = encode_ipc_frame(
+        response_frame = encode_ipc_frame(
             IpcMessageType::search_response, frame.header.request_id, payload);
-        if (!write_exact(pipe.value, response_frame, io_error)) {
-            DisconnectNamedPipe(pipe.value);
-            return io_error;
-        }
-        FlushFileBuffers(pipe.value);
+        diagnostics.encode_microseconds = elapsed_microseconds(encode_started);
     } catch (const std::exception&) {
+        diagnostics.error = ERROR_BUFFER_OVERFLOW;
+        diagnostics.result_count = response.results.size();
+        diagnostics.total_microseconds = elapsed_microseconds(request_started);
+        publish_diagnostics(diagnostics_sink, diagnostics);
         DisconnectNamedPipe(pipe.value);
         return ERROR_BUFFER_OVERFLOW;
     }
+
+    const auto write_started = std::chrono::steady_clock::now();
+    if (!write_exact(pipe.value, response_frame, io_error)) {
+        diagnostics.write_microseconds = elapsed_microseconds(write_started);
+        diagnostics.error = io_error;
+        diagnostics.result_count = response.results.size();
+        diagnostics.total_microseconds = elapsed_microseconds(request_started);
+        publish_diagnostics(diagnostics_sink, diagnostics);
+        DisconnectNamedPipe(pipe.value);
+        return io_error;
+    }
+    FlushFileBuffers(pipe.value);
+    diagnostics.write_microseconds = elapsed_microseconds(write_started);
+    diagnostics.error = response.error;
+    diagnostics.result_count = response.results.size();
+    diagnostics.total_microseconds = elapsed_microseconds(request_started);
+    publish_diagnostics(diagnostics_sink, diagnostics);
     DisconnectNamedPipe(pipe.value);
     return ERROR_SUCCESS;
 }
 
-std::uint32_t serve_named_pipe_search(std::wstring_view pipe_name,
-                                      const MetadataIndex& index,
-                                      std::atomic_bool& stop,
-                                      std::size_t worker_count) {
+std::uint32_t serve_named_pipe_search(
+    std::wstring_view pipe_name, const MetadataIndex& index,
+    std::atomic_bool& stop, std::size_t worker_count,
+    PipeSearchDiagnosticsSink diagnostics) {
     if (worker_count == 0) return ERROR_INVALID_PARAMETER;
 
     std::atomic<std::uint32_t> fatal_error{ERROR_SUCCESS};
@@ -248,7 +357,8 @@ std::uint32_t serve_named_pipe_search(std::wstring_view pipe_name,
     for (std::size_t i = 0; i < worker_count; ++i) {
         workers.emplace_back([&, pipe = std::wstring(pipe_name)] {
             while (!stop.load(std::memory_order_relaxed)) {
-                const auto error = serve_named_pipe_search_once(pipe, index);
+                const auto error =
+                    serve_named_pipe_search_once(pipe, index, diagnostics);
                 if (stop.load(std::memory_order_relaxed)) break;
                 // Client disconnects and malformed requests affect only that
                 // connection. Pipe creation/security failures are host-fatal.

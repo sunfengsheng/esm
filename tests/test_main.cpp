@@ -1821,6 +1821,35 @@ void test_ipc_protocol_round_trip() {
             "IPC corrupt magic rejected");
 }
 
+void test_pipe_search_diagnostics_format() {
+    esm::PipeSearchDiagnostics diagnostics;
+    diagnostics.request_id = 77;
+    diagnostics.requested_limit = 1000;
+    diagnostics.query_characters = 4096;
+    diagnostics.result_count = 321;
+    diagnostics.match_path = true;
+    diagnostics.whole_word = true;
+    diagnostics.match_diacritics = false;
+    diagnostics.sort = esm::SortField::last_write_time;
+    diagnostics.descending = true;
+    diagnostics.read_microseconds = 1'000;
+    diagnostics.decode_microseconds = 2'000;
+    diagnostics.search_microseconds = 125'500;
+    diagnostics.encode_microseconds = 3'000;
+    diagnostics.write_microseconds = 4'000;
+    diagnostics.total_microseconds = 135'500;
+
+    const auto message = esm::format_pipe_search_diagnostics(diagnostics);
+    require(message.find(L"request=77") != std::wstring::npos &&
+                message.find(L"total_ms=135.500") != std::wstring::npos &&
+                message.find(L"search_ms=125.500") != std::wstring::npos &&
+                message.find(L"query_chars=4096") != std::wstring::npos &&
+                message.find(L"sort=last_write_time desc") != std::wstring::npos &&
+                message.find(L"path,whole-word,fold-diacritics") !=
+                    std::wstring::npos,
+            "pipe diagnostics should expose bounded phase metadata");
+}
+
 void test_named_pipe_search() {
     const auto suffix = std::chrono::steady_clock::now()
                             .time_since_epoch().count();
@@ -1843,8 +1872,13 @@ void test_named_pipe_search() {
                            std::to_wstring(GetCurrentProcessId()) + L"_" +
                            std::to_wstring(suffix);
     std::uint32_t server_error = ERROR_SUCCESS;
+    esm::PipeSearchDiagnostics diagnostics;
     std::thread server([&] {
-        server_error = esm::serve_named_pipe_search_once(pipe_name, index);
+        server_error = esm::serve_named_pipe_search_once(
+            pipe_name, index,
+            [&](const esm::PipeSearchDiagnostics& value) {
+                diagnostics = value;
+            });
     });
 
     esm::IpcSearchRequest request;
@@ -1861,7 +1895,48 @@ void test_named_pipe_search() {
                 result.response.results.front().record.size == 0 &&
                 result.response.results.front().record.last_write_time == 0,
             "named pipe search avoids blocking filesystem metadata hydration");
+    require(diagnostics.request_id == 1 &&
+                diagnostics.error == ERROR_SUCCESS &&
+                diagnostics.requested_limit == 10 &&
+                diagnostics.query_characters == request.query.size() &&
+                diagnostics.result_count == 1 && diagnostics.match_path &&
+                diagnostics.search_microseconds ==
+                    result.response.elapsed_microseconds &&
+                diagnostics.total_microseconds >=
+                    diagnostics.search_microseconds,
+            "named pipe search publishes protocol-independent phase timings");
     std::filesystem::remove_all(root);
+}
+
+void test_named_pipe_diagnostics_exception_isolated() {
+    esm::MetadataIndex index;
+    std::vector<esm::FileRecord> records;
+    records.push_back(record(1, L"alpha.txt", L"D:\\alpha.txt"));
+    index.replace(std::move(records));
+
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto pipe_name = L"everything_sm_diagnostics_throw_" +
+                           std::to_wstring(GetCurrentProcessId()) + L"_" +
+                           std::to_wstring(suffix);
+    std::uint32_t server_error = ERROR_SUCCESS;
+    std::thread server([&] {
+        server_error = esm::serve_named_pipe_search_once(
+            pipe_name, index,
+            [](const esm::PipeSearchDiagnostics&) {
+                throw std::runtime_error("diagnostics failure");
+            });
+    });
+
+    esm::IpcSearchRequest request;
+    request.limit = 10;
+    request.query = L"alpha";
+    const auto result = esm::query_named_pipe_search(pipe_name, request, 5000);
+    server.join();
+
+    require(server_error == ERROR_SUCCESS && result.error == ERROR_SUCCESS &&
+                result.response.results.size() == 1,
+            "diagnostics exceptions must not fail pipe search");
 }
 
 void test_named_pipe_missing_server_error() {
@@ -1891,10 +1966,15 @@ void test_named_pipe_concurrent_search() {
                            std::to_wstring(GetCurrentProcessId()) + L"_" +
                            std::to_wstring(suffix);
     std::atomic_bool stop{false};
+    std::atomic_size_t observed{0};
     std::uint32_t server_error = ERROR_SUCCESS;
     std::thread server([&] {
         server_error = esm::serve_named_pipe_search(
-            pipe_name, index, stop, 4);
+            pipe_name, index, stop, 4,
+            [&](const esm::PipeSearchDiagnostics& diagnostics) {
+                if (diagnostics.error == ERROR_SUCCESS)
+                    observed.fetch_add(1, std::memory_order_relaxed);
+            });
     });
 
     constexpr std::size_t client_count = 12;
@@ -1917,6 +1997,8 @@ void test_named_pipe_concurrent_search() {
 
     require(server_error == ERROR_SUCCESS,
             "concurrent named pipe server shutdown");
+    require(observed.load(std::memory_order_relaxed) == client_count,
+            "concurrent pipe diagnostics should observe every completed query");
     for (std::size_t i = 0; i < results.size(); ++i) {
         require(results[i].error == ERROR_SUCCESS,
                 "concurrent named pipe client request");
@@ -3233,7 +3315,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_interactive_search_timing(); test_result_metadata_pipeline(); test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_interactive_search_timing(); test_result_metadata_pipeline(); test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_pipe_search_diagnostics_format(); test_named_pipe_search(); test_named_pipe_diagnostics_exception_isolated(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

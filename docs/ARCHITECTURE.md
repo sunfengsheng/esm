@@ -217,12 +217,17 @@ Named Pipe 使用项目自有版本化二进制 frame：
 - 4 MiB payload 上限；
 - 1000 结果上限；
 - exact read/write；
-- 客户端超时和有限重试；
+- 客户端连接阶段超时和有限重试；
 - `PIPE_REJECT_REMOTE_CLIENTS`；
 - 显式 DACL；
 - foreground server 与 SCM service 各使用 4 个 worker/pipe instance。
+- `IpcSearchResponse::elapsed_microseconds` 继续只表示 `MetadataIndex::search` 时间，wire format 保持 IPC v1；
+- 每个 worker 在协议外生成 `PipeSearchDiagnostics`，分别测量 frame 读取、请求解码、索引搜索、响应编码、写回/flush 和连接后总耗时；observer 异常会被隔离，不能使查询失败；
+- SCM service 仅对 `error=ERROR_SUCCESS` 且总耗时不少于 100 ms 的请求写 Event Log，并限制为最多每 5 秒一条、在下一条中附带 `suppressed_since_last`；结构不包含原始 query，只记录字符数、flags、sort、limit 和结果数，避免把文件名或路径泄漏到日志。
 
 当前服务在 SYSTEM 权限下读取机器目录，但没有为每个查询 impersonate 调用用户，也没有按用户令牌过滤结果。安全边界详见 [OPERATIONS.md](OPERATIONS.md)。
+
+当前同步取消边界：`query_named_pipe_search(..., timeout_ms)` 的超时参数只约束连接 Pipe 的等待。连接建立后，frame 读写和 `MetadataIndex::search` 仍是同步调用；客户端关闭、GUI generation 过期或客户端线程返回都不能让已经进入 evaluator 的服务端查询立即停止。GUI 保持最多一个查询在途并丢弃旧 generation 响应，避免每次按键触发取消风暴，但真正的服务端取消仍需要 request generation/session 状态和 evaluator stop token，不能使用 `TerminateThread` 之类的强制终止。
 
 ## 10. GUI 查询流水线
 

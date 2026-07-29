@@ -129,7 +129,7 @@ Pipe 名标准化为：
 - 只接受本机客户端（`PIPE_REJECT_REMOTE_CLIENTS`）；
 - 单帧 payload 上限 4 MiB；
 - 单次结果上限 1000；
-- 精确读写、超时和重试；
+- 精确读写、连接阶段超时和有限重试；
 - SYSTEM/Administrators 完全控制；
 - Authenticated Users 可进行本地 Pipe 读写查询。
 
@@ -139,10 +139,21 @@ Pipe 名标准化为：
 
 服务使用 Windows Event Log 写入错误、警告和主要生命周期事件。多卷建库/协调会先记录 `name index published; background metadata hydration scheduled`；后台任务每检查约 250,000 条记录进度，并在完成或服务停止时报告 `examined`、`attempted`、`hydrated`、`errors`、`applied`、`stale`、`elapsed` 以及 `WAL=enabled`/`WAL=disabled`。`hydrated` 是文件系统读取成功数，`applied` 是路径仍匹配并完成合并的记录数；读取失败保留原值，过期路径计为 `stale`。WAL 写入失败会记录警告并继续内存补齐，但该批次不能保证在重启后恢复。可在事件查看器的 Windows 日志中查找来源 `everything_sm`，或用 PowerShell：
 
+文件名 SCM 服务还会对成功且连接后总耗时不少于 100 ms 的查询记录 `Slow search:` 警告。为避免连续输入或自动客户端刷满 Application 日志，同一服务进程最多每 5 秒记录一条，期间被抑制的慢查询数会在下一条的 `suppressed_since_last` 字段汇总。字段包括 `total_ms`、`read_ms`、`decode_ms`、`search_ms`、`encode_ms`、`write_ms`、结果数、limit、query 字符数、排序和匹配 flags。日志结构刻意不保存原始 query、文件名或路径。100 ms 是当前固定保守阈值，不是性能 SLA；`total_ms` 从服务端接受连接后开始，不包含客户端排队等待、GUI 防抖、窗口消息调度、ListView 绘制或 Shell 图标加载。
+
 ```powershell
 Get-WinEvent -LogName Application -MaxEvents 200 |
   Where-Object ProviderName -eq 'everything_sm'
+
+# 仅查看慢查询，并展开分阶段耗时
+Get-WinEvent -LogName Application -MaxEvents 1000 |
+  Where-Object {
+    $_.ProviderName -eq 'everything_sm' -and
+    $_.Message -like 'Slow search:*'
+  } | Select-Object TimeCreated,Message
 ```
+
+注意：当前查询 API 的 `timeout_ms` 只约束连接 Pipe 的等待。连接成功后的同步读写以及已进入索引 evaluator 的查询没有服务端协作取消；客户端超时或 GUI 丢弃过期 generation 不等于服务端查询已经停止。若慢查询持续出现，应先根据 `search_ms` 与编码/写回阶段区分索引 evaluator 和传输问题，不要通过强杀服务线程处理。
 
 快速诊断：
 

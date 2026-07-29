@@ -451,4 +451,10 @@ ctest --test-dir build-ucrt-vendor-final -C Release --output-on-failure
 - 首个输入仍使用 15 ms 防抖；150 ms 内的后续输入使用 60 ms 防抖，以合并快速输入突发。少于 200 条的首屏直接视为完整；只有刚好达到 200 条且最终上限更大时才显示 `+` 并安排 refinement。
 - 客户端仍保持最多一个同步 Named Pipe 查询在途，不会在每个按键上调用 `CancelSynchronousIo`；这避免取消风暴占满服务端 worker，但一个已经开始的慢查询仍可能增加最新输入的尾部延迟。
 - 默认名称、路径、大小、修改时间和类型视图不再触发最终结果的无条件完整文件系统 hydration；只为修改时间仍未知的结果构建轻量请求。按创建时间、访问时间或 NTFS Change 时间排序时才读取全部结果路径，并最多使用 4 个 worker。
-- 下一步仍需要可取消的服务端 query generation、Named Pipe/反序列化/列表重绘分阶段计时，以及真实 GUI 连续输入 p50/p95。当前优化不能被描述为 Everything 100% 性能兼容。
+- Named Pipe 服务端现已在 IPC v1 协议外记录 frame 读取、请求解析、`MetadataIndex::search`、响应编码、写回/flush 和连接后总耗时；SCM 服务只把成功且总耗时不少于 100 ms 的样本按最多每 5 秒一条写 Event Log，并汇总期间被抑制的样本数。仍缺 GUI 防抖/线程调度/ListView 重绘/图标加载的客户端阶段，以及可取消的服务端 query generation 和真实连续输入 p50/p95。当前诊断能力不能被描述为性能提升或 Everything 100% 性能兼容。
+
+### 13.6 服务端分阶段诊断的验证方法与边界
+
+2026-07-29 的自动测试通过真实本地 Named Pipe 请求验证 observer 会得到 request id、limit、query 字符数、flags、结果数以及各阶段计时，并在 12 个并发客户端/4 个 Pipe worker 场景中为每个成功请求回调一次；格式测试验证毫秒换算和排序/flags 输出。测试数据只有 2 条内存记录，目的仅是验证诊断字段、线程调用和 IPC v1 兼容边界，不是查询吞吐或延迟基准。
+
+`search_ms` 与客户端响应中的 `elapsed_microseconds` 同源，只覆盖索引查询；`total_ms` 从服务端连接建立后开始并包含协议处理和写回，不包含客户端连接排队、GUI debounce、窗口线程调度、列表绘制、Shell 图标或异步元数据补齐。尚未采集真实 330 万记录上的分阶段 p50/p95，因此本轮没有发布新的性能数字，也不能从新增日志推导“搜索已经变快”。

@@ -33,6 +33,8 @@ namespace {
 constexpr wchar_t service_name[] = L"everything_sm";
 constexpr wchar_t service_display_name[] = L"everything_sm Search Service";
 constexpr wchar_t default_pipe_name[] = L"everything_sm";
+constexpr std::uint64_t slow_query_threshold_microseconds = 100'000;
+constexpr auto slow_query_log_interval = std::chrono::seconds(5);
 constexpr DWORD service_wait_timeout_ms = 120'000;
 constexpr auto snapshot_refresh_interval = std::chrono::minutes(5);
 constexpr std::size_t snapshot_refresh_changes = 100'000;
@@ -96,6 +98,36 @@ void log_event(WORD type, std::wstring_view message) {
     LPCWSTR strings[] = {stable.c_str()};
     ReportEventW(source, type, 0, 1, nullptr, 1, 0, strings, nullptr);
     DeregisterEventSource(source);
+}
+
+void log_pipe_search_diagnostics(
+    const esm::PipeSearchDiagnostics& diagnostics) {
+    if (diagnostics.error != ERROR_SUCCESS ||
+        diagnostics.total_microseconds < slow_query_threshold_microseconds) {
+        return;
+    }
+
+    static std::mutex mutex;
+    static auto last_logged = std::chrono::steady_clock::time_point{};
+    static std::size_t suppressed{};
+    std::wstring message;
+    {
+        std::lock_guard lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (last_logged != std::chrono::steady_clock::time_point{} &&
+            now - last_logged < slow_query_log_interval) {
+            ++suppressed;
+            return;
+        }
+        message = esm::format_pipe_search_diagnostics(diagnostics);
+        if (suppressed != 0) {
+            message += L", suppressed_since_last=" +
+                       std::to_wstring(suppressed);
+            suppressed = 0;
+        }
+        last_logged = now;
+    }
+    log_event(EVENTLOG_WARNING_TYPE, message);
 }
 
 void report_service_status(DWORD state, DWORD win32_error = ERROR_SUCCESS,
@@ -1248,7 +1280,8 @@ void run_mft_auto_service() {
     });
 
     const auto pipe_error = esm::serve_named_pipe_search(
-        configuration.pipe_name, index, runtime.stop, 4);
+        configuration.pipe_name, index, runtime.stop, 4,
+        log_pipe_search_diagnostics);
     report_service_status(SERVICE_STOP_PENDING, ERROR_SUCCESS, 30'000);
     coordinator.request_stop();
     if (coordinator.joinable()) coordinator.join();
@@ -1330,7 +1363,8 @@ void run_mft_service() {
     });
 
     const auto pipe_error = esm::serve_named_pipe_search(
-        configuration.pipe_name, index, runtime.stop, 4);
+        configuration.pipe_name, index, runtime.stop, 4,
+        log_pipe_search_diagnostics);
     report_service_status(SERVICE_STOP_PENDING, ERROR_SUCCESS, 30'000);
     reconciler.request_stop();
     if (reconciler.joinable()) reconciler.join();
@@ -1422,7 +1456,8 @@ void run_live_service() {
                                            : L"MFT enumeration"));
     report_service_status(SERVICE_RUNNING);
     const auto pipe_error = esm::serve_named_pipe_search(
-        configuration.pipe_name, session.index(), runtime.stop, 4);
+        configuration.pipe_name, session.index(), runtime.stop, 4,
+        log_pipe_search_diagnostics);
 
     report_service_status(SERVICE_STOP_PENDING, ERROR_SUCCESS, 30'000);
     follower.request_stop();

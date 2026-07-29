@@ -44,8 +44,10 @@
 
 - Windows SCM 服务安装、启动、停止、状态和卸载。
 - 本地 Named Pipe 版本化二进制协议。
-- 4 MiB payload、1000 结果上限、超时/重试、精确读写。
-- 4 个并发 Pipe worker。
+- 4 MiB payload、1000 结果上限、连接阶段超时/有限重试、精确读写。
+- 4 个并发 Pipe worker；每个已接收请求在 IPC v1 协议外记录读取、解析、索引搜索、编码、写回和总耗时。
+- SCM 服务对成功且总耗时不少于 100 ms 的请求以最多每 5 秒一条的频率写 Windows Event Log，并在下一条记录中汇总被抑制数量；诊断只包含查询字符数、请求选项、结果数和耗时，不保存查询文本、文件名或路径。
+- 当前客户端 `timeout_ms` 只限制连接 Pipe 的等待；连接成功后的同步读写和已进入 `MetadataIndex::search` 的服务端工作尚不能协作取消。GUI generation 会丢弃过期响应，但不会中断服务端 evaluator。
 - 拒绝远程客户端并设置显式 DACL。
 
 ### GUI
@@ -80,7 +82,7 @@
 
 ### 安全和发布
 
-已有本地 Pipe DACL、NSIS、服务自启动、CI artifact 和 tag release；仍缺 per-request impersonation、按用户搜索权限隔离、代码签名、自动升级、崩溃报告、日志轮转和稳定 SDK。
+已有本地 Pipe DACL、NSIS、服务自启动、CI artifact、tag release 和受限慢查询 Event Log 诊断；仍缺 per-request impersonation、按用户搜索权限隔离、代码签名、自动升级、崩溃报告、文件日志轮转和稳定 SDK。
 
 ### 测试运行库基线
 

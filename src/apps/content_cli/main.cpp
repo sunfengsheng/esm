@@ -1,4 +1,5 @@
 ﻿#include "esm/content_named_pipe.hpp"
+#include "esm/content_settings.hpp"
 
 #include <windows.h>
 
@@ -9,17 +10,46 @@ namespace {
 void usage() {
     std::wcout
         << L"Usage:\n"
-        << L"  esm_content_cli [--pipe <name>] status\n"
-        << L"  esm_content_cli [--pipe <name>] search <query> [limit]\n";
+        << L"  esm_content_cli [--config <path>] [--pipe <name>] status\n"
+        << L"  esm_content_cli [--config <path>] [--pipe <name>] search <query> [limit]\n";
 }
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::wstring pipe = L"everything_sm_content";
+    auto config_path = esm::default_content_config_path();
+    bool explicit_config = false;
+    for (int argument_index = 1; argument_index + 1 < argc; ++argument_index) {
+        if (std::wstring_view(argv[argument_index]) == L"--config") {
+            config_path = argv[argument_index + 1];
+            explicit_config = true;
+            break;
+        }
+    }
+    auto settings = esm::default_content_app_settings();
+    std::wstring settings_error;
+    if (std::filesystem::exists(config_path)) {
+        if (!esm::load_content_app_settings(config_path, settings,
+                                            settings_error)) {
+            std::wcerr << settings_error << L"\n";
+            return 2;
+        }
+    } else if (explicit_config) {
+        std::wcerr << L"Content configuration does not exist: " << config_path
+                   << L"\n";
+        return 2;
+    }
+    std::wstring pipe = settings.pipe_name;
     int index = 1;
-    if (index + 1 < argc && std::wstring_view(argv[index]) == L"--pipe") {
-        pipe = argv[index + 1];
-        index += 2;
+    while (index < argc) {
+        const std::wstring_view argument(argv[index]);
+        if (argument == L"--config" && index + 1 < argc) {
+            index += 2;
+        } else if (argument == L"--pipe" && index + 1 < argc) {
+            pipe = argv[index + 1];
+            index += 2;
+        } else {
+            break;
+        }
     }
     if (index >= argc) {
         usage();

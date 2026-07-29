@@ -1,6 +1,7 @@
 #include "esm/content_index.hpp"
 #include "esm/content_named_pipe.hpp"
 #include "esm/content_roots.hpp"
+#include "esm/content_settings.hpp"
 #include "esm/directory_watcher.hpp"
 
 #include <windows.h>
@@ -25,16 +26,6 @@ BOOL WINAPI console_handler(DWORD signal) {
         return TRUE;
     }
     return FALSE;
-}
-
-std::filesystem::path default_database_root() {
-    wchar_t buffer[32768]{};
-    const DWORD length = GetEnvironmentVariableW(
-        L"PROGRAMDATA", buffer, static_cast<DWORD>(std::size(buffer)));
-    if (length != 0 && length < std::size(buffer)) {
-        return std::filesystem::path(buffer) / L"everything_sm" / L"content";
-    }
-    return std::filesystem::temp_directory_path() / L"everything_sm-content";
 }
 
 std::filesystem::path normalize_path(const std::filesystem::path& path) {
@@ -240,12 +231,16 @@ void scan_and_watch(esm::ContentIndex& index,
 void print_usage() {
     std::wcout
         << L"Usage:\n"
+        << L"  esm_content_service [--config <content.ini>]\n"
         << L"  esm_content_service --root <directory> [--root <directory> ...]\n"
         << L"  esm_content_service --all-fixed\n"
         << L"      [--db <directory> | --db-root <directory>]\n"
         << L"      [--exclude <path> ...] [--no-default-excludes]\n"
-        << L"      [--pipe <name>] [--max-mib <1-64>]\n\n"
+        << L"      [--config <content.ini>] [--pipe <name>]\n"
+        << L"      [--max-mib <1-64>]\n\n"
         << L"Notes:\n"
+        << L"  With no root arguments, settings are loaded from --config or\n"
+        << L"  %LOCALAPPDATA%\\everything_sm_content\\content.ini.\n"
         << L"  --db is only valid for one root. Multi-root mode creates one\n"
         << L"  Xapian database per root below --db-root\\volumes.\n\n"
         << L"Examples:\n"
@@ -255,20 +250,56 @@ void print_usage() {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::vector<std::filesystem::path> roots;
-    std::vector<std::filesystem::path> excluded_paths;
+    auto config_path = esm::default_content_config_path();
+    bool explicit_config = false;
+    for (int argument_index = 1; argument_index < argc; ++argument_index) {
+        if (std::wstring_view(argv[argument_index]) == L"--config" &&
+            argument_index + 1 < argc) {
+            config_path = argv[++argument_index];
+            explicit_config = true;
+        }
+    }
+
+    auto settings = esm::default_content_app_settings();
+    std::wstring settings_error;
+    if (std::filesystem::exists(config_path)) {
+        if (!esm::load_content_app_settings(config_path, settings,
+                                            settings_error)) {
+            std::wcerr << settings_error << L"\n";
+            return 2;
+        }
+    } else if (explicit_config) {
+        std::wcerr << L"Content configuration does not exist: "
+                   << config_path << L"\n";
+        return 2;
+    } else if (!esm::save_content_app_settings(config_path, settings,
+                                               settings_error)) {
+        std::wcerr << settings_error << L"\n";
+        return 2;
+    }
+
+    auto roots = settings.roots;
+    auto excluded_paths = settings.excluded_paths;
     std::filesystem::path direct_database;
-    auto database_root = default_database_root();
+    auto database_root = settings.database_root;
     bool direct_database_set = false;
     bool database_root_set = false;
-    bool all_fixed = false;
-    bool use_default_excludes = true;
-    std::wstring pipe = L"everything_sm_content";
-    std::size_t maximum_bytes = 4 * 1024 * 1024;
+    bool roots_overridden = false;
+    bool all_fixed = settings.all_fixed;
+    bool use_default_excludes = settings.use_default_excludes;
+    std::wstring pipe = settings.pipe_name;
+    std::size_t maximum_bytes = settings.maximum_bytes;
 
     for (int argument_index = 1; argument_index < argc; ++argument_index) {
         const std::wstring argument = argv[argument_index];
-        if (argument == L"--root" && argument_index + 1 < argc) {
+        if (argument == L"--config" && argument_index + 1 < argc) {
+            ++argument_index;
+        } else if (argument == L"--root" && argument_index + 1 < argc) {
+            if (!roots_overridden) {
+                roots.clear();
+                all_fixed = false;
+                roots_overridden = true;
+            }
             roots.emplace_back(argv[++argument_index]);
         } else if (argument == L"--all-fixed") {
             all_fixed = true;
@@ -315,6 +346,8 @@ int wmain(int argc, wchar_t** argv) {
     }
     roots = normalize_roots(std::move(roots));
     if (roots.empty()) {
+        std::wcerr << L"No content roots are configured in " << config_path
+                   << L"\n";
         print_usage();
         return 2;
     }
@@ -347,8 +380,21 @@ int wmain(int argc, wchar_t** argv) {
         shard_specs.push_back({root, std::move(database)});
     }
 
+    auto mutex_name = std::wstring(L"Local\\EverythingSmContentService-") + pipe;
+    std::replace(mutex_name.begin(), mutex_name.end(), L'\\', L'_');
+    const HANDLE instance_mutex = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
+    if (!instance_mutex) {
+        std::wcerr << L"Unable to create content service instance mutex\n";
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(instance_mutex);
+        return 0;
+    }
+
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     SetConsoleCtrlHandler(console_handler, TRUE);
+    int exit_code = 0;
     try {
         esm::ShardedContentIndex index(shard_specs);
         std::vector<std::jthread> workers;
@@ -366,7 +412,7 @@ int wmain(int argc, wchar_t** argv) {
                                           use_default_excludes,
                                           std::move(root_excludes));
             index.shard(shard_index)
-                .set_indexing(true, L"等待后台扫描 " +
+                .set_indexing(true, L"\u7b49\u5f85\u540e\u53f0\u626b\u63cf " +
                                         index.shard_root(shard_index).wstring());
             workers.emplace_back(
                 [&index, shard_index, filter = std::move(filter),
@@ -378,7 +424,8 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         std::wcout << L"Content service started; initial scans run in background\n"
-                   << L"  pipe: " << pipe << L"\n";
+                   << L"  config: " << config_path << L"\n"
+                   << L"  pipe:   " << pipe << L"\n";
         for (std::size_t shard_index = 0; shard_index < shard_specs.size();
              ++shard_index) {
             std::wcout << L"  root: " << shard_specs[shard_index].root << L"\n"
@@ -396,14 +443,15 @@ int wmain(int argc, wchar_t** argv) {
         if (pipe_error != ERROR_SUCCESS) {
             std::wcerr << L"Content pipe stopped with error " << pipe_error
                        << L"\n";
-            return 1;
+            exit_code = 1;
         }
     } catch (const std::exception& exception) {
         std::cerr << "Content service failed: " << exception.what() << "\n";
-        return 1;
+        exit_code = 1;
     } catch (...) {
         std::cerr << "Content service failed: unknown non-standard exception\n";
-        return 1;
+        exit_code = 1;
     }
-    return 0;
+    CloseHandle(instance_mutex);
+    return exit_code;
 }

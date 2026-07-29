@@ -1,4 +1,5 @@
 #include "esm/content_named_pipe.hpp"
+#include "esm/content_settings.hpp"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -13,7 +14,7 @@
 #include <vector>
 
 namespace {
-constexpr wchar_t window_class[] = L"EsmContentLabWindow";
+constexpr wchar_t window_class[] = L"EsmContentSearchWindow";
 constexpr UINT message_search_complete = WM_APP + 1;
 constexpr UINT message_status_complete = WM_APP + 2;
 constexpr UINT_PTR search_timer = 1;
@@ -37,7 +38,10 @@ struct App {
     HWND results{};
     HWND status{};
     HFONT font{};
-    std::wstring pipe{L"everything_sm_content"};
+    std::wstring pipe{esm::default_content_pipe_name};
+    std::filesystem::path config_path{esm::default_content_config_path()};
+    bool service_start_attempted{};
+    bool pipe_overridden{};
     std::atomic<std::uint64_t> generation{};
     std::vector<esm::ContentSearchHit> hits;
 };
@@ -243,6 +247,57 @@ void layout(App& app) {
                (std::max<LONG>)(0, client.right - margin * 2), status_height, TRUE);
 }
 
+std::filesystem::path current_executable_directory() {
+    std::vector<wchar_t> buffer(32768);
+    const auto length = GetModuleFileNameW(
+        nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size()) return {};
+    return std::filesystem::path(
+               std::wstring_view(buffer.data(), static_cast<std::size_t>(length)))
+        .parent_path();
+}
+
+bool ensure_content_service_running(App& app, std::wstring& error) {
+    error.clear();
+    if (app.service_start_attempted) return true;
+    app.service_start_attempted = true;
+
+    auto settings = esm::default_content_app_settings();
+    if (std::filesystem::exists(app.config_path)) {
+        if (!esm::load_content_app_settings(app.config_path, settings, error))
+            return false;
+    } else if (!esm::save_content_app_settings(app.config_path, settings,
+                                               error)) {
+        return false;
+    }
+    if (!app.pipe_overridden) app.pipe = settings.pipe_name;
+
+    const auto service_path =
+        current_executable_directory() / L"esm_content_service.exe";
+    if (!std::filesystem::is_regular_file(service_path)) {
+        error = L"\u627e\u4e0d\u5230\u72ec\u7acb\u5185\u5bb9\u670d\u52a1\uff1a" + service_path.wstring();
+        return false;
+    }
+    std::wstring command = L"\"" + service_path.wstring() +
+                           L"\" --config \"" +
+                           app.config_path.wstring() + L"\"";
+    if (app.pipe_overridden)
+        command += L" --pipe \"" + app.pipe + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(service_path.c_str(), command.data(), nullptr, nullptr,
+                        FALSE, CREATE_NO_WINDOW, nullptr,
+                        service_path.parent_path().c_str(), &startup, &process)) {
+        error = L"\u65e0\u6cd5\u542f\u52a8\u72ec\u7acb\u5185\u5bb9\u670d\u52a1\uff0c\u9519\u8bef\u7801 " +
+                std::to_wstring(GetLastError());
+        return false;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
                              LPARAM lparam) {
     auto* app = app_from(window);
@@ -289,6 +344,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
         SendMessageW(app->status, WM_SETFONT,
                      reinterpret_cast<WPARAM>(app->font), TRUE);
         SetTimer(window, status_timer, 2000, nullptr);
+        std::wstring service_error;
+        if (!ensure_content_service_running(*app, service_error))
+            set_status(*app, std::move(service_error));
         request_status(*app);
         layout(*app);
         SetFocus(app->search);
@@ -378,8 +436,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     App app;
     int argc{};
     auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv && argc >= 2 && argv[1][0] != L'\0') app.pipe = argv[1];
-    if (argv) LocalFree(argv);
+    if (argv) {
+        for (int index = 1; index < argc; ++index) {
+            const std::wstring_view argument(argv[index]);
+            if (argument == L"--config" && index + 1 < argc) {
+                app.config_path = argv[++index];
+            }
+        }
+        auto settings = esm::default_content_app_settings();
+        std::wstring settings_error;
+        if (std::filesystem::exists(app.config_path) &&
+            esm::load_content_app_settings(app.config_path, settings,
+                                           settings_error)) {
+            app.pipe = settings.pipe_name;
+        }
+        for (int index = 1; index < argc; ++index) {
+            const std::wstring_view argument(argv[index]);
+            if (argument == L"--config" && index + 1 < argc) {
+                ++index;
+            } else if (argument == L"--pipe" && index + 1 < argc) {
+                app.pipe = argv[++index];
+                app.pipe_overridden = true;
+            } else if (argc == 2 && !argument.starts_with(L"--")) {
+                app.pipe = argument;
+                app.pipe_overridden = true;
+            }
+        }
+        LocalFree(argv);
+    }
 
     WNDCLASSEXW window_class_info{};
     window_class_info.cbSize = sizeof(window_class_info);
@@ -394,7 +478,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (!RegisterClassExW(&window_class_info)) return 1;
 
     HWND window = CreateWindowExW(
-        0, window_class, L"Everything SM 内容搜索实验室",
+        0, window_class, L"Everything SM 内容搜索",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
         1180, 680, nullptr, nullptr, instance, &app);
     if (!window) return 1;

@@ -205,3 +205,31 @@ ctest --test-dir build-content --output-on-failure
 cmake --build build-ucrt-vendor-final --config Release --target esm_tests
 ctest --test-dir build-ucrt-vendor-final -C Release -R '^esm_tests$' --output-on-failure
 ```
+
+## 独立内容应用与开发安装包
+
+正式内容 GUI 构建目标为 `esm_content`：
+
+```powershell
+cmake -S . -B build-content -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DESM_BUILD_CONTENT_SEARCH=ON `
+  -DESM_BUILD_TESTS=ON `
+  -DESM_BUILD_BENCHMARKS=OFF
+cmake --build build-content --target `
+  esm_content esm_content_service esm_content_cli esm_content_tests
+ctest --test-dir build-content -R esm_content_tests --output-on-failure
+```
+
+`esm_content_tests` 现在还覆盖 `ContentAppSettings` 的 INI 保存/加载和独立默认数据根。旧目标 `esm_content_lab` 不再生成。
+
+本地开发安装包：
+
+```powershell
+.\packaging\build-content-installer.ps1 `
+  -BuildDirectory build-content `
+  -SkipBuild `
+  -AllowDevelopmentPackage
+```
+
+脚本输出 `dist\everything-sm-content-<version>-dev-setup.exe` 和 SHA-256 文件。它是按用户、无管理员权限的独立包，不包含文件名搜索二进制。`-AllowDevelopmentPackage` 是强制的误发布保护：Xapian 静态链接的 GPL/source-distribution 方案尚未审查完成，不能把该产物上传到公开 release。

@@ -69,6 +69,7 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   add_library(esm_content_protocol
       src/content/content_protocol.cpp
+      src/content/content_settings.cpp
       src/platform/windows/content_named_pipe.cpp
   )
   target_include_directories(esm_content_protocol PUBLIC include)
@@ -92,11 +93,11 @@ if(ESM_BUILD_CONTENT_SEARCH)
   target_link_libraries(esm_content_service PRIVATE
       esm_core esm_content_protocol esm_xapian_content)
 
-  add_executable(esm_content_lab WIN32
-      src/apps/content_lab/main.cpp
+  add_executable(esm_content WIN32
+      src/apps/content_gui/main.cpp
       src/apps/gui/resources.rc
   )
-  target_link_libraries(esm_content_lab PRIVATE
+  target_link_libraries(esm_content PRIVATE
       esm_content_protocol comctl32 shell32)
 
   add_executable(esm_content_cli
@@ -115,7 +116,7 @@ if(ESM_BUILD_CONTENT_SEARCH)
       esm_content_protocol
       esm_xapian_content
       esm_content_service
-      esm_content_lab
+      esm_content
       esm_content_cli)
   if(TARGET esm_content_tests)
     list(APPEND ESM_CONTENT_TARGETS esm_content_tests)
@@ -132,7 +133,7 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   if(MINGW)
     target_link_options(esm_content_service PRIVATE -municode -static)
-    target_link_options(esm_content_lab PRIVATE -municode -mwindows -static)
+    target_link_options(esm_content PRIVATE -municode -mwindows -static)
     target_link_options(esm_content_cli PRIVATE -municode -static)
     if(TARGET esm_content_tests)
       target_link_options(esm_content_tests PRIVATE -static)

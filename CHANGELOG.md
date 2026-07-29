@@ -6,6 +6,8 @@
 
 ### Added
 
+- 将 Xapian 内容搜索正式拆分为独立应用边界：新增正式 GUI 目标 `esm_content.exe`、独立 `%LOCALAPPDATA%\everything_sm_content` 配置/数据库根、`everything_sm_content_service` Pipe、配置 round-trip 测试、显式配置路径校验和按 Pipe 单实例服务保护；内容 GUI 可按需无控制台启动同目录服务，文件名搜索进程与数据库不变。
+- 新增独立的每用户 NSIS 开发安装包脚本 `packaging/build-content-installer.ps1`；包内只包含内容 GUI、内容服务和内容 CLI，不需要管理员权限，也不向主文件名搜索安装包混入 Xapian。由于 GPL/source-distribution 审查尚未完成，脚本必须显式传入 `-AllowDevelopmentPackage`，产物仅供本地开发验证。
 - ?? `docs/EVERYTHING_COMPATIBILITY.md`????? Everything 1.4.1.1030 ??????????NTFS ???GUI???????????? PASS/PARTIAL/FAIL/UNTESTED ?????
 - ?? `mft-auto` ?? generation/volume/root ???????/USN append-only delta WAL v2???????????? snapshot generation????????root file ID?journal ID ??? USN cursor????? write-through + `FlushFileBuffers`?????? torn tail??? checkpoint ?????????????? cursor gap?
 - ???????? NTFS reconciliation ???? `esm_reconcile_benchmark`??????????? `FSCTL_ENUM_USN_DATA`??? namespacing????????checkpoint ??/????? 10 ms ???? Working Set ? Private Bytes?
@@ -17,7 +19,7 @@
 - 文件名查询新增 Everything 风格的 `startwith:`、`endwith:`、`len:`、`depth:`/`parents:`、`parent:`/`infolder:`/`nosubfolders:`、`root:`、`count:`、`child:`、`empty:`、`childcount:`、`childfilecount:` 和 `childfoldercount:`；支持单个 `|`、`< >` 分组、`ext:` 分号扩展名列表、数字/大小范围、Everything 大小常量、`datemodified:`、下一个自然周/月/年、滚动 N 年/月/周/日/时/分/秒，以及英文月份/星期日期常量。高级搜索窗口新增文件名前缀、后缀和直接父文件夹条件。
 
 - 内容服务新增整机内容索引第一阶段：显式 `--all-fixed` 固定卷发现、可重复 `--root`、每根独立 Xapian 分片数据库、全局结果聚合、默认系统/缓存目录排除与多根自动测试。
-- 新增独立 Xapian 文件内容搜索原型：`esm_content_service.exe`、`esm_content_lab.exe`、`esm_content_cli.exe`、独立 Named Pipe、纯文本提取、CJK n-gram、摘要与 UTF-16 高亮。
+- 新增独立 Xapian 文件内容搜索原型：`esm_content_service.exe`、`esm_content.exe`、`esm_content_cli.exe`、独立 Named Pipe、纯文本提取、CJK n-gram、摘要与 UTF-16 高亮。
 - 新增内容协议、Named Pipe、文本提取和 Xapian 生命周期自动测试；仓库固定包含 Xapian Core 1.4.31 上游源码，Windows CI 从源码构建静态库、运行测试并检查三个实验程序的动态依赖。
 
 - 建立完整文档入口，包括用户手册、查询语法、开发指南、运维手册和当前状态说明。

@@ -1,6 +1,7 @@
 #include "esm/content_index.hpp"
 #include "esm/content_named_pipe.hpp"
 #include "esm/content_roots.hpp"
+#include "esm/content_settings.hpp"
 #include "esm/content_protocol.hpp"
 
 #include <windows.h>
@@ -70,6 +71,38 @@ void write_bytes(const std::filesystem::path& path,
 
 void write_utf8(const std::filesystem::path& path, std::string_view text) {
     write_bytes(path, std::vector<std::uint8_t>(text.begin(), text.end()));
+}
+
+void test_content_settings_round_trip() {
+    TemporaryDirectory directory(L"everything-sm-content-settings");
+    const auto config = directory.path() / L"content.ini";
+    esm::ContentAppSettings expected;
+    expected.roots = {L"C:\\Users\\tester", L"D:\\docs"};
+    expected.excluded_paths = {L"D:\\docs\\cache"};
+    expected.database_root = directory.path() / L"index";
+    expected.pipe_name = L"everything_sm_content_test";
+    expected.maximum_bytes = 7U * 1024U * 1024U;
+    expected.all_fixed = true;
+    expected.use_default_excludes = false;
+
+    std::wstring error;
+    require(esm::save_content_app_settings(config, expected, error),
+            "content settings should save");
+    esm::ContentAppSettings loaded;
+    require(esm::load_content_app_settings(config, loaded, error),
+            "content settings should load");
+    require(loaded.roots == expected.roots &&
+                loaded.excluded_paths == expected.excluded_paths &&
+                loaded.database_root == expected.database_root &&
+                loaded.pipe_name == expected.pipe_name &&
+                loaded.maximum_bytes == expected.maximum_bytes &&
+                loaded.all_fixed == expected.all_fixed &&
+                loaded.use_default_excludes == expected.use_default_excludes,
+            "content settings should round-trip");
+
+    const auto default_root = esm::default_content_app_data_root().wstring();
+    require(default_root.find(L"everything_sm_content") != std::wstring::npos,
+            "content data root should be isolated from filename-search data");
 }
 
 void test_protocol_round_trip() {
@@ -461,6 +494,7 @@ void test_xapian_index_lifecycle() {
 
 int main() {
     try {
+        test_content_settings_round_trip();
         test_protocol_round_trip();
         test_named_pipe_round_trip();
         test_plain_text_extraction();

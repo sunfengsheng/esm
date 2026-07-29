@@ -283,7 +283,7 @@ flowchart LR
     NamePipe --> Service["esm_service.exe"]
     Service --> Metadata["MetadataIndex / MFT / USN"]
 
-    Lab["esm_content_lab.exe"] --> ContentPipe["everything_sm_content"]
+    Lab["esm_content.exe"] --> ContentPipe["everything_sm_content"]
     ContentCLI["esm_content_cli.exe"] --> ContentPipe
     ContentPipe --> ContentService["esm_content_service.exe"]
     ContentService --> Extract["纯文本提取器（当前内置）"]
@@ -361,3 +361,28 @@ NtfsDirectoryEntryIdentity = object identity + parent object identity + entry na
 ```
 
 ????????????????????? size/time/attributes ????sequence ?????? MFT slot ??? sequence ?????????????? generation WAL?? hydration ???? parent reference ?????`FSCTL_ENUM_USN_DATA` ??????????? hard-link ??????????????????????? provider??? snapshot/WAL schema ???????????
+
+## 独立内容搜索应用边界（2026-07-29）
+
+```mermaid
+flowchart LR
+    ContentGui["esm_content.exe"] --> ContentPipe["everything_sm_content_service"]
+    ContentCli["esm_content_cli.exe"] --> ContentPipe
+    ContentPipe --> ContentService["esm_content_service.exe"]
+    ContentService --> Config["%LOCALAPPDATA%/everything_sm_content/content.ini"]
+    ContentService --> Shards["每个内容根一个 Xapian shard"]
+    Shards --> ContentDb["%LOCALAPPDATA%/everything_sm_content/index"]
+
+    NameGui["esm_gui.exe"] --> NameService["esm_service.exe"]
+    NameService --> NameDb["Metadata snapshot + WAL"]
+```
+
+`ContentAppSettings` 是三个内容程序共享的只读启动配置模型。GUI 在启动时加载配置；Pipe 不可用时，它通过 `CREATE_NO_WINDOW` 启动同目录服务。服务使用由 Pipe 名派生的 `Local\EverythingSmContentService-*` 互斥体阻止重复实例。服务仍在各根的后台线程执行初次扫描和 watcher，并在每根独立 Xapian shard 上聚合查询。
+
+隔离约束：
+
+1. Xapian 只链接到 `esm_xapian_content` 和内容服务；
+2. 文件名服务不读取内容配置，也不打开内容数据库；
+3. 两套服务使用不同 Pipe 和不同默认数据根；
+4. 当前不共享任何可写状态；未来允许的集成仅限只读文件发现 IPC 或 GUI 跳转；
+5. 内容服务故障不能改变文件名服务的可用性和恢复路径。

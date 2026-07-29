@@ -1,4 +1,4 @@
-﻿# 用户手册
+# 用户手册
 
 ## 1. 系统要求
 
@@ -190,9 +190,31 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 .\esm_content_service.exe `
   --root D:\work `
   --db "$env:LOCALAPPDATA\everything_sm\content\xapian"
-.\esm_content_lab.exe
+.\esm_content.exe
 ```
 
 实验 UI 的“内容匹配”列显示 Xapian 摘要，黄色/橙色区域表示命中词；双击可打开文件。内容服务不可用时，状态栏会明确提示“独立内容服务不可用；现有文件名搜索不受影响”。
 
 当前只索引白名单中的纯文本文件，默认跳过大于 4 MiB 的文件，不支持 PDF、Office 和 OCR。可重复使用 `--root`，或显式使用 `--all-fixed` 索引当前可访问的固定盘；多根应指定 `--db-root`，服务会为每根创建独立 Xapian 数据库并聚合查询。`--all-fixed` 不会由安装程序自动开启。默认跳过系统目录和 `.git`、`node_modules` 等缓存/依赖目录，可用 `--exclude` 增补。首次扫描在后台执行；如果 watcher 报告通知溢出，当前需要重启内容服务重新扫描。完整命令、格式列表和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+
+## 独立内容搜索应用
+
+内容搜索不是文件名搜索窗口中的一个模式，而是独立程序：
+
+```powershell
+.\esm_content.exe
+```
+
+首次启动会在 `%LOCALAPPDATA%\everything_sm_content\content.ini` 创建配置，默认索引当前用户目录，并把 Xapian 数据库放到 `%LOCALAPPDATA%\everything_sm_content\index`。GUI 会在需要时隐藏启动同目录的 `esm_content_service.exe`，因此正常使用不需要先打开控制台。
+
+指定配置：
+
+```powershell
+.\esm_content.exe --config D:\content-search\content.ini
+```
+
+显式指定的配置文件必须已经存在；如果路径拼错，服务和 CLI 会直接报错，不会退回默认 Pipe。GUI 的默认配置仍会在首次启动时自动创建。
+
+结果列表显示名称、路径、内容摘要和相关度；匹配词会高亮，双击可打开文件。建库期间可以查询，但尚未提交的文件不会命中。当前仅支持纯文本和源码白名单，不支持 PDF、Office 或 OCR。
+
+独立开发安装包按当前用户安装，不弹 UAC；它与需要管理员权限的文件名搜索主安装包无关。开发包尚未完成 GPL 公开分发审查，只能用于本地验证。

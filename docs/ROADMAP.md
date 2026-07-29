@@ -158,14 +158,15 @@ P7 下一批工作按以下顺序推进：
 6. ACL impersonation、真实容量/性能/长期内存基线；
 7. Xapian GPL 分发合规完成后，再考虑把入口合并进主 GUI。
 
-## 2026-07-29 ?????? NTFS ??????
+## 2026-07-29：持久化与 NTFS 后续工作
 
-- [x] ?? generation/volume/root-bound ??/USN append-only WAL v2
-- [x] torn-tail ???checksum?journal cursor ???? checkpoint ?????????
-- [x] base + overlay - tombstone checkpoint consolidation ???
-- [ ] generation directory + atomic current manifest + streaming/mapped consolidation
-- [ ] NTFS object identity / directory-entry identity schema ? snapshot/WAL ??
-- [ ] hard-link ???????????????????????
-- [ ] MFT slot sequence ???????? parent?? WAL ?? hydration ??????
-- [ ] ???????? reconciliation ???????????
-- [ ] ?? Everything ???????????????????????
+- [x] generation/volume/root-bound 名称/USN append-only WAL v2；
+- [x] 事务 checksum、撕裂尾部恢复、durable journal cursor 和 checkpoint 恢复测试；
+- [x] `base + overlay - tombstone` checkpoint consolidation；
+- [x] generation-bound metadata hydration WAL 与状态 sidecar；
+- [ ] 将 checkpoint writer 改为真正流式/映射写入，避免完整 `vector<FileRecord>`；
+- [ ] 在真实百万级多卷环境建立 reconciliation 时间、峰值内存、磁盘写入和恢复基准；
+- [ ] 在 snapshot/WAL/provider 中引入完整 NTFS object identity 与 directory-entry identity；
+- [ ] 让每个 hard-link 目录入口都能独立索引和返回；
+- [ ] 传播并验证 MFT record/parent sequence，覆盖 slot 重用、parent 重用、WAL replay 和 hydration stale 边界；
+- [ ] 建立同机 Everything 自动化对照 runner，逐项关闭功能、GUI、恢复和性能差距。

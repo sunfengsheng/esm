@@ -37,6 +37,8 @@
 - 65536 桶的 16-bit trigram hash 名称倒排索引，posting 按自然顺序位置做 delta/varint 压缩。
 - 从必须出现的名称 trigram 中选择最稀疏 posting，最终由完整 evaluator 消除 hash collision 误报。
 - raw 与 accent-folded 名称 gram，默认忽略变音符号时仍可走候选索引。
+- 文件名 GUI 使用首键 15 ms、150 ms 输入突发内 60 ms 的自适应防抖；保持单一在途 Pipe 查询并通过 generation 丢弃过期响应。
+- 最终结果不再无条件逐项访问文件系统；默认只补齐修改时间仍未知的结果，创建/访问/NTFS Change 时间排序才触发全结果补齐。两种路径都使用轻量槽位+路径请求、最多 4 个 worker 和 UI 原位数值更新。
 
 ### 服务与 IPC
 
@@ -115,6 +117,10 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 
 这些数据是特定机器和 snapshot 的开发基线，不是通用 SLA；已安装服务列仍来自上一版二进制的单次功能验证，不应当作本轮 p50。`path:` 查询存在明确慢路径。完整方法见 [PERFORMANCE.md](PERFORMANCE.md)。
 
+本轮 `esm_gui_pipeline_benchmark` 合成微基准显示：默认 1000 条结果下，旧完整结果交接估算 0.38 MiB，轻量路径请求 0.22 MiB、返回数值 payload 0.05 MiB；10 万条压力样本分别为 39.22 MiB、22.27 MiB 和 5.34 MiB。该结果只描述 GUI 元数据交接的数据形状，不是端到端搜索延迟或真实进程峰值。测试方法见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+2026-07-29 的工作区 GUI 功能自动化确认：精确查询 `123456789.txt` 返回 2 条，0 B/565 B 和修改时间均能显示，状态为 `2 个结果` 而不是 `2+`；宽查询 `1` 先显示 `200+`，随后 refinement 到 1000 条。短响应现在直接进入缺失元数据补齐和历史流程，只有首屏刚好达到 200 条时才发送第二次最终查询。该检查不是稳定的真实键盘端到端 p50/p95。
+
 ## 5. 已知资源问题
 
 用户观察到的旧安装服务稳定内存约为 1.85–2 GiB；更早的开发版本曾达到 Working Set 约 3589 MB、Private Bytes 约 3662 MB。第一阶段通过释放 rvalue 源记录、普通文件路径组件化、128 位名称 Bloom、delta/varint posting 和 48 字节 `CompactRecord`，把真实 326 万条单搜索索引降到约 628.79 MiB Working Set。
@@ -142,34 +148,32 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 已完成第一阶段可运行原型：
 
 - `esm_content_service.exe`：单根或多根后台启动扫描、显式 `--all-fixed` 固定卷发现、每根 Xapian 持久分片数据库和递归 watcher、全局聚合查询、独立 `everything_sm_content` Pipe；
-- `esm_content.exe`：180 ms debounce、后台查询、过期响应丢弃、名称/路径/内容摘要/相关度列、黄色匹配高亮、双击打开；
+- `esm_content.exe`：160 ms debounce、单一长期 IPC worker、过期响应丢弃、服务状态灯、Shell 文件图标、名称/路径/内容摘要/相关度列、黄色匹配高亮、按钮/右键菜单/快捷键，以及显示文件名、完整路径和高亮索引摘要的右侧可开关预览窗格；
 - `esm_content_cli.exe`：status/search 真实 IPC 诊断；
-- 纯文本扩展名白名单、UTF-8/UTF-16 BOM/本地 ANSI 解码、二进制 NUL 检测和 4 MiB 默认上限；
+- 纯文本扩展名白名单、UTF-8/UTF-16 BOM/本地 ANSI 解码、二进制 NUL 检测和 4 MiB 默认上限；`.docx` 支持 IFilter + 内置 ZIP/XML 回退，`.pdf` 支持 IFilter + 受限基础文本流回退，旧 `.doc` 依赖系统 IFilter；
 - Xapian 默认 AND、phrase/boolean/love-hate/wildcard 和 CJK n-gram；
 - 仓库固定包含 Xapian Core 1.4.31 官方发布源码，MinGW 默认从 `third_party/xapian-core` 构建静态库，CI 不依赖预编译 Xapian 包；
-- 协议、提取器、英文/中文查询、摘要高亮、upsert、delete、分片聚合、路径过滤、root key，以及查询与 60 次 commit 交错的并发自动测试；
+- 协议、纯文本/DOCX/PDF 提取器、英文/中文查询、摘要高亮、upsert、delete、分片聚合、路径过滤、root key，以及查询与 60 次 commit 交错的并发自动测试；
 - 本机真实 E2E 已验证英文、中文、两个临时根聚合查询、第二根 watcher 新增文件命中、两个分片目录和停止后重启查询；真实约 26.47 万文档数据库在修复后连续完成多轮查询且服务保持存活。
 
 真实内容查询速度目前不快：2026-07-26 使用约 264,692～264,693 个文档、约 4.63 GiB Xapian 数据库，在后台仍扫描时，`limit=100` 的不同查询单次 Named Pipe 往返为 671.9～5807.3 ms；`limit=10` 的重复样本约 237.8～756.9 ms。样本数不足以形成发布级 p50/p95，但足以否定“已经达到 Everything 式即时匹配”。摘要生成会读取 document data 中的完整正文，是当前最明显的查询慢路径。
 
-仍属于实验状态：没有 SCM 注册、NSIS 集成、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、PDF/Office/OCR、ACL impersonation、网络/云盘/可移动卷 provider、持久任务队列、首次建库吞吐/长期内存/真实 GUI 端到端基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+仍属于实验状态：没有 SCM 注册、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、OCR、完整复杂 PDF/Office 语义、ACL impersonation、网络/云盘/可移动卷 provider、持久任务队列、首次建库吞吐/长期内存/真实 GUI 端到端基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
 
 
-## 2026-07-29???/USN delta WAL ? checkpoint consolidation
+## 2026-07-29：名称/USN delta WAL 与 checkpoint consolidation
 
-???? `mft-auto` ?????????????????
+默认多卷 `mft-auto` 已具备以下持久化能力：
 
-- ??/???/??/????????? generation-bound WAL v2?
-- ?????? snapshot generation?volume identity?volume root?root file ID?journal ID ??? USN?
-- durable ?????? USN batch ? WAL write-through + flush ? ?????? ? ???? cursor??
-- ?????? snapshot ? hydration WAL???? state sidecar??? base??????? WAL????? journal catch-up?
-- torn tail ????checkpoint ?????????????/??/? root/journal gap ???????? reconciliation?
-- live base + overlay + tombstone ???? ID ?????? generation checkpoint????? 5 ??? 100,000 ???????? consolidation?
-- snapshot?????? WAL ? state sidecar ??????? generation ???? generation ?? WAL?
+- 名称、创建、删除、重命名和相关 USN 增量使用 generation-bound append-only WAL v2；
+- state 保存 snapshot generation、卷身份、卷根、root file ID、journal ID、原始 USN 边界和 durable cursor；
+- 每个已提交 USN batch 先以 write-through 事务写入并 flush，再推进 durable cursor；
+- 启动按 snapshot、名称/USN WAL、元数据 hydration WAL、state sidecar 的顺序校验和恢复；
+- 不完整事务尾部可截断；generation、卷集合、root 或 journal gap 不可信时保留可用名称基线并安排 reconciliation；
+- checkpoint 按 `base + overlay - tombstone` 生成新 generation，并原子切换 snapshot/WAL/state；
+- 已有小规模 crash-recovery 与 10 万 delta 合成 consolidation 测试。
 
-????????????????snapshot/state ?????????? generation directory + atomic manifest?checkpoint ?????? `vector<FileRecord>`??????????????????? MFT ?????????? Release ????????????????? UAC??? 2026-07-29 ????????????????
-
-?????????????? hard-link ?????????MFT slot sequence ?????? WAL/hydration ??????????? Everything ??????????????????????????/Xapian ?????
+仍未完成的边界：checkpoint writer 仍可能物化完整 `vector<FileRecord>`；真实百万级 MFT + 增量场景的耗时、Private Bytes、磁盘 flush 和 SCM/UAC 端到端恢复尚未建立发布级基线。hard-link 每个目录入口的独立表示、完整 MFT slot/parent sequence 传播和 Everything 100% 功能/性能兼容仍未完成。
 
 ## 2026-07-29：内容搜索独立应用状态
 
@@ -181,7 +185,8 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 - 内容服务按 Pipe 创建单实例互斥体，避免 GUI 重复启动相同扫描任务；
 - GUI、服务和 CLI 都支持 `--config`，命令行参数仍可覆盖配置；
 - 默认首次配置只索引当前用户目录，不会未经确认执行 `--all-fixed`；
-- 新增设置持久化自动测试、临时单根服务/CLI E2E 验证和独立 NSIS 开发安装包；
+- 新增设置持久化、DOCX/PDF 提取自动测试、TXT/DOCX/PDF 临时单根服务/CLI E2E 验证和独立 NSIS 开发安装包；
+- 内容应用使用与文件名搜索不同的专属图标；GUI 增加 160 ms 防抖、长期 worker、状态灯、Shell 图标、结果按钮、右键菜单、快捷键和 Everything 风格的右侧摘要预览窗格；
 - 文件名搜索进程、数据库、安装包和 IPC 未改为依赖内容搜索。
 
-仍未完成：SCM 内容服务、持久任务队列、删除 reconciliation、受限 extractor worker、ACL/per-request impersonation、PDF/Office/OCR、真实整机长期基准以及 GPL 公开分发审查。因此内容搜索仍是开发功能，不能声称达到生产发布标准。
+仍未完成：Windows Preview Handler、PDF/Word 页面级渲染、图片/OCR 预览、SCM 内容服务、持久任务队列、删除 reconciliation、受限 extractor worker、ACL/per-request impersonation、完整复杂 PDF/Office 语义、真实整机长期基准以及 GPL 公开分发审查。因此内容搜索仍是开发功能，不能声称达到生产发布标准。

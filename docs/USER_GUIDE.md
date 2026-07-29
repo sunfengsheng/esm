@@ -40,7 +40,7 @@ GUI 采用接近 Everything 的七菜单布局：`文件`、`编辑`、`查看`�
 - **预览面板**：显示当前选中项目的信息；尚未接入完整 Windows Preview Handler。
 - **状态栏**：显示连接状态、查询状态和结果数量。
 
-连续输入时，GUI 先请求最多 200 条结果以保持响应；停止输入约 250 ms 后，再请求设置中的最终上限（默认 1000 条）。文件大小、修改时间和图标可能稍后由后台补齐。
+连续输入时，首个编辑约 15 ms 后可触发交互查询；150 ms 内的后续快速编辑采用约 60 ms 突发防抖，减少逐键中间请求。GUI 先请求最多 200 条结果：若首屏少于 200 条，该响应已经完整，不会再发送第二次查询，状态栏也不显示 `+`；只有首屏刚好达到 200 条且设置的最终上限更大时，停止输入约 250 ms 后才请求最终上限（默认 1000 条）。服务索引已知的文件大小和修改时间会随结果直接显示；若某条结果的修改时间仍未知，GUI 会只为这些缺失项后台读取文件系统。按创建时间、访问时间或 NTFS Change 时间排序时，GUI 才补齐全部完整结果的元数据。Shell 图标仍可能在首次遇到某种扩展名时稍后出现。
 
 ## 5. 结果操作
 
@@ -166,7 +166,8 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 
 - 默认每次稳定查询最多返回 1000 条；可在选项中降低最终结果上限。
 - `path:`、复杂正则、重复项函数和宽泛单字符查询通常比纯名称查询更贵。
-- 第一次显示某种扩展名图标或补齐大量文件元数据时可能有额外 Shell/文件系统开销。
+- 第一次显示某种扩展名图标可能有额外 Shell 开销；默认查询只为修改时间未知的结果读取文件系统，按创建时间、访问时间或 NTFS Change 时间排序时才运行全结果补齐。
+- 首个编辑保持低延迟，快速连续编辑会被约 60 ms 的突发防抖合并；少于 200 条的首屏会直接完成，`200+` 才表示仍在等待最终 refinement。
 - 如果服务正在首次建库、全量校准或写 checkpoint，等待后台工作结束后再比较。
 - 使用 [PERFORMANCE.md](PERFORMANCE.md) 中的基准工具区分服务端查询延迟和 GUI 渲染延迟。
 
@@ -182,39 +183,49 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 
 当前版本尚未提供完整 Everything 查询函数、ETP 协议、Windows 原生预览处理器、完整 Shell 右键扩展、按用户权限模拟查询、签名二进制和自动升级。详情见 [CURRENT_STATUS.md](CURRENT_STATUS.md)。
 
-## 11. 实验性文件内容搜索
+## 11. 独立文件内容搜索
 
-当前内容搜索没有集成到正式 `esm_gui.exe`、portable 包和 NSIS 安装流程，需要从源码构建目录手动启动。
-
-```powershell
-.\esm_content_service.exe `
-  --root D:\work `
-  --db "$env:LOCALAPPDATA\everything_sm\content\xapian"
-.\esm_content.exe
-```
-
-实验 UI 的“内容匹配”列显示 Xapian 摘要，黄色/橙色区域表示命中词；双击可打开文件。内容服务不可用时，状态栏会明确提示“独立内容服务不可用；现有文件名搜索不受影响”。
-
-当前只索引白名单中的纯文本文件，默认跳过大于 4 MiB 的文件，不支持 PDF、Office 和 OCR。可重复使用 `--root`，或显式使用 `--all-fixed` 索引当前可访问的固定盘；多根应指定 `--db-root`，服务会为每根创建独立 Xapian 数据库并聚合查询。`--all-fixed` 不会由安装程序自动开启。默认跳过系统目录和 `.git`、`node_modules` 等缓存/依赖目录，可用 `--exclude` 增补。首次扫描在后台执行；如果 watcher 报告通知溢出，当前需要重启内容服务重新扫描。完整命令、格式列表和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
-
-## 独立内容搜索应用
-
-内容搜索不是文件名搜索窗口中的一个模式，而是独立程序：
+内容搜索不集成到文件名搜索窗口，而是独立程序和独立数据库：
 
 ```powershell
 .\esm_content.exe
 ```
 
-首次启动会在 `%LOCALAPPDATA%\everything_sm_content\content.ini` 创建配置，默认索引当前用户目录，并把 Xapian 数据库放到 `%LOCALAPPDATA%\everything_sm_content\index`。GUI 会在需要时隐藏启动同目录的 `esm_content_service.exe`，因此正常使用不需要先打开控制台。
+首次启动会在 `%LOCALAPPDATA%\everything_sm_content\content.ini` 创建配置，默认索引当前用户目录，并把 Xapian 数据库放到 `%LOCALAPPDATA%\everything_sm_content\index`。GUI 会在需要时隐藏启动同目录的 `esm_content_service.exe`。显式 `--config` 路径必须已经存在。
 
-指定配置：
+### 11.1 搜索窗口操作
 
-```powershell
-.\esm_content.exe --config D:\content-search\content.ini
-```
+- 在搜索框输入内容关键词，停顿约 160 ms 后自动查询；
+- “清空”按钮或 `Esc` 清空查询；
+- `Ctrl+L` 聚焦并全选搜索框；
+- `Enter` 立即查询；已有选中结果时打开该文件；
+- 双击结果或点击“打开”使用系统默认程序打开；
+- “打开目录”在资源管理器中选中文件；
+- 右键结果可打开、打开所在目录或复制完整路径；
+- 内容摘要中的黄色/橙色片段是匹配高亮；
+- 查询返回结果时默认选中第一项，并在右侧预览窗格显示文件名、完整路径和带黄色粗体命中的索引摘要；
+- 点击“隐藏预览/显示预览”、选择“查看 → 预览窗格”，或按 `Ctrl+Shift+P` 可切换预览窗格；关闭后结果列表会扩展到可用宽度；
+- 红灯表示内容服务不可用，黄灯表示启动、索引或查询中，绿灯表示就绪；结果数量与服务状态分开显示。
 
-显式指定的配置文件必须已经存在；如果路径拼错，服务和 CLI 会直接报错，不会退回默认 Pipe。GUI 的默认配置仍会在首次启动时自动创建。
+### 11.2 内容预览窗格
 
-结果列表显示名称、路径、内容摘要和相关度；匹配词会高亮，双击可打开文件。建库期间可以查询，但尚未提交的文件不会命中。当前仅支持纯文本和源码白名单，不支持 PDF、Office 或 OCR。
+当前预览是 **Xapian 索引摘要预览**，不是文件页面渲染器。选择结果后，GUI 直接使用内容服务返回的 `snippet + UTF-16 highlights`，不会再次读取或解析原始文件。因此 DOCX/PDF 预览显示的是建库时提取并写入索引的文本片段，响应路径较短，也不会因为切换选择而重复启动 Office/PDF 提取器。
 
-独立开发安装包按当前用户安装，不弹 UAC；它与需要管理员权限的文件名搜索主安装包无关。开发包尚未完成 GPL 公开分发审查，只能用于本地验证。
+尚未接入 Windows Preview Handler，也不显示 PDF 页面布局、Word 排版、图片或 OCR 结果。RichEdit 不可用时正文仍能显示，但匹配背景高亮可能不可用；正常支持的 Windows 系统会加载系统 `Msftedit.dll`。
+
+### 11.3 PDF 和 Word
+
+当前支持：
+
+- `.docx`：优先使用 Windows IFilter；没有可用 IFilter 时使用内置 ZIP/XML 正文提取；
+- `.pdf`：优先使用 Windows IFilter；没有可用 IFilter 时尝试受限的基础 PDF 文本流提取；
+- `.doc`：依赖本机安装的 Windows IFilter；没有对应 IFilter 时不会建立内容索引；
+- 纯文本和常见源码/配置格式继续按白名单索引。
+
+不支持扫描版 PDF OCR、加密 PDF、复杂字体映射的完整兼容、完整 Office 对象/批注/宏语义。文件或提取文本超过配置中的 `maximum_bytes` 时会跳过。安装 Office 或 PDF 软件可能增加系统 IFilter，但第三方提取器的兼容性取决于本机环境。
+
+### 11.4 建库和整机扫描
+
+建库期间可以搜索已经提交的文件，尚未提交的文件暂时不会命中。默认配置只扫描当前用户目录，不会自动读取所有固定盘。需要整机内容索引时显式配置多个 `root` 或启动服务时使用 `--all-fixed`；这会产生明显的 CPU、磁盘读取和 Xapian 数据库写入负载。
+
+独立开发安装包按当前用户安装，不弹 UAC；它与需要管理员权限的文件名搜索主安装包无关。开发包尚未完成 Xapian GPL/source-distribution 公开分发审查，只能用于本地开发验证。更多格式和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

@@ -6,11 +6,16 @@
 
 ### Added
 
+- 新增 `esm_gui_pipeline_benchmark`，用于对比完整 `SearchResult` 深复制与轻量元数据请求交接的合成成本；新增连续输入防抖边界和结果元数据原位应用测试。
+- 为独立内容搜索应用新增专属紫蓝色文档/放大镜图标，并把 GUI 资源、NSIS 安装图标和卸载图标切换到该资源；保留可重复生成的 SVG/PNG/ICO 源文件和脚本。
+- 内容搜索 GUI 新增 160 ms 防抖、单一长期 IPC worker、过期结果丢弃、服务状态灯、Shell 文件图标、清空/打开/打开所在目录按钮、结果右键菜单以及 `Ctrl+L`、`Esc`、`Enter` 快捷键，降低连续输入时的线程创建和界面抖动。
+- 内容搜索 GUI 新增 Everything 风格的右侧可开关预览窗格：默认选中首个结果，显示文件名、完整路径和 Xapian 索引摘要，并以 RichEdit 黄色粗体标出命中；可通过顶部按钮、“查看 → 预览窗格”或 `Ctrl+Shift+P` 切换。
+- 内容索引新增统一文档提取调度：`.docx` 优先 Windows IFilter 并回退到内置 ZIP/XML 提取，`.pdf` 优先 Windows IFilter 并回退到受限基础文本流提取，旧 `.doc` 使用系统 IFilter；增加不依赖 Office/PDF 软件的 DOCX/PDF 自动测试。
 - 将 Xapian 内容搜索正式拆分为独立应用边界：新增正式 GUI 目标 `esm_content.exe`、独立 `%LOCALAPPDATA%\everything_sm_content` 配置/数据库根、`everything_sm_content_service` Pipe、配置 round-trip 测试、显式配置路径校验和按 Pipe 单实例服务保护；内容 GUI 可按需无控制台启动同目录服务，文件名搜索进程与数据库不变。
 - 新增独立的每用户 NSIS 开发安装包脚本 `packaging/build-content-installer.ps1`；包内只包含内容 GUI、内容服务和内容 CLI，不需要管理员权限，也不向主文件名搜索安装包混入 Xapian。由于 GPL/source-distribution 审查尚未完成，脚本必须显式传入 `-AllowDevelopmentPackage`，产物仅供本地开发验证。
-- ?? `docs/EVERYTHING_COMPATIBILITY.md`????? Everything 1.4.1.1030 ??????????NTFS ???GUI???????????? PASS/PARTIAL/FAIL/UNTESTED ?????
-- ?? `mft-auto` ?? generation/volume/root ???????/USN append-only delta WAL v2???????????? snapshot generation????????root file ID?journal ID ??? USN cursor????? write-through + `FlushFileBuffers`?????? torn tail??? checkpoint ?????????????? cursor gap?
-- ???????? NTFS reconciliation ???? `esm_reconcile_benchmark`??????????? `FSCTL_ENUM_USN_DATA`??? namespacing????????checkpoint ??/????? 10 ms ???? Working Set ? Private Bytes?
+- 新增 `docs/EVERYTHING_COMPATIBILITY.md`，以 Everything 1.4.1.1030 为本机对照，按查询、NTFS、GUI、发布和性能列出 PASS/PARTIAL/FAIL/UNTESTED，明确禁止无验证的 100% 兼容声明。
+- 多卷 `mft-auto` 新增与 generation、卷身份和根边界绑定的名称/USN append-only delta WAL v2，持久化 durable cursor，并支持 checksum、write-through、`FlushFileBuffers`、撕裂尾部截断和 crash recovery。
+- 新增真实多卷 NTFS reconciliation 基准入口 `esm_reconcile_benchmark`，分阶段观察 MFT 枚举、多卷 namespacing、索引构建、checkpoint 写入以及 Working Set/Private Bytes；无管理员权限的零记录运行不会作为性能结论。
 - 多卷 `mft-auto` 新增与 snapshot generation 绑定的低内存元数据补齐 WAL，以及保存卷身份、root file ID、原始 USN journal boundary、补齐 cursor 和完成状态的 sidecar；恢复时会重新读取并校验当前 root file ID，健康重启会重放大小、修改时间和属性更新，并从已刷盘 cursor 继续后台补齐。
 - 元数据 WAL 使用带校验事务、write-through append 和 `FlushFileBuffers`；恢复会拒绝 generation/path fingerprint 不匹配的旧更新，并自动截断不完整事务尾部。
 
@@ -27,11 +32,15 @@
 
 ### Changed
 
-- ?? WAL ???????????????????? checkpoint ????????????? checkpoint ????????????????? MFT ????? reconciliation ????????????????????????????????
-- ??????????? snapshot ???????/USN WAL??? durable cursor ?? USN catch-up?WAL replay ??????????? I/O???????????????? hydration?
-- ?????? 5 ??? 100,000 ???????? checkpoint consolidation??? base + overlay - tombstone???? generation snapshot/WAL/state?????????????? generation ?????? WAL?
+- 文件名搜索 GUI 对首个输入继续采用 15 ms 低延迟，对 150 ms 内的连续输入改用 60 ms 突发防抖，减少快速输入期间的中间 Named Pipe 查询；仍保持最多一个服务查询在途并丢弃过期 generation。
+- 首个交互查询少于 200 条时现在直接视为完整响应，不再发送无意义的第二次最终查询；可立即安排缺失元数据补齐和历史写入。只有首屏刚好达到 200 条且设置的最终上限更大时才保留 `200+` 状态并执行 refinement。
+- 文件名搜索的最终结果不再无条件访问文件系统补齐全部元数据；默认只补齐服务结果中修改时间仍未知的条目，按创建时间、访问时间或 NTFS Change 时间排序时才补齐全部结果。后台交接从深复制整个结果向量改为只复制所需结果的槽位和路径，最多 4 个 worker 读取，并在 UI 线程原位应用纯数值更新。
+
+- 名称/USN WAL 恢复与 checkpoint consolidation 统一使用 generation 边界；不可信的卷、root、journal 或 cursor 状态不会静默重放，而会保留可用名称基线并安排 reconciliation。
+- 健康启动恢复顺序调整为 snapshot、名称/USN WAL、元数据 hydration WAL、state sidecar 校验，再从 durable cursor 继续 USN catch-up，减少重复全盘文件 I/O。
+- checkpoint consolidation 按 `base + overlay - tombstone` 生成新 generation，并原子切换 snapshot/WAL/state；已增加多轮与 100,000 delta 的合成 crash-recovery 覆盖。
 - 默认多卷 `mft-auto` 服务改为两阶段首次建库和完整 reconciliation：MFT 路径重建后先保存并发布名称索引，使 Named Pipe 查询尽早可用；随后协调器按 ID 顺序每批检查 4,096 条基础记录、每批默认最多 4 个 worker 在索引锁外补齐大小/修改时间/属性，并在重新加锁时校验 ID 与路径仍匹配。USN 增量优先于下一批补齐；重命名、删除或全量替换造成的过期结果会被丢弃；每批之间检查停止请求，Event Log 每检查约 250,000 条报告一次进度并记录完成或提前停止摘要。
-- CLI、前台 MFT server 和单卷 MFT 服务继续保留同步元数据补齐行为；多卷后台补齐只物化有限批次路径，不保留第二份全盘路径向量。多卷服务现在先把每批成功读取的元数据事务刷入 generation-bound WAL，再合并内存索引；卷集合、卷身份、root 和原始 USN boundary 全部有效时，健康重启可跳过立即完整 MFT reconciliation。完整 reconciliation 创建新 generation 时，只有当前 live USN 状态仍连续可信，并且 MFT 扫描完成后可把新旧共有卷再次追赶到当前 USN 边界，才会把新 MFT 基线按 ID 排序，并在当前 live base/overlay 的文件 ID、完整路径一致且修改时间已知时复用大小、修改时间和属性；新 snapshot 直接保存复用结果，后台只读取未知或 stale 项。启动 state 失效、扫描后的 USN 追赶失败、普通 USN 读取失败或 journal gap 会禁用旧元数据复用，避免遗漏路径不变的内容修改。直接 USN 变化会先清空旧大小和时间，读取失败时保持未知，防止 stale 值进入查询或后续 generation；名称/USN delta 仍未持久化。
+- CLI、前台 MFT server 和单卷 MFT 服务继续保留同步元数据补齐行为；多卷后台补齐只物化有限批次路径，不保留第二份全盘路径向量。多卷服务现在先把每批成功读取的元数据事务刷入 generation-bound WAL，再合并内存索引；卷集合、卷身份、root 和原始 USN boundary 全部有效时，健康重启可跳过立即完整 MFT reconciliation。完整 reconciliation 创建新 generation 时，只有当前 live USN 状态仍连续可信，并且 MFT 扫描完成后可把新旧共有卷再次追赶到当前 USN 边界，才会把新 MFT 基线按 ID 排序，并在当前 live base/overlay 的文件 ID、完整路径一致且修改时间已知时复用大小、修改时间和属性；新 snapshot 直接保存复用结果，后台只读取未知或 stale 项。启动 state 失效、扫描后的 USN 追赶失败、普通 USN 读取失败或 journal gap 会禁用旧元数据复用，避免遗漏路径不变的内容修改。直接 USN 变化会先清空旧大小和时间，读取失败时保持未知，防止 stale 值进入查询或后续 generation；名称/USN delta 现已由与 generation、卷身份和根边界绑定的 append-only WAL v2 持久化。
 
 - 精确且仅含单个正向 `filelist:` 条件的查询改为复用现有 raw/accent-folded 名称前缀表：先按每个候选的 basename 缩小 base 记录范围，完整路径只为文件名精确命中的少量候选重建；overlay 继续完整求值。该优化不新增常驻文件名或路径哈希表，带 `*`/`?` 的列表仍走完整 evaluator。
 

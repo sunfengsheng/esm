@@ -221,7 +221,15 @@ cmake --build build-content --target `
 ctest --test-dir build-content -R esm_content_tests --output-on-failure
 ```
 
-`esm_content_tests` 现在还覆盖 `ContentAppSettings` 的 INI 保存/加载和独立默认数据根。旧目标 `esm_content_lab` 不再生成。
+`esm_content_tests` 现在覆盖 `ContentAppSettings` 的 INI 保存/加载、独立默认数据根、统一提取调度、DOCX ZIP/XML/实体提取、基础 PDF 文本流提取和损坏文档诊断。测试样本在运行时自行生成，因此 CI 不依赖安装 Microsoft Office、PDF 阅读器或系统第三方 IFilter。Windows IFilter 仍是环境相关的扩展路径，不能把某台开发机上的可用性当作发布保证。旧目标 `esm_content_lab` 不再生成。
+
+内容应用图标由仓库脚本生成：
+
+```powershell
+python tools\generate_content_icon.py
+```
+
+生成的 `assets\icon\content_search.ico` 同时用于 `esm_content.exe` 的 Windows 资源和独立 NSIS 安装/卸载界面。修改图标源或生成脚本后，应提交 SVG、预览 PNG、各尺寸 PNG 和 ICO，并重新构建 GUI 与安装包。
 
 本地开发安装包：
 

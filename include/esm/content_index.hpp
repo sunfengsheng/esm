@@ -110,4 +110,24 @@ private:
     std::size_t maximum_bytes,
     ContentDocument& document,
     std::wstring& error);
+[[nodiscard]] bool extract_docx_file(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    ContentDocument& document,
+    std::wstring& error);
+[[nodiscard]] bool extract_basic_pdf_file(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    ContentDocument& document,
+    std::wstring& error);
+[[nodiscard]] bool extract_windows_ifilter_file(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    ContentDocument& document,
+    std::wstring& error);
+[[nodiscard]] bool extract_content_file(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    ContentDocument& document,
+    std::wstring& error);
 } // namespace esm

@@ -4,6 +4,7 @@
 #include "esm/saved_search.hpp"
 #include "esm/directory_watcher.hpp"
 #include "esm/gui_settings.hpp"
+#include "esm/interactive_search_timing.hpp"
 #include "esm/index.hpp"
 #include "esm/ipc_protocol.hpp"
 #include "esm/named_pipe.hpp"
@@ -19,6 +20,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include "esm/query.hpp"
+#include "esm/result_metadata.hpp"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -59,6 +61,87 @@ std::uint64_t current_file_time() {
     return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32U) |
         value.dwLowDateTime;
 }
+void test_interactive_search_timing() {
+    require(esm::interactive_search_debounce_ms(1000, 0) ==
+                esm::interactive_search_initial_debounce_ms,
+            "first edit should retain low-latency debounce");
+    require(esm::interactive_search_debounce_ms(1100, 1000) ==
+                esm::interactive_search_burst_debounce_ms,
+            "rapid follow-up edits should use burst coalescing");
+    require(esm::interactive_search_debounce_ms(
+                1000 + esm::interactive_search_burst_window_ms, 1000) ==
+                esm::interactive_search_burst_debounce_ms,
+            "burst window boundary should remain coalesced");
+    require(esm::interactive_search_debounce_ms(
+                1001 + esm::interactive_search_burst_window_ms, 1000) ==
+                esm::interactive_search_initial_debounce_ms,
+            "edits outside the burst window should return to low latency");
+    require(esm::interactive_search_response_is_complete(false, 2, 200),
+            "short interactive responses should already be complete");
+    require(!esm::interactive_search_response_is_complete(false, 200, 200),
+            "full interactive pages should schedule final refinement");
+    require(esm::interactive_search_response_is_complete(true, 200, 200),
+            "explicit final responses should always be complete");
+}
+
+void test_result_metadata_pipeline() {
+    std::vector<esm::SearchResult> results(2);
+    results[0].score = 41;
+    results[0].record = record(7, L"alpha.txt", L"C:\\alpha.txt");
+    results[1].score = 42;
+    results[1].record = record(8, L"beta.txt", L"D:\\beta.txt");
+
+    const auto requests = esm::make_result_metadata_requests(results);
+    require(requests.size() == 2 && requests[0].result_index == 0 &&
+                requests[0].path == L"C:\\alpha.txt" &&
+                requests[1].result_index == 1 &&
+                requests[1].path == L"D:\\beta.txt",
+            "metadata handoff should retain only stable slots and paths");
+
+    results[1].record.last_write_time = 99;
+    const auto missing_requests =
+        esm::make_result_metadata_requests(results, true);
+    require(missing_requests.size() == 1 &&
+                missing_requests[0].result_index == 0 &&
+                missing_requests[0].path == L"C:\\alpha.txt",
+            "missing-only metadata requests should skip indexed timestamps");
+    results[1].record.last_write_time = 0;
+
+    esm::ResultMetadataUpdate valid;
+    valid.result_index = 1;
+    valid.size = 1234;
+    valid.last_write_time = 11;
+    valid.creation_time = 12;
+    valid.last_access_time = 13;
+    valid.change_time = 14;
+    valid.attributes = FILE_ATTRIBUTE_ARCHIVE;
+    valid.directory = false;
+    valid.succeeded = true;
+    esm::ResultMetadataUpdate failed;
+    failed.result_index = 0;
+    failed.size = 9999;
+    failed.succeeded = false;
+    esm::ResultMetadataUpdate out_of_range = valid;
+    out_of_range.result_index = 99;
+
+    const std::array updates{valid, failed, out_of_range};
+    require(esm::apply_result_metadata_updates(results, updates) == 1,
+            "only successful in-range metadata updates should apply");
+    require(results[0].record.size == 0,
+            "failed metadata update should preserve the original record");
+    require(results[1].record.size == 1234 &&
+                results[1].record.last_write_time == 11 &&
+                results[1].record.creation_time == 12 &&
+                results[1].record.last_access_time == 13 &&
+                results[1].record.change_time == 14 &&
+                results[1].record.attributes == FILE_ATTRIBUTE_ARCHIVE,
+            "metadata update should refresh every numeric field");
+    require(results[1].score == 42 && results[1].record.id == 8 &&
+                results[1].record.name == L"beta.txt" &&
+                results[1].record.path == L"D:\\beta.txt",
+            "metadata update should preserve result identity and text");
+}
+
 void test_multi_volume_namespacing() {
     const auto c_id = esm::namespace_ntfs_file_id(
         L"\\\\?\\Volume{11111111-1111-1111-1111-111111111111}\\", 42);
@@ -3150,7 +3233,7 @@ void test_scanner() {
 }
 int main() {
     try {
-        test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
+        test_interactive_search_timing(); test_result_metadata_pipeline(); test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_named_pipe_search(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

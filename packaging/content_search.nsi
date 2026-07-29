@@ -32,8 +32,8 @@ SetCompressor /SOLID lzma
 SetDatablockOptimize on
 CRCCheck on
 BrandingText "Everything SM Content Search"
-Icon "${PROJECT_ROOT}\assets\icon\everything_sm.ico"
-UninstallIcon "${PROJECT_ROOT}\assets\icon\everything_sm.ico"
+Icon "${PROJECT_ROOT}\assets\icon\content_search.ico"
+UninstallIcon "${PROJECT_ROOT}\assets\icon\content_search.ico"
 VIProductVersion "${PRODUCT_VERSION_RESOURCE}"
 VIAddVersionKey /LANG=2052 "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
@@ -47,8 +47,8 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "Development package; review licensi
 !include "x64.nsh"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "${PROJECT_ROOT}\assets\icon\everything_sm.ico"
-!define MUI_UNICON "${PROJECT_ROOT}\assets\icon\everything_sm.ico"
+!define MUI_ICON "${PROJECT_ROOT}\assets\icon\content_search.ico"
+!define MUI_UNICON "${PROJECT_ROOT}\assets\icon\content_search.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\esm_content.exe"
 !define MUI_FINISHPAGE_RUN_PARAMETERS "--config $\"$LOCALAPPDATA\everything_sm_content\content.ini$\""
 !define MUI_FINISHPAGE_RUN_TEXT "启动 Everything SM 内容搜索"

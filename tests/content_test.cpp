@@ -73,6 +73,106 @@ void write_utf8(const std::filesystem::path& path, std::string_view text) {
     write_bytes(path, std::vector<std::uint8_t>(text.begin(), text.end()));
 }
 
+void append_u16(std::vector<std::uint8_t>& bytes, std::uint16_t value) {
+    bytes.push_back(static_cast<std::uint8_t>(value));
+    bytes.push_back(static_cast<std::uint8_t>(value >> 8));
+}
+
+void append_u32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
+    bytes.push_back(static_cast<std::uint8_t>(value));
+    bytes.push_back(static_cast<std::uint8_t>(value >> 8));
+    bytes.push_back(static_cast<std::uint8_t>(value >> 16));
+    bytes.push_back(static_cast<std::uint8_t>(value >> 24));
+}
+
+void write_stored_docx(const std::filesystem::path& path,
+                       std::string_view document_xml) {
+    constexpr std::string_view name = "word/document.xml";
+    std::vector<std::uint8_t> bytes;
+    append_u32(bytes, 0x04034b50);
+    append_u16(bytes, 20);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u32(bytes, 0);
+    append_u32(bytes, static_cast<std::uint32_t>(document_xml.size()));
+    append_u32(bytes, static_cast<std::uint32_t>(document_xml.size()));
+    append_u16(bytes, static_cast<std::uint16_t>(name.size()));
+    append_u16(bytes, 0);
+    bytes.insert(bytes.end(), name.begin(), name.end());
+    bytes.insert(bytes.end(), document_xml.begin(), document_xml.end());
+
+    const auto central_offset = static_cast<std::uint32_t>(bytes.size());
+    append_u32(bytes, 0x02014b50);
+    append_u16(bytes, 20);
+    append_u16(bytes, 20);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u32(bytes, 0);
+    append_u32(bytes, static_cast<std::uint32_t>(document_xml.size()));
+    append_u32(bytes, static_cast<std::uint32_t>(document_xml.size()));
+    append_u16(bytes, static_cast<std::uint16_t>(name.size()));
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u32(bytes, 0);
+    append_u32(bytes, 0);
+    bytes.insert(bytes.end(), name.begin(), name.end());
+    const auto central_size =
+        static_cast<std::uint32_t>(bytes.size()) - central_offset;
+
+    append_u32(bytes, 0x06054b50);
+    append_u16(bytes, 0);
+    append_u16(bytes, 0);
+    append_u16(bytes, 1);
+    append_u16(bytes, 1);
+    append_u32(bytes, central_size);
+    append_u32(bytes, central_offset);
+    append_u16(bytes, 0);
+    write_bytes(path, bytes);
+}
+
+void write_basic_pdf(const std::filesystem::path& path,
+                     std::string_view text) {
+    std::vector<std::string> objects;
+    objects.emplace_back("<< /Type /Catalog /Pages 2 0 R >>");
+    objects.emplace_back("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    objects.emplace_back(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>");
+    objects.emplace_back(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    const std::string stream =
+        "BT /F1 18 Tf 72 720 Td (" + std::string(text) + ") Tj ET";
+    objects.emplace_back("<< /Length " + std::to_string(stream.size()) +
+                         " >>\nstream\n" + stream + "\nendstream");
+
+    std::string pdf = "%PDF-1.4\n";
+    std::vector<std::size_t> offsets{0};
+    for (std::size_t index = 0; index < objects.size(); ++index) {
+        offsets.push_back(pdf.size());
+        pdf += std::to_string(index + 1) + " 0 obj\n" + objects[index] +
+               "\nendobj\n";
+    }
+    const auto xref = pdf.size();
+    pdf += "xref\n0 " + std::to_string(objects.size() + 1) +
+           "\n0000000000 65535 f \n";
+    for (std::size_t index = 1; index < offsets.size(); ++index) {
+        char entry[24]{};
+        snprintf(entry, sizeof(entry), "%010llu 00000 n \n",
+                 static_cast<unsigned long long>(offsets[index]));
+        pdf += entry;
+    }
+    pdf += "trailer\n<< /Size " + std::to_string(objects.size() + 1) +
+           " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) +
+           "\n%%EOF\n";
+    write_utf8(path, pdf);
+}
+
 void test_content_settings_round_trip() {
     TemporaryDirectory directory(L"everything-sm-content-settings");
     const auto config = directory.path() / L"content.ini";
@@ -258,6 +358,10 @@ void test_plain_text_extraction() {
             "UTF-8 text should be extracted");
     require(document.utf8_text == utf8_text,
             "UTF-8 text should remain unchanged");
+    esm::ContentDocument dispatched_document;
+    require(esm::extract_content_file(utf8_path, 1024, dispatched_document, error) &&
+                dispatched_document.utf8_text == utf8_text,
+            "the unified extractor should preserve plain-text behavior");
     require(document.path.is_absolute() &&
                 document.size == document.utf8_text.size(),
             "extracted document metadata should be populated");
@@ -285,8 +389,38 @@ void test_plain_text_extraction() {
 
     require(esm::is_supported_content_path(L"sample.TXT") &&
                 esm::is_supported_content_path(L"sample.md") &&
-                !esm::is_supported_content_path(L"sample.pdf"),
-            "supported content extensions should be case-insensitive and explicit");
+                esm::is_supported_content_path(L"sample.PDF") &&
+                esm::is_supported_content_path(L"sample.doc") &&
+                esm::is_supported_content_path(L"sample.DOCX") &&
+                !esm::is_supported_content_path(L"sample.exe"),
+            "supported content extensions should include PDF and Word explicitly");
+
+    const auto valid_docx = directory.path() / L"word.docx";
+    write_stored_docx(
+        valid_docx,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:body><w:p><w:r><w:t>Word &amp; DOCX "+
+        utf8(L"中文内容") +
+        "</w:t></w:r></w:p></w:body></w:document>");
+    require(esm::extract_docx_file(valid_docx, 4096, document, error) &&
+                document.utf8_text.find("Word & DOCX") != std::string::npos &&
+                document.utf8_text.find(utf8(L"中文内容")) !=
+                    std::string::npos,
+            "the built-in DOCX fallback should extract XML text and entities");
+
+    const auto basic_pdf = directory.path() / L"basic.pdf";
+    write_basic_pdf(basic_pdf, "pdffallbackunique PDF extraction");
+    require(esm::extract_basic_pdf_file(basic_pdf, 4096, document, error) &&
+                document.utf8_text.find("pdffallbackunique") !=
+                    std::string::npos,
+            "the built-in PDF fallback should extract basic text streams");
+
+    const auto invalid_docx = directory.path() / L"invalid.docx";
+    write_utf8(invalid_docx, "not a real Office package");
+    require(!esm::extract_content_file(invalid_docx, 1024, document, error) &&
+                !error.empty(),
+            "an invalid or unsupported IFilter document should fail diagnostically");
 }
 
 void test_content_path_filter_and_root_keys() {

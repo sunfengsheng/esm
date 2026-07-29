@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(esm_core
     src/core/index.cpp
     src/core/gui_settings.cpp
+    src/core/result_metadata.cpp
     src/core/file_list.cpp
     src/core/saved_search.cpp
     src/core/query.cpp
@@ -79,11 +80,14 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   add_library(esm_xapian_content
       src/content/xapian_content_index.cpp
+      src/content/docx_extractor.cpp
+      src/content/pdf_text_extractor.cpp
+      src/content/windows_ifilter_extractor.cpp
       src/platform/windows/content_roots.cpp
   )
   target_include_directories(esm_xapian_content PUBLIC include)
   target_link_libraries(esm_xapian_content
-      PRIVATE esm_xapian_dependency z rpcrt4 ws2_32)
+      PRIVATE esm_xapian_dependency z rpcrt4 ws2_32 query ole32)
   target_compile_definitions(esm_xapian_content PUBLIC
       UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 
@@ -95,10 +99,10 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   add_executable(esm_content WIN32
       src/apps/content_gui/main.cpp
-      src/apps/gui/resources.rc
+      src/apps/content_gui/resources.rc
   )
   target_link_libraries(esm_content PRIVATE
-      esm_content_protocol comctl32 shell32)
+      esm_content_protocol comctl32 shell32 ole32 uuid)
 
   add_executable(esm_content_cli
       src/apps/content_cli/main.cpp
@@ -165,16 +169,6 @@ if(ESM_BUILD_BENCHMARKS)
   target_link_libraries(esm_real_search_benchmark PRIVATE esm_core psapi)
   add_executable(esm_reconcile_benchmark benchmarks/reconciliation_benchmark.cpp)
   target_link_libraries(esm_reconcile_benchmark PRIVATE esm_core psapi)
+  add_executable(esm_gui_pipeline_benchmark benchmarks/gui_pipeline_benchmark.cpp)
+  target_link_libraries(esm_gui_pipeline_benchmark PRIVATE esm_core)
 endif()
-
-
-
-
-
-
-
-
-
-
-
-

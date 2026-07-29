@@ -521,7 +521,7 @@ bool is_supported_content_path(const std::filesystem::path& path) {
         L".cpp", L".cxx", L".h", L".hpp", L".cs", L".java",
         L".py", L".js", L".ts", L".tsx", L".jsx", L".rs", L".go",
         L".cmake", L".ps1", L".bat", L".cmd", L".sql", L".html",
-        L".htm", L".css", L".toml"};
+        L".htm", L".css", L".toml", L".pdf", L".doc", L".docx"};
     auto extension = invariant_lower(path.extension().wstring());
     return supported.contains(extension);
 }

@@ -93,7 +93,7 @@ bool index_path(esm::ContentIndex& index, const esm::ContentPathFilter& filter,
     }
     esm::ContentDocument document;
     std::wstring error;
-    if (!esm::extract_plain_text_file(path, maximum_bytes, document, error)) {
+    if (!esm::extract_content_file(path, maximum_bytes, document, error)) {
         ++skipped;
         return false;
     }

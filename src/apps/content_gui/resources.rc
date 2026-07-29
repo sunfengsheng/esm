@@ -1,0 +1,3 @@
+#include "resource.h"
+
+IDI_CONTENT_APP ICON "../../../assets/icon/content_search.ico"

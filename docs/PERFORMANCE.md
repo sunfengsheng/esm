@@ -1,4 +1,4 @@
-﻿# 性能说明
+# 性能说明
 
 ## 1. 性能目标
 
@@ -358,29 +358,97 @@ throughput=43,609 records/s
 本轮验证方法仅为 `build-ucrt-vendor-final` Release 正确性测试：构造无序新基线，覆盖 matching base、matching overlay、路径变化、removed、来源未知和新 ID，检查排序、复用统计及未知项保持未修改；同时验证后台批次跳过已知 base 元数据，并验证直接 USN 变化后的文件元数据读取失败会把旧大小/修改时间置为未知。该测试没有使用真实百万级 MFT、SCM 服务、磁盘 flush 或并发 USN 压力，因此不能声称 reconciliation 时间、启动时间、Private Bytes 或磁盘写入已经改善到某个实测数值。后续真实基准应记录 `reused metadata/unknown/stale`、原地排序与线性核对时间、新 snapshot 保存时间、WAL 事务数、补齐文件 I/O 数、USN catch-up 延迟和峰值内存，并与未复用版本在同一 snapshot/卷集合上对照。
 
 
-## 2026-07-29 ???? reconciliation ????
+## 2026-07-29：真实 reconciliation 基准入口
 
-?? Release ?? `esm_reconcile_benchmark`?????????????????????????????????? NTFS ????? `FSCTL_ENUM_USN_DATA`?????
+Release 目标 `esm_reconcile_benchmark` 用于观察默认多卷 NTFS 完整 reconciliation 的真实阶段，而不是生成合成百万记录。它依次记录：
 
-1. ?? NTFS ????
-2. ???? MFT/USN ????? size/time hydration??
-3. ?? reserve ??????? ID namespacing?
-4. `MetadataIndex` base ???
-5. `snapshot_records()` checkpoint ???
-6. ?? atomic snapshot writer ???
-7. ???? 10 ms ?? Working Set ? Private Bytes?
+1. 固定 NTFS 卷发现；
+2. 每卷 `FSCTL_ENUM_USN_DATA` MFT/USN 枚举（不包含后续 size/time hydration）；
+3. 多卷合并、一次性 reserve 和卷级 ID namespacing；
+4. `MetadataIndex` base 构建；
+5. `snapshot_records()` checkpoint 物化；
+6. 原子 snapshot 写入；
+7. 后台每 10 ms 采样 Working Set 和 Private Bytes。
 
-??????????MFT ???????????checkpoint ???????? `flush` ???????????????????????????????????????? `million_scale=1/0`?????????? 1,000,000 ??????????
+输出文件包含阶段耗时、每卷记录数、峰值内存和 `million_scale=1/0`。该工具需要能够读取卷 MFT 的管理员权限；非提升进程得到 `records=0` 时只能证明权限路径被拒绝，不能作为性能数据。
 
-????????
+验证命令：
 
 ```powershell
-cmake --build build-ucrt-vendor-final --config Release `
-  --target esm_service esm_tests esm_reconcile_benchmark -j 4
+cmake --build build-ucrt-vendor-final --config Release   --target esm_service esm_tests esm_reconcile_benchmark -j 4
 $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 ctest --test-dir build-ucrt-vendor-final -C Release --output-on-failure
 ```
 
-2026-07-29 ????? Release ?????2/2 CTest ??????????????? MFT ??????? `records=0` ???????????????????????? UAC????????????????????????????????????????????????????????
+2026-07-29 的非提升 Release 运行完成了构建和测试，但真实 MFT 阶段返回 `records=0`，因此没有发布任何 reconciliation 时间或峰值内存结论。后续需要在明确提升的同一机器上运行，并同时记录文件名 GUI、Named Pipe、USN catch-up 和 metadata hydration；不能把 checkpoint 单元测试、合成记录或无权限样本夸大为 Everything 级端到端结果。
 
-??????????????? MFT + ??? index/checkpoint????????? GUI?Named Pipe?????????? metadata hydration????? Everything ?????????????????????????? checkpoint ???? `vector<FileRecord>`???????????????? streaming/mapped consolidation ?????????????
+## 12. 内容 GUI 连续输入与文档提取功能检查（2026-07-29）
+
+### 12.1 测试方法
+
+- 使用 `build-ucrt-vendor-final` Release 构建；
+- 创建唯一测试 Pipe 和只包含 `welcome.txt`、`word-support.docx`、`pdf-support.pdf` 的临时根；
+- DOCX/PDF 样本包含各自唯一词，通过真实 `esm_content_service.exe`、Named Pipe 和 `esm_content_cli.exe` 查询；
+- 使用 Windows UI 自动化向内容 GUI 输入查询，检查搜索框、清空/打开/打开目录按钮、结果列、状态灯、状态文字和结果计数；
+- 连续输入路径使用 160 ms debounce、单一长期 IPC worker 和 generation 丢弃过期结果。
+
+### 12.2 观察结果与边界
+
+服务完成后报告 `documents=3 ready=1 indexing=0`；DOCX 和 PDF 唯一词分别返回对应文件。本机 `LoadIFilter` 对 DOCX 返回 class-not-registered、对 PDF 返回 `E_NOINTERFACE`，因此该样本验证的是内置 DOCX/PDF 回退，而不是第三方 IFilter。UI 自动化确认 TXT 查询可显示结果、完成状态和结果计数。
+
+这是一组 3 文档的小样本功能与响应性检查，没有采集稳定的端到端延迟分布，也没有覆盖整机扫描、复杂 PDF、Office 大文档、OCR、冷缓存、后台高负载或真实键盘/IME 的 p50/p95。长期 worker 主要消除连续输入时反复创建 detached thread 和过期结果回写；它不代表 Xapian 查询本身变快，更不能据此声称达到 Everything 的即时搜索性能。
+
+
+## 13. 文件名 GUI 输入与元数据交接基线（2026-07-29）
+
+### 13.1 测试环境与方法
+
+- 构建：`build-ucrt-vendor-final`，`Release`，MinGW/UCRT64；
+- 机器：Intel Core i7-10750H，6 核 12 线程，物理内存约 15.8 GiB；
+- 真实索引：`C:\ProgramData\everything_sm\indexes\mft-index.snapshot`，3,300,421 条记录；
+- 进程内真实 snapshot 基准：`esm_real_search_benchmark.exe`，每个查询预热后运行 9 次并报告 p50/p95，`limit=1000`；
+- GUI 数据交接微基准：`esm_gui_pipeline_benchmark.exe <result-count>`，分别运行 21 次，比较旧的完整 `vector<SearchResult>` 深复制与新的“结果槽位 + 路径”请求构建；内存数字由容器容量、对象大小和字符串 capacity 估算，不是 Working Set/Private Bytes；
+- 本节包含一次 Windows UI 自动化功能检查，但没有自动化真实键盘/IME、稳定窗口绘制、Shell 图标或 Named Pipe 端到端延迟分布，因此不能据此声称达到 Everything 的端到端体感或性能。
+
+### 13.2 真实 330 万记录进程内基线
+
+本轮未修改核心倒排索引；该数据用于给 GUI 优化提供服务端量级背景：
+
+| 阶段/查询 | 结果 |
+|---|---:|
+| snapshot load | 3172 ms |
+| MetadataIndex build | 18053 ms |
+| build peak Private Bytes | 2320.20 MiB |
+| index ready Private Bytes | 440.95 MiB |
+| `1` p50 / p95 | 2.92 / 3.46 ms |
+| `txt` p50 / p95 | 1.56 / 2.30 ms |
+| `123456789.txt` p50 / p95 | 0.04 / 0.12 ms |
+| `path:test1` p50 / p95 | 46.70 / 65.33 ms |
+
+这些是同进程查询时间，不包含 Named Pipe 序列化、GUI 线程调度、ListView 失效重绘和图标加载。`path:` 仍是明显慢路径。
+
+### 13.3 GUI 元数据交接合成微基准
+
+| 结果数 | 旧完整深复制 p50 / p95 | 新轻量请求构建 p50 / p95 | 旧交接估算 | 新请求估算 | 数值更新 payload 估算 |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 0.39 / 0.54 ms | 0.21 / 0.36 ms | 0.38 MiB | 0.22 MiB | 0.05 MiB |
+| 100,000 | 38.31 / 47.73 ms | 22.92 / 26.17 ms | 39.22 MiB | 22.27 MiB | 5.34 MiB |
+
+100,000 条样本的 21 次范围：旧深复制 30.98–49.16 ms，新轻量请求构建 17.76–27.30 ms。新的运行时峰值还会同时包含请求与数值更新数组，不能简单把 22.27 MiB 当作完整峰值；但窗口线程不再复制名称字符串，后台完成后也只向窗口传回固定大小数值更新，不再把完整结果向量往返一次。
+
+### 13.4 GUI 功能自动化观察
+
+2026-07-29 使用工作区 `esm_gui.exe` 连接本机已运行服务，并通过 Windows UI 自动化注入查询、等待后读取可访问性树：
+
+- `123456789.txt` 返回 2 条；`D:\test1\123456789.txt` 显示 0 B 和 `2026-07-24 15:47`，Recent 快捷方式显示 565 B 和同一分钟修改时间；状态为 `2 个结果，13.92 ms`，没有 `+`，验证少于 200 条的首屏被直接视为完整并可启动缺失元数据补齐。
+- 宽查询 `1` 在输入后约 180 ms 的观察点显示 `200+ 个结果，104.02 ms`，再等待约 1.2 秒后显示 `1000 个结果，105.83 ms`，验证仅满 200 条首屏进入最终 refinement。
+- 自动化输入 `path:program files ext:exe` 的调用本身约 33.6 ms，查询完成时搜索框仍保持焦点；该次状态栏为 `4 个结果，435.74 ms`，再次说明 `path:`/复杂组合仍是慢路径。另一次单字符输入调用约 40.9 ms。
+
+状态栏中的毫秒值来自服务响应，不等于从物理按键到首帧绘制的端到端延迟；自动化调用耗时也包含工具与输入注入开销。以上均为单次功能观察，不是 p50/p95，不覆盖真实键盘/IME、冷缓存或后台高负载。
+
+### 13.5 行为优化和剩余瓶颈
+
+- 首个输入仍使用 15 ms 防抖；150 ms 内的后续输入使用 60 ms 防抖，以合并快速输入突发。少于 200 条的首屏直接视为完整；只有刚好达到 200 条且最终上限更大时才显示 `+` 并安排 refinement。
+- 客户端仍保持最多一个同步 Named Pipe 查询在途，不会在每个按键上调用 `CancelSynchronousIo`；这避免取消风暴占满服务端 worker，但一个已经开始的慢查询仍可能增加最新输入的尾部延迟。
+- 默认名称、路径、大小、修改时间和类型视图不再触发最终结果的无条件完整文件系统 hydration；只为修改时间仍未知的结果构建轻量请求。按创建时间、访问时间或 NTFS Change 时间排序时才读取全部结果路径，并最多使用 4 个 worker。
+- 下一步仍需要可取消的服务端 query generation、Named Pipe/反序列化/列表重绘分阶段计时，以及真实 GUI 连续输入 p50/p95。当前优化不能被描述为 Everything 100% 性能兼容。

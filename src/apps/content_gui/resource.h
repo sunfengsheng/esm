@@ -1,0 +1,1 @@
+#define IDI_CONTENT_APP 101

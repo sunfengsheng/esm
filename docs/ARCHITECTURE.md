@@ -235,27 +235,38 @@ sequenceDiagram
     participant M as 元数据线程
 
     U->>G: 文本变化
-    G->>G: 去重/取消旧请求
+    G->>G: 去重并更新 generation<br/>首键15ms/突发输入60ms防抖
     G->>W: 活跃查询，limit=200
     W->>S: Named Pipe request
     S-->>W: 已排序轻量结果
     W-->>G: 更新虚拟列表
-    G->>G: 约250ms refinement计时
-    G->>W: 稳定查询，limit=设置值(默认1000)
-    W->>S: Named Pipe request
-    S-->>W: 最终结果
-    W-->>G: 更新列表
-    G->>M: 延迟补齐大小/时间/图标
-    M-->>G: 分批刷新可见数据
+    alt 首屏少于200条
+        G->>G: 直接标记完整响应
+    else 首屏刚好达到200条且最终上限更大
+        G->>G: 约250ms refinement计时
+        G->>W: 稳定查询，limit=设置值(默认1000)
+        W->>S: Named Pipe request
+        S-->>W: 最终结果
+        W-->>G: 更新列表
+    end
+    alt 默认视图存在修改时间未知的结果
+        G->>M: 只复制未知结果的槽位+路径
+        M-->>G: 返回基础数值更新并原位应用
+    else 按创建/访问/NTFS Change 时间排序
+        G->>M: 复制全部结果槽位+路径
+        M-->>G: 返回完整数值更新并原位应用/重排
+    end
     G->>G: 约1秒后写查询历史
 ```
 
 关键响应策略：
 
-- 文本变化请求去重和取消过期结果；
-- 不重复排序服务端已按名称自然顺序返回的结果；
+- 搜索框和组合框的重复通知先去重；首个输入保持 15 ms 低延迟，150 ms 内的后续输入采用 60 ms 突发防抖；
+- 不在每个按键上取消同步 Pipe I/O：客户端保持最多一个服务请求在途，以 generation 丢弃旧响应，并在到期后发送最新合并查询，避免取消风暴占满 4 个服务 worker；
+- 不重复排序服务端已按请求顺序返回的结果；首个交互响应少于请求上限 200 条时已经覆盖全部匹配，直接作为完整响应进入元数据补齐和历史延迟写入。只有刚好返回 200 条且最终结果上限更大时才显示 `+` 并安排 refinement；
+- 默认名称/路径/大小/修改时间/类型视图优先使用索引返回的紧凑元数据；若结果的修改时间仍为未知值，只为这些结果启动选择性 hydration。只有本地排序确实依赖创建时间、访问时间或 NTFS Change 时间时，才对全部完整结果启动延迟完整 hydration；
+- hydration 线程只持有“结果槽位 + 路径”请求；默认模式会在交接前过滤掉修改时间已知的记录，完整时间排序模式才保留全部结果。后台最多 4 个 worker 并行读取，完成后只向 UI 返回数值字段并原位应用，避免深复制并往返替换完整 `vector<SearchResult>`；
 - Shell 图标按扩展名缓存；
-- 文件元数据后台 hydration；
 - 搜索历史延迟写入，避免每次按键同步 I/O。
 
 ## 11. 设置和用户数据
@@ -303,64 +314,31 @@ flowchart LR
 内容 shard 的 writer 在 `commit()` 发布新 revision 时取得独占 revision 锁，查询在打开只读 `Xapian::Database`、取得 MSet、读取 document data 和生成摘要的整个期间持有共享 revision 锁。这样多个查询仍可并行，但不会与本进程的 commit 交叉而得到失效快照。若数据库被外部变化或底层 revision 竞争打断，查询最多重新打开数据库重试 3 次；其余 `Xapian::Error` 在索引边界转换为 `std::runtime_error`。Named Pipe 请求处理、每根扫描/监听工作线程和 `wmain` 还有 `catch (...)` 最后防线，避免 Xapian 不继承 `std::exception` 的异常越过进程边界。该策略优先保证原型稳定性，尚未实现可取消查询、查询优先级或跨 shard 并行执行。
 
 
-## ????/USN WAL v2 ? checkpoint ????
+## 名称/USN WAL v2 与 checkpoint consolidation
 
-???? NTFS ??????? WAL?
+默认多卷 `mft-auto` 将名称/USN 增量持久化为与 snapshot generation、卷身份和根信息绑定的 append-only WAL。事务包含校验信息、durable USN cursor 和提交边界；写入使用 write-through，并在提交后调用 `FlushFileBuffers`。恢复时只重放完整事务，撕裂尾部会被截断；generation、卷集合、root file ID、journal ID 或 cursor 边界不一致时拒绝把旧 WAL 应用到新基线，并转入 reconciliation。
 
-```text
-mft-index.snapshot.names.<generation-hex>.<volume-fingerprint>.wal
-```
+恢复顺序为：
 
-???? WAL replay ???????????? checkpoint????????????????????????????????? generation snapshot??????????????checkpoint ????????????????????
+1. 读取当前 manifest/state 和 generation snapshot；
+2. 校验卷集合、卷身份、root file ID 与 journal 边界；
+3. 重放名称/USN delta WAL 和元数据 hydration WAL；
+4. 从 durable cursor 继续 USN catch-up；
+5. 当 delta 数量或运维操作触发 checkpoint 时，按 `base + overlay - tombstone` 物化新的 generation snapshot；
+6. 原子切换 generation 对应的 snapshot/WAL/state，再清理旧 generation 文件。
 
-????????
+checkpoint consolidation 已覆盖 base、overlay 和 tombstone 的 ID 语义，并有事务尾部、generation mismatch 和 crash-recovery 测试。当前 writer 仍会物化完整记录向量；百万级真实卷的 checkpoint 峰值内存和耗时仍需继续优化，不能把格式正确性测试当作真实端到端性能结果。
 
-```text
-snapshot generation
-volume identity fingerprint
-volume root fingerprint
-root file ID
-journal ID
-start USN -> next USN
-payload checksum
-```
+## NTFS 文件身份边界
 
-??????
-
-```text
-read_usn_changes
-  -> append transaction with write-through
-  -> FlushFileBuffers
-  -> MetadataIndex::apply_ntfs_changes
-  -> advance in-memory durable cursor
-```
-
-????????
-
-```text
-load snapshot
-  -> replay metadata hydration WAL
-  -> restore and validate per-volume state sidecar
-  -> publish compact/base search index
-  -> replay each volume name/USN WAL without synchronous metadata hydration
-  -> advance per-volume cursor to WAL durable cursor
-  -> continue live journal catch-up
-```
-
-checkpoint consolidation ??? 5 ??? 100,000 ??????????????? `base + overlay - removed`?? ID ?????? generation snapshot????? generation hydration/name WAL???? per-volume state??? snapshot????? WAL ? state ??????? live generation???? WAL ???????hydration WAL ???????????????????? generation ? size/time hydration ?????????
-
-??????????snapshot/state ???????? snapshot ???? state ????????? generation mismatch ?????????? reconciliation??????????? base???????????? manifest ????????? generation directory??? current-manifest?streaming/mapped checkpoint writer ???? generation ???
-
-## NTFS ?????????????
-
-????????? 64 ? `id` ???? NTFS ???????????? MFT file reference ??????????? hard-link ???????
+当前内部 64 位 `id` 已按卷做 namespace 隔离，并保留原始 NTFS file reference 用于同卷增量更新；但这还不是完整的 Everything 目录入口语义。目标模型为：
 
 ```text
 NtfsObjectIdentity = volume identity + full file reference (record slot + sequence)
 NtfsDirectoryEntryIdentity = object identity + parent object identity + entry name/discriminator
 ```
 
-????????????????????? size/time/attributes ????sequence ?????? MFT slot ??? sequence ?????????????? generation WAL?? hydration ???? parent reference ?????`FSCTL_ENUM_USN_DATA` ??????????? hard-link ??????????????????????? provider??? snapshot/WAL schema ???????????
+后续仍需把完整 record/parent sequence 传播到 provider、snapshot、WAL 和 hydration 校验中，明确 MFT slot 重用边界，并让每个 hard-link 目录入口都能独立出现在查询结果中。当前实现不得声称 hard-link 与 sequence 语义已经 100% 完成。
 
 ## 独立内容搜索应用边界（2026-07-29）
 
@@ -386,3 +364,34 @@ flowchart LR
 3. 两套服务使用不同 Pipe 和不同默认数据根；
 4. 当前不共享任何可写状态；未来允许的集成仅限只读文件发现 IPC 或 GUI 跳转；
 5. 内容服务故障不能改变文件名服务的可用性和恢复路径。
+
+### 内容提取调度与 GUI 查询线程（2026-07-29）
+
+```mermaid
+flowchart LR
+    Scanner["根扫描 / watcher"] --> Dispatcher["extract_content_file"]
+    Dispatcher --> Plain["纯文本解码"]
+    Dispatcher --> IFilter["Windows IFilter"]
+    Dispatcher --> Docx["内置 DOCX ZIP/XML"]
+    Dispatcher --> Pdf["内置基础 PDF 文本流"]
+    Plain --> Xapian["ContentIndex::upsert"]
+    IFilter --> Xapian
+    Docx --> Xapian
+    Pdf --> Xapian
+```
+
+`extract_content_file` 根据扩展名调度提取器：DOCX/PDF 先尝试系统 IFilter，再进入内置回退；旧 `.doc` 只走 IFilter；纯文本保持原解码路径。提取仍在内容服务的扫描/watcher 工作线程中执行，第三方 IFilter 尚未移动到独立低权限进程，因此崩溃、挂起和资源隔离仍是下一阶段架构工作。
+
+内容 GUI 不再为每次文本变化创建 detached thread。窗口线程只负责 160 ms debounce、提交最新 generation 和绘制；一个长期 `std::jthread` 串行执行 search/status Named Pipe 请求，尚未开始的搜索会被最新查询覆盖，已经返回但 generation 过期的结果会被窗口丢弃。当前 Pipe 客户端仍使用同步 I/O，尚不能真正取消已进入服务端或正在等待的请求。
+
+右侧预览窗格复用同一条搜索响应，不新增文件解析或 IPC：
+
+```mermaid
+flowchart LR
+    Xapian["Xapian 命中"] --> Hit["snippet + UTF-16 highlights"]
+    Hit --> Pipe["内容 Named Pipe"]
+    Pipe --> List["结果列表"]
+    Hit --> Preview["右侧预览窗格"]
+```
+
+列表选择变化时，窗口线程把命中的文件名、完整路径和索引摘要写入只读 RichEdit，并按服务端返回的 UTF-16 范围设置黄色粗体。预览不会重新读取原始 DOCX/PDF，也没有接入 Windows Preview Handler；因此它展示的是索引摘要，而不是文件页面、Word 排版或 PDF 渲染结果。

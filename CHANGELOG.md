@@ -6,6 +6,7 @@
 
 ### Changed
 
+- GitHub Windows 流水线现在会在 `main`、pull request、手动运行和 tag 上都构建 GPL 内容搜索预览安装包及完整对应源码；非 tag 构建使用 CMake 项目版本并只作为 30 天 Actions artifact，tag 仍使用 tag 版本并进入 Release 流程。
 - 内容服务在未显式使用 `--db` 时，即使只有一个根也改用 `<database_root>\volumes\<root-key>\xapian` 独立分片，避免 GUI 更换单根后复用旧 `index\xapian` 并返回旧根文档。旧单根数据库不会自动删除，升级后会在 root-key 分片中重建。
 - GitHub 标签构建在配置生产 PFX 时继续生成并校验签名安装包；未配置证书时不再中止，而是生成带 `UNSIGNED-PRERELEASE.txt` 警告的未签名预发布包，并把 GitHub Release 标记为 prerelease。MSVC CI 改为使用 runner 当前默认 Visual Studio 生成器，安装 smoke 使用无空格的临时安装目录，避免 runner 工具链升级和参数拆分造成误失败。
 - 未签名预发布版在 MinGW/MSVC 构建和测试通过后允许保留可下载 Release，即使隔离 runner 的安装 smoke 失败，也会把失败状态写入 `UNSIGNED-PRERELEASE.txt`；生产签名标签仍把 smoke 成功作为发布硬门槛。安装 smoke 增加命令、退出码、安装目录和 SCM 状态诊断。

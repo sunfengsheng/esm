@@ -158,9 +158,10 @@ git status --short
 2. 安装 MSYS2 UCRT64；
 3. 配置和编译 Release；
 4. 运行测试；
-5. 构建 NSIS 安装包；
-6. 上传安装包及 SHA-256 artifact；
-7. `vMAJOR.MINOR.PATCH` tag 发布 GitHub Release。
+5. 构建主程序 NSIS 安装包；
+6. 在所有触发类型上构建独立 GPL 内容搜索预览安装包、SHA-256 和完整对应源码 ZIP；
+7. 上传主安装包与内容安装包 artifact，非 tag 保留 30 天；
+8. `vMAJOR.MINOR.PATCH` tag 发布 GitHub Release。
 
 当前未完成代码签名、自动升级和稳定 SDK 兼容承诺。
 

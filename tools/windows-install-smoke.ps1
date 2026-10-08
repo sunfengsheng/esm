@@ -18,7 +18,9 @@ function Invoke-CheckedProcess {
         [string[]]$ArgumentList = @(),
         [int[]]$AllowedExitCodes = @(0)
     )
-    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow
+    Write-Host "Running: $FilePath $($ArgumentList -join ' ')"
+    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -WindowStyle Hidden
+    Write-Host "Exit code: $($process.ExitCode)"
     if ($AllowedExitCodes -notcontains $process.ExitCode) {
         throw "$FilePath failed with exit code $($process.ExitCode)"
     }
@@ -75,6 +77,15 @@ try {
         }
     }
     Write-Host 'Installer smoke test passed.'
+} catch {
+    Write-Error "Installer smoke failed: $($_.Exception.Message)"
+    Write-Host "Install directory exists: $(Test-Path -LiteralPath $install)"
+    if (Test-Path -LiteralPath $install) {
+        Get-ChildItem -LiteralPath $install -Force -ErrorAction SilentlyContinue |
+            Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+    }
+    sc.exe query $serviceName 2>&1 | Write-Host
+    throw
 } finally {
     if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
         $serviceExe = Join-Path $install 'esm_service.exe'

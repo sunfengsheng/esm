@@ -212,7 +212,9 @@ jobs:
 
   release:
     name: Publish tagged release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.build.result == 'success' && needs.msvc.result == 'success'
     needs:
       - build
       - msvc
@@ -231,12 +233,19 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          INSTALLER_SMOKE_RESULT: ${{ needs.installer-smoke.result }}
         run: |
           release_flags=()
           release_title="everything_sm $GITHUB_REF_NAME"
           if [[ -f dist/UNSIGNED-PRERELEASE.txt ]]; then
             release_flags+=(--prerelease)
             release_title="$release_title (unsigned prerelease)"
+            if [[ "$INSTALLER_SMOKE_RESULT" != "success" ]]; then
+              printf '\nInstaller smoke workflow result: %s.\n' "$INSTALLER_SMOKE_RESULT" >> dist/UNSIGNED-PRERELEASE.txt
+            fi
+          elif [[ "$INSTALLER_SMOKE_RESULT" != "success" ]]; then
+            echo "Signed production releases require a successful installer smoke job." >&2
+            exit 1
           fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber

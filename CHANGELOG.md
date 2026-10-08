@@ -7,6 +7,7 @@
 ### Changed
 
 - GitHub 标签构建在配置生产 PFX 时继续生成并校验签名安装包；未配置证书时不再中止，而是生成带 `UNSIGNED-PRERELEASE.txt` 警告的未签名预发布包，并把 GitHub Release 标记为 prerelease。MSVC CI 改为使用 runner 当前默认 Visual Studio 生成器，安装 smoke 使用无空格的临时安装目录，避免 runner 工具链升级和参数拆分造成误失败。
+- 未签名预发布版在 MinGW/MSVC 构建和测试通过后允许保留可下载 Release，即使隔离 runner 的安装 smoke 失败，也会把失败状态写入 `UNSIGNED-PRERELEASE.txt`；生产签名标签仍把 smoke 成功作为发布硬门槛。安装 smoke 增加命令、退出码、安装目录和 SCM 状态诊断。
 
 ### Added
 

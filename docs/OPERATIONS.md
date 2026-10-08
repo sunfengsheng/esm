@@ -220,6 +220,8 @@ NSIS 安装程序先通过 SCM 确认旧服务存在，再在覆盖二进制前�
 
 ## 8. 发布前运维检查
 
+GitHub 的 unsigned prerelease 只用于下载诊断：若其 `UNSIGNED-PRERELEASE.txt` 记录 installer smoke 不是 `success`，不得把该包宣传为已通过安装验收。生产签名标签仍由流水线强制要求 installer smoke 成功。
+
 - 干净机器安装会触发 UAC；
 - 服务被正确注册为 automatic + delayed-auto，并配置 5 秒、30 秒、5 分钟三级重启；
 - `sc.exe qsidtype everything_sm` 显示 unrestricted service SID，`sc.exe qfailure everything_sm` 显示 failure actions；

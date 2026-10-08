@@ -279,4 +279,6 @@ ctest --test-dir build-msvc18-hardening -C Release --output-on-failure
 
 标签缺少证书时仍会生成安装包，但流水线同时发布 `UNSIGNED-PRERELEASE.txt`，并把 GitHub Release 标记为 **unsigned prerelease**；它只能用于测试，不能冒充生产实签版本。配置证书后标签构建会启用 `-RequireSignature`，任何 EXE、内嵌卸载器或最终安装器签名/校验失败都会阻断发布。真实正式发布前还要在隔离 VM 检查安装后的 `Uninstall.exe`，确认其 Authenticode 链和时间戳有效。
 
+unsigned prerelease 只要求 MinGW/MSVC 构建和自动测试通过；若隔离 runner 的安装 smoke 失败，Release 仍可保留用于下载诊断，但 `UNSIGNED-PRERELEASE.txt` 会记录 smoke 结果。生产签名标签不同：安装 smoke 不成功时 release job 必须失败。`windows-install-smoke.ps1` 会输出执行命令、退出码、安装目录文件清单和 SCM 查询结果，但仍在 `finally` 中清理临时服务和文件。
+
 MSVC job 不固定 Visual Studio 主版本，而由 GitHub Windows runner 的 CMake 选择当前默认 VS 生成器，以兼容 runner 从 VS 2022 升级到 VS 2026。安装 smoke 显式使用 `$RUNNER_TEMP\everything_sm-ci` 这类无空格目录，避免 `Start-Process`/NSIS `/D=` 参数在带空格路径上产生歧义；产品默认安装路径仍由独立发布矩阵覆盖。

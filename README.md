@@ -10,11 +10,11 @@
 - 文件名搜索：`esm_gui.exe` + `esm_service.exe`，使用 MFT/USN、MetadataIndex、snapshot/WAL；
 - 内容搜索：`esm_content.exe` + `esm_content_service.exe` + `esm_content_cli.exe`，使用独立 Xapian 数据库和 `everything_sm_content_service` Pipe。
 
-内容搜索默认把配置和索引放在 `%LOCALAPPDATA%\everything_sm_content`，不会链接进或写入文件名搜索服务。`esm_content.exe` 使用独立图标，提供防抖搜索、状态灯、文件图标、打开/定位/复制路径等操作；除纯文本和源码外，还支持 `.docx`、受限文本型 `.pdf`，以及本机已安装 IFilter 时的旧 `.doc`。扫描版 PDF 仍需要尚未实现的 OCR。GUI 会按需隐藏启动内容服务。独立 NSIS 开发包按用户安装且不需要管理员权限，但在 GPL/source-distribution 审查完成前不得公开分发。详见 [独立内容搜索应用](docs/CONTENT_SEARCH.md)。
+内容搜索默认把配置和索引放在 `%LOCALAPPDATA%\everything_sm_content`，不会链接进或写入文件名搜索服务。`esm_content.exe` 使用独立图标，提供防抖搜索、状态灯、文件图标、打开/定位/复制路径等操作；除纯文本和源码外，还支持 `.docx`、受限文本型 `.pdf`，以及本机已安装 IFilter 时的旧 `.doc`。扫描版 PDF 仍需要尚未实现的 OCR。GUI 会按需隐藏启动内容服务。独立 GPL-2.0-or-later 预览安装包按用户安装且不需要管理员权限；每个公开二进制版本在同一 Release 附带完整对应源码和 SHA-256。详见 [独立内容搜索应用](docs/CONTENT_SEARCH.md) 与 [内容搜索许可证](CONTENT_SEARCH_LICENSE.md)。
 
 `everything_sm` 是一个 clean-room Windows 本地文件搜索引擎，目标是在不复制 Everything 源码的前提下，实现接近 Everything 的文件名搜索体验和性能。
 
-> 当前状态：已实现多卷 NTFS 自动发现、MFT 建库、USN Journal 增量跟踪、快照与 WAL 恢复、Named Pipe 查询服务、Windows SCM 服务、原生 GUI、递归扫描/`ReadDirectoryChangesW` 回退以及 NSIS 安装包；另有与主服务完全隔离的 Xapian 文件内容搜索实验原型。项目仍未达到 Everything 的完整查询语法、完整 NTFS 语义、资源占用和发布成熟度，内容搜索已有独立的每用户开发安装流程，但尚未完成公开发布与许可证审查，详见 [当前状态](docs/CURRENT_STATUS.md)、[内容搜索原型](docs/CONTENT_SEARCH.md) 与 [路线图](docs/ROADMAP.md)。
+> 当前状态：已实现多卷 NTFS 自动发现、MFT 建库、USN Journal 增量跟踪、快照与 WAL 恢复、Named Pipe 查询服务、Windows SCM 服务、原生 GUI、递归扫描/`ReadDirectoryChangesW` 回退以及 NSIS 安装包；另有与主服务完全隔离的 Xapian 文件内容搜索实验原型和 GPL-2.0-or-later 独立预览包。项目仍未达到 Everything 的完整查询语法、完整 NTFS 语义、资源占用和发布成熟度，内容搜索公开包仍是实验预览而非稳定产品，详见 [当前状态](docs/CURRENT_STATUS.md)、[内容搜索原型](docs/CONTENT_SEARCH.md) 与 [路线图](docs/ROADMAP.md)。
 
 ## 快速开始
 
@@ -62,7 +62,7 @@ ctest --test-dir build --output-on-failure
 | `esm_content.exe` | 独立内容搜索 UI，提供连续输入防抖、状态灯、Shell 图标、摘要高亮和结果操作 |
 | `esm_content_cli.exe` | 内容服务状态与 IPC 查询诊断 |
 
-内容搜索是显式 opt-in 的实验 target；启用后默认从仓库内 `third_party/xapian-core` 的 Xapian Core 1.4.31 上游源码构建静态库，不依赖预安装的 Xapian 二进制包；详细构建和 GPL 分发边界见 [内容搜索原型](docs/CONTENT_SEARCH.md) 与 [开发指南](docs/DEVELOPMENT.md)。
+内容搜索是显式 opt-in 的实验 target；启用后默认从仓库内 `third_party/xapian-core` 的 Xapian Core 1.4.31 上游源码构建静态库，不依赖预安装的 Xapian 二进制包。独立内容应用和对应构建材料按 GPL-2.0-or-later 发布；详细范围见 [内容搜索许可证](CONTENT_SEARCH_LICENSE.md)、[内容搜索原型](docs/CONTENT_SEARCH.md) 与 [开发指南](docs/DEVELOPMENT.md)。
 
 常用开发命令：
 

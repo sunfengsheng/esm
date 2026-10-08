@@ -23,8 +23,8 @@
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\everything_sm_content"
 !define PRODUCT_PIPE "everything_sm_content_service"
 
-Name "${PRODUCT_NAME} ${PRODUCT_VERSION} (Development)"
-OutFile "${OUTPUT_DIR}\everything-sm-content-${PRODUCT_VERSION}-dev-setup.exe"
+Name "${PRODUCT_NAME} ${PRODUCT_VERSION} (Preview)"
+OutFile "${OUTPUT_DIR}\everything-sm-content-${PRODUCT_VERSION}-preview-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Everything SM Content Search"
 InstallDirRegKey HKCU "${PRODUCT_DIR_REGKEY}" "InstallDir"
 RequestExecutionLevel user
@@ -37,10 +37,10 @@ UninstallIcon "${PROJECT_ROOT}\assets\icon\content_search.ico"
 VIProductVersion "${PRODUCT_VERSION_RESOURCE}"
 VIAddVersionKey /LANG=2052 "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
-VIAddVersionKey /LANG=2052 "FileDescription" "独立文件内容搜索开发安装程序"
+VIAddVersionKey /LANG=2052 "FileDescription" "独立文件内容搜索预览安装程序"
 VIAddVersionKey /LANG=2052 "FileVersion" "${PRODUCT_VERSION}"
 VIAddVersionKey /LANG=2052 "CompanyName" "${PRODUCT_PUBLISHER}"
-VIAddVersionKey /LANG=2052 "LegalCopyright" "Development package; review licensing before redistribution"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "GPL-2.0-or-later; see CONTENT_SEARCH_LICENSE.md"
 
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
@@ -87,7 +87,14 @@ Section "安装独立内容搜索" SEC_MAIN
   File /oname=esm_content_service.exe "${BUILD_DIR}\esm_content_service.exe"
   File /oname=esm_content_cli.exe "${BUILD_DIR}\esm_content_cli.exe"
   File /oname=CONTENT_SEARCH.md "${PROJECT_ROOT}\docs\CONTENT_SEARCH.md"
+  File /oname=CONTENT_SEARCH_LICENSE.md "${PROJECT_ROOT}\CONTENT_SEARCH_LICENSE.md"
+  File /oname=GPL-2.0-or-later.txt "${PROJECT_ROOT}\LICENSES\GPL-2.0-or-later.txt"
   File /oname=XAPIAN-COPYING "${PROJECT_ROOT}\third_party\xapian-core\COPYING"
+  FileOpen $0 "$INSTDIR\SOURCE-CODE.txt" w
+  FileWrite $0 "The complete corresponding source for this version is available at:$\r$\n"
+  FileWrite $0 "https://github.com/sunfengsheng/esm/releases/download/v${PRODUCT_VERSION}/everything-sm-content-${PRODUCT_VERSION}-source.zip$\r$\n$\r$\n"
+  FileWrite $0 "Verify it with everything-sm-content-${PRODUCT_VERSION}-source.zip.sha256 on the same release page.$\r$\n"
+  FileClose $0
 
   CreateDirectory "$LOCALAPPDATA\everything_sm_content"
   CreateDirectory "$LOCALAPPDATA\everything_sm_content\index"
@@ -105,7 +112,7 @@ Section "安装独立内容搜索" SEC_MAIN
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "${PRODUCT_DIR_REGKEY}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayName" "${PRODUCT_NAME} (Development)"
+  WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayName" "${PRODUCT_NAME} (Preview)"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\esm_content.exe"
@@ -144,7 +151,10 @@ Section "Uninstall"
   Delete /REBOOTOK "$INSTDIR\esm_content_service.exe"
   Delete /REBOOTOK "$INSTDIR\esm_content_cli.exe"
   Delete /REBOOTOK "$INSTDIR\CONTENT_SEARCH.md"
+  Delete /REBOOTOK "$INSTDIR\CONTENT_SEARCH_LICENSE.md"
+  Delete /REBOOTOK "$INSTDIR\GPL-2.0-or-later.txt"
   Delete /REBOOTOK "$INSTDIR\XAPIAN-COPYING"
+  Delete /REBOOTOK "$INSTDIR\SOURCE-CODE.txt"
   Delete /REBOOTOK "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 SectionEnd

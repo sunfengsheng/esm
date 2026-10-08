@@ -303,7 +303,7 @@ checkpoint consolidation 会把当前 `base + overlay - tombstone` 写入新 gen
 
 GUI `esm_content.exe` 会按需以无控制台窗口方式启动服务。相同 Pipe 的服务使用单实例互斥体，重复启动会正常退出而不会建立第二套扫描线程。默认 Pipe 是 `everything_sm_content_service`。
 
-配置和数据库是当前用户级状态；独立开发安装包不需要管理员权限，也不安装 SCM 服务。停止服务可关闭 GUI 后按 PID 终止 `esm_content_service.exe`，或在前台调试时使用 `Ctrl+C`。卸载程序会询问是否删除 `%LOCALAPPDATA%\everything_sm_content`。
+配置和数据库是当前用户级状态；独立 GPL 预览安装包不需要管理员权限，也不安装 SCM 服务。停止服务可关闭 GUI 后按 PID 终止 `esm_content_service.exe`，或在前台调试时使用 `Ctrl+C`。卸载程序会询问是否删除 `%LOCALAPPDATA%\everything_sm_content`。安装目录的 `SOURCE-CODE.txt` 指向同一版本的完整对应源码 ZIP；发布验收必须校验该资产及其 SHA-256 均存在。
 
 若需要整机固定盘索引，必须显式把配置中的 `all_fixed` 改为 `1` 或传入 `--all-fixed`。操作前应确认数据库空间、排除目录、当前用户访问权限和首次扫描负载。多用户不得共享同一个可写 Xapian 数据库；当前尚无 per-request impersonation。
 

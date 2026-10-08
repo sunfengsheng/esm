@@ -181,7 +181,7 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 
 真实内容查询速度目前不快：2026-07-26 使用约 264,692～264,693 个文档、约 4.63 GiB Xapian 数据库，在后台仍扫描时，`limit=100` 的不同查询单次 Named Pipe 往返为 671.9～5807.3 ms；`limit=10` 的重复样本约 237.8～756.9 ms。样本数不足以形成发布级 p50/p95，但足以否定“已经达到 Everything 式即时匹配”。摘要生成会读取 document data 中的完整正文，是当前最明显的查询慢路径。
 
-仍属于实验状态：没有 SCM 注册、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、OCR、完整复杂 PDF/Office 语义、ACL impersonation、网络/云盘/可移动卷 provider、持久任务队列、首次建库吞吐/长期内存/真实 GUI 端到端基线和 Xapian GPL 发布合规方案。现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+仍属于实验状态：没有 SCM 注册、启动 stale-document reconciliation、通知溢出自动修复、独立 extractor worker、OCR、完整复杂 PDF/Office 语义、ACL impersonation、网络/云盘/可移动卷 provider、持久任务队列、首次建库吞吐/长期内存和真实 GUI 端到端基线。GPL-2.0-or-later 预览分发材料已经建立，但不代表功能达到稳定版；现有文件名搜索链路未修改，内容服务不可用不会影响 `esm_service.exe`。详情见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
 
 
 ## 2026-07-29：名称/USN delta WAL 与 checkpoint consolidation
@@ -208,8 +208,8 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 - 内容服务按 Pipe 创建单实例互斥体，避免 GUI 重复启动相同扫描任务；
 - GUI、服务和 CLI 都支持 `--config`，命令行参数仍可覆盖配置；
 - 默认首次配置只索引当前用户目录，不会未经确认执行 `--all-fixed`；
-- 新增设置持久化、DOCX/PDF 提取自动测试、TXT/DOCX/PDF 临时单根服务/CLI E2E 验证和独立 NSIS 开发安装包；
+- 新增设置持久化、DOCX/PDF 提取自动测试、TXT/DOCX/PDF 临时单根服务/CLI E2E 验证和独立 GPL NSIS 预览安装包；
 - 内容应用使用与文件名搜索不同的专属图标；GUI 增加 160 ms 防抖、长期 worker、状态灯、Shell 图标、结果按钮、右键菜单、快捷键和 Everything 风格的右侧摘要预览窗格；
 - 文件名搜索进程、数据库、安装包和 IPC 未改为依赖内容搜索。
 
-仍未完成：Windows Preview Handler、PDF/Word 页面级渲染、图片/OCR 预览、SCM 内容服务、持久任务队列、删除 reconciliation、受限 extractor worker、ACL/per-request impersonation、完整复杂 PDF/Office 语义、真实整机长期基准以及 GPL 公开分发审查。因此内容搜索仍是开发功能，不能声称达到生产发布标准。
+2026-10-08 已明确内容搜索及其构建相关代码的 GPL-2.0-or-later 授权范围；标签发布同时提供独立预览安装包、GPL/Xapian 许可证、精确源码地址、完整对应源码 ZIP 和 SHA-256。仍未完成 Windows Preview Handler、PDF/Word 页面级渲染、图片/OCR 预览、SCM 内容服务、持久任务队列、删除 reconciliation、受限 extractor worker、ACL/per-request impersonation、完整复杂 PDF/Office 语义和真实整机长期基准。因此内容搜索仍是预览功能，不能声称达到生产发布标准。

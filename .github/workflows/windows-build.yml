@@ -136,6 +136,21 @@ jobs:
             ) | Set-Content -LiteralPath 'dist/UNSIGNED-PRERELEASE.txt' -Encoding utf8
           }
 
+      - name: Build GPL content-search preview and source archive
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          ESM_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:ESM_REF_NAME -notmatch '^v([0-9]+(?:\.[0-9]+){2,3})$') {
+            throw 'Release tags must use vMAJOR.MINOR.PATCH, for example v0.1.0'
+          }
+          .\packaging\build-content-installer.ps1 `
+            -BuildDirectory build-ci `
+            -Version $Matches[1] `
+            -SkipBuild `
+            -AllowGplRelease
+
       - name: Remove signing certificate
         if: always() && github.ref_type == 'tag'
         shell: pwsh
@@ -151,6 +166,8 @@ jobs:
           path: |
             dist/*.exe
             dist/*.sha256
+            dist/*-source.zip
+            dist/CONTENT-SEARCH-PREVIEW.txt
             dist/UNSIGNED-PRERELEASE.txt
           if-no-files-found: error
           compression-level: 0
@@ -243,6 +260,9 @@ jobs:
             if [[ "$INSTALLER_SMOKE_RESULT" != "success" ]]; then
               printf '\nInstaller smoke workflow result: %s.\n' "$INSTALLER_SMOKE_RESULT" >> dist/UNSIGNED-PRERELEASE.txt
             fi
+          elif [[ -f dist/CONTENT-SEARCH-PREVIEW.txt ]]; then
+            release_flags+=(--prerelease)
+            release_title="$release_title (content-search preview)"
           elif [[ "$INSTALLER_SMOKE_RESULT" != "success" ]]; then
             echo "Signed production releases require a successful installer smoke job." >&2
             exit 1

@@ -147,9 +147,10 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   add_executable(esm_content_service
       src/apps/content_service/main.cpp
+      src/platform/windows/directory_watcher.cpp
   )
   target_link_libraries(esm_content_service PRIVATE
-      esm_core esm_content_protocol esm_xapian_content)
+      esm_content_protocol esm_xapian_content)
 
   add_executable(esm_content WIN32
       src/apps/content_gui/main.cpp

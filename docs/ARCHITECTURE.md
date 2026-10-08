@@ -312,7 +312,7 @@ flowchart LR
 
 `esm_service.exe` 和 `esm_gui.exe` 不链接 Xapian，文件名服务也不加载内容数据库。内容服务使用单独的版本化二进制协议、Pipe DACL、数据库目录和两个 Pipe worker。`ShardedContentIndex` 把每个规范化内容根映射到独立 `XapianContentIndex`，写入按路径路由，查询当前逐 shard 执行后在进程内按相关度聚合；状态汇总各 shard 的文档数和 indexing 标记。搜索请求返回路径、相关度、摘要以及 UTF-16 code-unit 高亮范围，避免 UI 再解析 UTF-8 字节偏移。
 
-构建时依赖同样隔离：`third_party/xapian-core` 固定保存未经本地修改的 Xapian Core 1.4.31 发布源码，`cmake/BuildXapian.cmake` 通过独立 Autotools 子构建生成静态 `libxapian.a`，再只链接到 `esm_xapian_content`。`esm_core`、`esm_service` 和主 GUI 的依赖图不包含该 imported target。`SYSTEM` provider 仅用于开发机或非 MinGW 工具链显式使用 ABI 匹配的已有静态库。
+构建时依赖同样隔离：`third_party/xapian-core` 固定保存未经本地修改的 Xapian Core 1.4.31 发布源码，`cmake/BuildXapian.cmake` 通过独立 Autotools 子构建生成静态 `libxapian.a`，再只链接到 `esm_xapian_content`。`esm_content_service` 不再链接整个 `esm_core`，只直接编译其实际使用的 `directory_watcher.cpp`；`esm_core`、`esm_service` 和主 GUI 的依赖图不包含 Xapian imported target。`SYSTEM` provider 仅用于开发机或非 MinGW 工具链显式使用 ABI 匹配的已有静态库。标签流水线把独立内容安装包与由同一提交生成的完整对应源码 ZIP 一起发布，许可证范围见 `CONTENT_SEARCH_LICENSE.md`。
 
 内容文档当前以规范化小写路径的 FNV-1a 64 位哈希形成 Xapian boolean unique term；正文由 `TermGenerator::FLAG_NGRAMS` 建索引，查询和摘要启用 n-gram。完整路径与提取正文暂存在 Xapian document data 中，因此当前空间模型不能视为最终方案。
 

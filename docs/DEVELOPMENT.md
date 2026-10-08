@@ -198,9 +198,9 @@ ctest --test-dir build-content --output-on-failure
 
 第一次构建会在构建目录的 `_deps/xapian-1.4.31-build` 中配置并编译静态库。`ESM_XAPIAN_BUILD_JOBS` 只控制 Xapian 子构建并行度。若开发机已经有 ABI 匹配的静态库，可使用 `-DESM_XAPIAN_PROVIDER=SYSTEM`；非 MinGW 编译器目前也必须使用该模式。
 
-`esm_content_tests` 覆盖协议 round-trip、UTF-16 高亮范围、文本编码/大小/二进制过滤、Xapian upsert/search/delete 生命周期、多 shard 聚合路由、全局 limit、状态汇总、路径排除和数据库 root key。CI 的 UCRT64 job 从仓库内源码冷构建 Xapian，测试三个实验程序，并检查内容服务没有动态依赖 Xapian DLL。开发时可用两个临时 `--root` 配合唯一 `--pipe` 做多根 E2E；不要在自动测试或普通开发启动中使用 `--all-fixed`，避免未经确认触发整机扫描。portable ZIP 和 NSIS 包暂不分发内容搜索二进制，待 Xapian 许可证兼容和分发材料审查完成后再决定发布方式。
+`esm_content_tests` 覆盖协议 round-trip、UTF-16 高亮范围、文本编码/大小/二进制过滤、Xapian upsert/search/delete 生命周期、多 shard 聚合路由、全局 limit、状态汇总、路径排除和数据库 root key。CI 的 UCRT64 job 从仓库内源码冷构建 Xapian，测试三个实验程序，并检查内容服务没有动态依赖 Xapian DLL。开发时可用两个临时 `--root` 配合唯一 `--pipe` 做多根 E2E；不要在自动测试或普通开发启动中使用 `--all-fixed`，避免未经确认触发整机扫描。标签流水线另外生成独立 GPL 预览安装包和版本匹配的对应源码归档。
 
-由于 Xapian 使用 GPL-2.0-or-later，发布负责人在把该原型纳入正式安装包前必须完成许可证兼容、对应源码、许可证文本和构建材料审查。仅把源码放入 `third_party` 不等于已经完成二进制分发合规。
+Xapian 和项目内容搜索相关代码按 GPL-2.0-or-later 分发，授权范围见 `CONTENT_SEARCH_LICENSE.md`。公开二进制必须同时提供 GPL 全文、Xapian 上游许可证、可复现构建材料、版本匹配的完整对应源码 ZIP 及 SHA-256；仅把源码放入 `third_party` 或依赖 GitHub 自动源码快照不能替代流水线校验。
 ## MinGW/UCRT 测试运行库
 
 `esm_tests.exe`、服务、CLI 和 GUI 在 MinGW 构建中统一使用静态 GCC/libstdc++/winpthread 运行库。不要移除测试目标的 `-static`：开发机同时安装 `mingw64` 与 `ucrt64` 时，动态测试程序可能从 `PATH` 加载错误 ABI 的 DLL，并在进入 `main` 前以 `0xc0000139`（入口点不存在）退出。
@@ -212,7 +212,7 @@ cmake --build build-ucrt-vendor-final --config Release --target esm_tests
 ctest --test-dir build-ucrt-vendor-final -C Release -R '^esm_tests$' --output-on-failure
 ```
 
-## 独立内容应用与开发安装包
+## 独立内容应用与 GPL 预览安装包
 
 正式内容 GUI 构建目标为 `esm_content`：
 
@@ -237,16 +237,16 @@ python tools\generate_content_icon.py
 
 生成的 `assets\icon\content_search.ico` 同时用于 `esm_content.exe` 的 Windows 资源和独立 NSIS 安装/卸载界面。修改图标源或生成脚本后，应提交 SVG、预览 PNG、各尺寸 PNG 和 ICO，并重新构建 GUI 与安装包。
 
-本地开发安装包：
+本地预览安装包和对应源码：
 
 ```powershell
 .\packaging\build-content-installer.ps1 `
   -BuildDirectory build-content `
   -SkipBuild `
-  -AllowDevelopmentPackage
+  -AllowGplRelease
 ```
 
-脚本输出 `dist\everything-sm-content-<version>-dev-setup.exe` 和 SHA-256 文件。它是按用户、无管理员权限的独立包，不包含文件名搜索二进制。`-AllowDevelopmentPackage` 是强制的误发布保护：Xapian 静态链接的 GPL/source-distribution 方案尚未审查完成，不能把该产物上传到公开 release。
+脚本输出 `dist\everything-sm-content-<version>-preview-setup.exe`、版本匹配的 `-source.zip`、两者的 SHA-256 和 `CONTENT-SEARCH-PREVIEW.txt`。它是按用户、无管理员权限的独立包，不包含文件名搜索二进制。`-AllowGplRelease` 是强制的发布保护；脚本拒绝缺失 `CONTENT_SEARCH_LICENSE.md`、GPL 全文或 Xapian `COPYING` 的构建，并检查源码 ZIP 含关键源码与构建脚本。只要标签包含内容搜索预览资产，GitHub Release 就保持 prerelease 标记。
 
 ## 11. P0 发布加固验证与签名
 

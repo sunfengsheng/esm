@@ -5,12 +5,12 @@ param(
     [string]$Version,
     [string]$MakeNsisPath,
     [switch]$SkipBuild,
-    [switch]$AllowDevelopmentPackage
+    [switch]$AllowGplRelease
 )
 
 $ErrorActionPreference = "Stop"
-if (-not $AllowDevelopmentPackage) {
-    throw "Content search is statically linked with GPL Xapian. Pass -AllowDevelopmentPackage only for local development packaging; do not redistribute until the repository licensing decision and source-distribution obligations are completed."
+if (-not $AllowGplRelease) {
+    throw "Content search is GPL-2.0-or-later. Pass -AllowGplRelease to build the binary installer and matching corresponding-source archive."
 }
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -22,6 +22,14 @@ $bundledMakeNsis = Join-Path $nsisRoot "makensis.exe"
 $nsisZip = Join-Path $projectRoot "tools\nsis\nsis-3.12.zip"
 
 $cmakeListsPath = Join-Path $projectRoot "CMakeLists.txt"
+$contentLicensePath = Join-Path $projectRoot "CONTENT_SEARCH_LICENSE.md"
+$gplLicensePath = Join-Path $projectRoot "LICENSES\GPL-2.0-or-later.txt"
+$xapianLicensePath = Join-Path $projectRoot "third_party\xapian-core\COPYING"
+foreach ($licensePath in $contentLicensePath, $gplLicensePath, $xapianLicensePath) {
+    if (-not (Test-Path -LiteralPath $licensePath)) {
+        throw "Missing required content-search distribution license: $licensePath"
+    }
+}
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $cmakeLists = Get-Content -LiteralPath $cmakeListsPath -Raw
     $match = [regex]::Match($cmakeLists, 'project\s*\([^)]*\bVERSION\s+([0-9]+(?:\.[0-9]+){2,3})', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -77,7 +85,7 @@ New-Item -ItemType Directory -Force -Path $distPath | Out-Null
     "/DPRODUCT_VERSION_RESOURCE=$resourceVersion" $nsiPath
 if ($LASTEXITCODE -ne 0) { throw "NSIS compilation failed: $LASTEXITCODE" }
 
-$installer = Join-Path $distPath "everything-sm-content-$Version-dev-setup.exe"
+$installer = Join-Path $distPath "everything-sm-content-$Version-preview-setup.exe"
 if (-not (Test-Path -LiteralPath $installer)) { throw "Installer was not produced: $installer" }
 $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $installer
 $hashFile = "$installer.sha256"
@@ -86,4 +94,44 @@ Write-Host "Installer: $installer"
 Write-Host "SHA256:    $($hash.Hash)"
 Write-Host "Hash file: $hashFile"
 Write-Host "Size:      $((Get-Item -LiteralPath $installer).Length) bytes"
-Write-Warning "Development package only. Do not redistribute before GPL/source-distribution review is complete."
+
+$sourceArchive = Join-Path $distPath "everything-sm-content-$Version-source.zip"
+if (Test-Path -LiteralPath $sourceArchive) { Remove-Item -LiteralPath $sourceArchive -Force }
+& git -C $projectRoot archive --format=zip `
+    "--prefix=everything-sm-content-$Version-source/" `
+    --output $sourceArchive HEAD
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sourceArchive)) {
+    throw "Unable to create corresponding-source archive from HEAD."
+}
+$archiveEntries = & tar -tf $sourceArchive
+if ($LASTEXITCODE -ne 0) { throw "Unable to inspect source archive: $sourceArchive" }
+$requiredArchiveSuffixes = @(
+    'CONTENT_SEARCH_LICENSE.md',
+    'LICENSES/GPL-2.0-or-later.txt',
+    'third_party/xapian-core/COPYING',
+    'third_party/xapian-core/include/xapian.h',
+    'src/content/xapian_content_index.cpp',
+    'packaging/build-content-installer.ps1'
+)
+foreach ($suffix in $requiredArchiveSuffixes) {
+    if (-not ($archiveEntries | Where-Object { $_.Replace('\', '/').EndsWith($suffix) })) {
+        throw "Corresponding-source archive is incomplete: missing $suffix"
+    }
+}
+$sourceHash = Get-FileHash -Algorithm SHA256 -LiteralPath $sourceArchive
+$sourceHashFile = "$sourceArchive.sha256"
+Set-Content -LiteralPath $sourceHashFile `
+    -Value "$($sourceHash.Hash)  $([IO.Path]::GetFileName($sourceArchive))" `
+    -Encoding ascii
+Write-Host "Source:    $sourceArchive"
+Write-Host "SHA256:    $($sourceHash.Hash)"
+Write-Host "Hash file: $sourceHashFile"
+Write-Host "Size:      $((Get-Item -LiteralPath $sourceArchive).Length) bytes"
+$previewNotice = Join-Path $distPath 'CONTENT-SEARCH-PREVIEW.txt'
+@(
+    'Everything SM Content Search is an experimental GPL-2.0-or-later preview.'
+    'It is separate from the file-name search application.'
+    'The matching corresponding-source archive and SHA-256 are included on the same release.'
+    'Known limitations are documented in docs/CONTENT_SEARCH.md.'
+) | Set-Content -LiteralPath $previewNotice -Encoding utf8
+Write-Warning "Experimental GPL-2.0-or-later preview. Review CONTENT_SEARCH_LICENSE.md and the matching source archive before redistribution."

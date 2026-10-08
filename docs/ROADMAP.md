@@ -156,7 +156,7 @@ P7 下一批工作按以下顺序推进：
 4. 压缩正文 sidecar，避免完整正文直接放大 Xapian document data；
 5. 多 root/provider 配置、SCM 服务和安装/恢复策略；
 6. ACL impersonation、真实容量/性能/长期内存基线；
-7. Xapian GPL 分发合规完成后，再考虑把入口合并进主 GUI。
+7. [x] 建立 Xapian GPL-2.0-or-later 独立预览分发、许可证和对应源码归档；[ ] 只有功能与安全边界成熟后才考虑把入口合并进主 GUI。
 
 ## 2026-07-29：持久化与 NTFS 后续工作
 

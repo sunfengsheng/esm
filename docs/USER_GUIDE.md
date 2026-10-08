@@ -232,4 +232,4 @@ C:\ProgramData\everything_sm\indexes\mft-index.snapshot
 
 建库期间可以搜索已经提交的文件，尚未提交的文件暂时不会命中。默认配置只扫描当前用户目录，不会自动读取所有固定盘。需要整机内容索引时显式配置多个 `root` 或启动服务时使用 `--all-fixed`；这会产生明显的 CPU、磁盘读取和 Xapian 数据库写入负载。
 
-独立开发安装包按当前用户安装，不弹 UAC；它与需要管理员权限的文件名搜索主安装包无关。开发包尚未完成 Xapian GPL/source-distribution 公开分发审查，只能用于本地开发验证。更多格式和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+独立内容搜索预览安装包按当前用户安装，不弹 UAC；它与需要管理员权限的文件名搜索主安装包无关。安装目录包含 `CONTENT_SEARCH_LICENSE.md`、GPL 全文、Xapian 上游许可证和精确源码下载地址；同一 GitHub Release 提供版本匹配的完整对应源码 ZIP 与 SHA-256。该包仍是实验预览，不代表 OCR、复杂 Office/PDF、ACL 隔离或长期稳定性已经完成。更多格式和风险边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。

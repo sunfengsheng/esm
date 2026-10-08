@@ -146,7 +146,7 @@ GUI 会读取默认配置，并在 Pipe 不可用时使用 `CREATE_NO_WINDOW` �
   --db-root D:\content-index
 ```
 
-`--all-fixed` 会产生明显的首次扫描 CPU、磁盘读取和数据库写入负载；默认配置和开发安装包不会自动打开该选项。
+`--all-fixed` 会产生明显的首次扫描 CPU、磁盘读取和数据库写入负载；默认配置和预览安装包不会自动打开该选项。
 
 CLI 示例：
 
@@ -199,21 +199,24 @@ Windows IFilter 是环境相关的扩展路径；第三方 IFilter 当前直接�
 
 当前 Named Pipe 请求仍是同步调用，窗口关闭时最坏可能等待当前请求超时；后续应改为可取消的 overlapped I/O。GUI 防抖和过期响应丢弃改善的是客户端连续输入体验，不等于降低 Xapian 服务端查询耗时。
 
-## 8. 独立开发安装包
+## 8. 独立 GPL 预览安装包
 
-本仓库提供独立的开发安装脚本：
+本仓库提供独立的公开预览安装脚本：
 
 ```powershell
 .\packaging\build-content-installer.ps1 `
   -BuildDirectory build-content `
   -SkipBuild `
-  -AllowDevelopmentPackage
+  -AllowGplRelease
 ```
 
 输出：
 
 ```text
-dist\everything-sm-content-<version>-dev-setup.exe
+dist\everything-sm-content-<version>-preview-setup.exe
+dist\everything-sm-content-<version>-preview-setup.exe.sha256
+dist\everything-sm-content-<version>-source.zip
+dist\everything-sm-content-<version>-source.zip.sha256
 ```
 
 安装包特点：
@@ -225,8 +228,10 @@ dist\everything-sm-content-<version>-dev-setup.exe
 - GUI 按需隐藏启动内容服务，不注册 SCM 服务；
 - 卸载时可选择是否删除 `%LOCALAPPDATA%\everything_sm_content`；
 - 不把任何内容二进制加入主文件名搜索安装包。
+- 安装 `CONTENT_SEARCH_LICENSE.md`、GPL 全文、Xapian 上游 `COPYING` 和版本精确的源码下载地址；
+- 同一 GitHub Release 附带由该提交 `git archive` 生成的完整对应源码，包含 Xapian 1.4.31 源码和构建脚本。
 
-**该安装包仅供本地开发验证，不能作为公开发布包。** Xapian 为 GPL-2.0-or-later，静态链接二进制公开分发前必须完成项目整体许可证决策、对应源码提供方式、构建材料和许可证文本审查。构建脚本要求显式传入 `-AllowDevelopmentPackage`，用于防止误发布。
+内容搜索应用及其相关项目源码按 GPL-2.0-or-later 发布，具体授权范围见仓库根目录 `CONTENT_SEARCH_LICENSE.md`。`-AllowGplRelease` 是显式发布保护：脚本会检查许可证材料、生成二进制与源码归档、验证源码归档中的关键文件，并分别生成 SHA-256。它仍是实验预览包，不因许可证和分发材料完备而自动达到生产稳定标准。
 
 ## 9. 2026-07-29 验证范围
 
@@ -244,7 +249,7 @@ dist\everything-sm-content-<version>-dev-setup.exe
 - 正式目标 `esm_content.exe`、服务、CLI 和测试的 Release 构建；
 - 临时单根目录上的真实服务/CLI E2E：TXT、DOCX、PDF 共 3 个文档完成提交，DOCX/PDF 唯一词均可命中；本机没有可用 Office/PDF IFilter，命中来自内置回退；
 - Windows UI 自动化检查搜索框、按钮、结果列、状态灯、状态文字、结果计数、DOCX/PDF 摘要预览、默认首项选择、按钮/菜单/`Ctrl+Shift+P` 开关，以及清空后的占位状态；
-- 独立 NSIS 开发安装包可成功编译。
+- 独立 NSIS 预览安装包和对应源码归档可成功生成。
 
 这些验证不代表首次整机建库吞吐、长期稳定性、权限隔离或公开发布合规已经完成。
 
@@ -262,6 +267,6 @@ dist\everything-sm-content-<version>-dev-setup.exe
 - 真实数据库查询在大 `limit` 下仍可能达到秒级，尚未达到“即时内容搜索”；
 - DOCX/PDF 仅实现上述第一阶段路径；仍无 OCR、加密 PDF、完整复杂 PDF 字体映射、完整 Office 语义和内置旧 `.doc` 解析；
 - 第三方 Windows IFilter 当前运行在内容服务进程内，尚无 extractor 沙箱、超时和崩溃隔离；
-- GPL/source-distribution 审查未完成，开发安装包不得公开分发。
+- 内容搜索已建立 GPL-2.0-or-later 二进制、许可证和对应源码公开分发路径；后续每个版本仍必须验证源码归档与二进制来自同一提交。
 
 后续即使增加文件名搜索与内容搜索之间的只读跳转或文件发现 IPC，也不允许共享可写索引数据库，Xapian 也不进入 `esm_service.exe` 进程。

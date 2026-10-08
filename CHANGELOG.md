@@ -11,6 +11,7 @@
 
 ### Added
 
+- 新增独立内容搜索 GPL-2.0-or-later 公开预览发布：标签流水线生成按用户安装的 `everything-sm-content-<version>-preview-setup.exe`、SHA-256、版本匹配的完整对应源码 ZIP 及源码 SHA-256；安装包内含项目内容搜索授权说明、GPL 全文、Xapian 上游许可证和精确源码下载地址。
 - 新增 `esm_service health [pipe-name] [timeout-ms]`：先确认 SCM 服务为 Running，再通过真实 Named Pipe 空查询验证索引端到端可用；安装器和 CI 安装 smoke 不再只把“进程已启动”当作健康。
 - 新增路径限定的 `stop-install-processes.ps1`、WER LocalDumps 配置和 `export-diagnostics.ps1` 诊断 ZIP；停止进程只作用于当前安装目录中的 everything_sm 可执行文件，诊断报告默认对用户名和用户目录做基础脱敏；复制的原始日志需在分享前人工检查。
 - 新增 MinGW 与 MSVC Release 双编译器 CI、100/20 轮进程强杀恢复压力入口，以及静默安装、同版本覆盖升级、Pipe 健康检查和静默卸载 smoke job。标签发布新增 EXE、内嵌卸载器和最终 NSIS 安装器 Authenticode 签名入口；无证书标签只能生成明确标记的未签名预发布包，不能冒充生产实签版本。
@@ -30,7 +31,7 @@
 - 内容搜索 GUI 新增 Everything 风格的右侧可开关预览窗格：默认选中首个结果，显示文件名、完整路径和 Xapian 索引摘要，并以 RichEdit 黄色粗体标出命中；可通过顶部按钮、“查看 → 预览窗格”或 `Ctrl+Shift+P` 切换。
 - 内容索引新增统一文档提取调度：`.docx` 优先 Windows IFilter 并回退到内置 ZIP/XML 提取，`.pdf` 优先 Windows IFilter 并回退到受限基础文本流提取，旧 `.doc` 使用系统 IFilter；增加不依赖 Office/PDF 软件的 DOCX/PDF 自动测试。
 - 将 Xapian 内容搜索正式拆分为独立应用边界：新增正式 GUI 目标 `esm_content.exe`、独立 `%LOCALAPPDATA%\everything_sm_content` 配置/数据库根、`everything_sm_content_service` Pipe、配置 round-trip 测试、显式配置路径校验和按 Pipe 单实例服务保护；内容 GUI 可按需无控制台启动同目录服务，文件名搜索进程与数据库不变。
-- 新增独立的每用户 NSIS 开发安装包脚本 `packaging/build-content-installer.ps1`；包内只包含内容 GUI、内容服务和内容 CLI，不需要管理员权限，也不向主文件名搜索安装包混入 Xapian。由于 GPL/source-distribution 审查尚未完成，脚本必须显式传入 `-AllowDevelopmentPackage`，产物仅供本地开发验证。
+- 新增独立的每用户 NSIS 内容预览安装包脚本 `packaging/build-content-installer.ps1`；包内只包含内容 GUI、内容服务和内容 CLI，不需要管理员权限，也不向主文件名搜索安装包混入 Xapian。脚本必须显式传入 `-AllowGplRelease`，并同时生成版本匹配的对应源码归档。
 - 新增 `docs/EVERYTHING_COMPATIBILITY.md`，以 Everything 1.4.1.1030 为本机对照，按查询、NTFS、GUI、发布和性能列出 PASS/PARTIAL/FAIL/UNTESTED，明确禁止无验证的 100% 兼容声明。
 - 多卷 `mft-auto` 新增与 generation、卷身份和根边界绑定的名称/USN append-only delta WAL v2，持久化 durable cursor，并支持 checksum、write-through、`FlushFileBuffers`、撕裂尾部截断和 crash recovery。
 - 新增真实多卷 NTFS reconciliation 基准入口 `esm_reconcile_benchmark`，分阶段观察 MFT 枚举、多卷 namespacing、索引构建、checkpoint 写入以及 Working Set/Private Bytes；无管理员权限的零记录运行不会作为性能结论。
@@ -50,6 +51,7 @@
 
 ### Changed
 
+- 内容服务不再链接整个 `esm_core`，只直接编译其实际使用的 `directory_watcher.cpp`，缩小二进制依赖和 GPL 对应源码边界；文件名搜索服务、安装包、数据库和 IPC 仍与内容搜索分离。
 - 默认多卷 checkpoint consolidation 改为直接导出紧凑节点和字符串 arena，不再先物化完整 `vector<FileRecord>`、复制全部后代完整路径或在 checkpoint 成功后重建活动搜索索引；overlay 和每个卷根作为完整路径 anchor 写入 v3 snapshot。
 - NSIS 覆盖升级改为在安装目录内使用持久 recovery 目录备份旧二进制、配置、卸载器和诊断脚本；新服务只有通过 SCM + Named Pipe 健康检查后才提交升级，失败时恢复旧文件并尝试重启旧服务。该实现是健康门控的部分事务回滚，不是掉电级多文件原子事务。
 - 静默安装/卸载为所有交互错误和删除数据提示设置保守默认值；静默卸载默认保留索引与用户设置。

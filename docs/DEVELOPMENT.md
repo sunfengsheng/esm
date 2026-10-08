@@ -248,6 +248,8 @@ python tools\generate_content_icon.py
 
 脚本输出 `dist\everything-sm-content-<version>-preview-setup.exe`、版本匹配的 `-source.zip`、两者的 SHA-256 和 `CONTENT-SEARCH-PREVIEW.txt`。它是按用户、无管理员权限的独立包，不包含文件名搜索二进制。`-AllowGplRelease` 是强制的发布保护；脚本拒绝缺失 `CONTENT_SEARCH_LICENSE.md`、GPL 全文或 Xapian `COPYING` 的构建，并检查源码 ZIP 含关键源码与构建脚本。只要标签包含内容搜索预览资产，GitHub Release 就保持 prerelease 标记。
 
+内容包与主安装包使用相同的 NSIS 发现顺序：显式 `-MakeNsisPath`、PATH、`Program Files (x86)\NSIS`、`Program Files\NSIS`、仓库本地缓存，最后才下载固定版本。CI 通过 Chocolatey 安装 NSIS，但不能假设它一定创建 `makensis.exe` 命令 shim。
+
 ## 11. P0 发布加固验证与签名
 
 本地无副作用验证：

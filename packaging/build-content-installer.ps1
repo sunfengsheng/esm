@@ -52,6 +52,12 @@ if (-not [string]::IsNullOrWhiteSpace($MakeNsisPath)) {
 }
 $makeNsisCommand = Get-Command makensis.exe -ErrorAction SilentlyContinue
 if ($makeNsisCommand) { $makeNsisCandidates += $makeNsisCommand.Source }
+if (${env:ProgramFiles(x86)}) {
+    $makeNsisCandidates += Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
+}
+if ($env:ProgramFiles) {
+    $makeNsisCandidates += Join-Path $env:ProgramFiles "NSIS\makensis.exe"
+}
 $makeNsisCandidates += $bundledMakeNsis
 $makeNsis = $makeNsisCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 if (-not $makeNsis) { $makeNsis = $bundledMakeNsis }

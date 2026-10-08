@@ -25,6 +25,9 @@
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "${OUTPUT_DIR}\everything_sm-${PRODUCT_VERSION}-setup.exe"
+!ifdef SIGN_UNINSTALLER
+  !uninstfinalize 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${PROJECT_ROOT}\packaging\sign-nsis-uninstaller.ps1" "%1"' = 0
+!endif
 InstallDir "$PROGRAMFILES64\everything_sm"
 InstallDirRegKey HKLM "${PRODUCT_DIR_REGKEY}" "InstallDir"
 RequestExecutionLevel admin
@@ -74,9 +77,14 @@ Var ServiceCheckbox
 Var ServiceDataRoot
 Var ServiceDataDir
 Var ServiceInstallState
+Var UpgradeBackupDir
+Var HadPreviousInstall
+Var HadPreviousService
+Var PreviousServiceMode
+Var PreviousScanRoot
 Function .onInit
   ${IfNot} ${RunningX64}
-    MessageBox MB_OK|MB_ICONSTOP "everything_sm 当前安装包仅支持 64 位 Windows。"
+    MessageBox MB_OK|MB_ICONSTOP "everything_sm 当前安装包仅支持 64 位 Windows。" /SD IDOK
     Abort
   ${EndIf}
   SetRegView 64
@@ -85,6 +93,10 @@ Function .onInit
   StrCpy $ScanRoot "$0\"
   StrCpy $InstallService "1"
   StrCpy $ServiceInstallState "compatibility"
+  StrCpy $HadPreviousInstall "0"
+  StrCpy $HadPreviousService "0"
+  StrCpy $PreviousServiceMode "compatibility"
+  StrCpy $PreviousScanRoot $ScanRoot
   ReadEnvStr $ServiceDataRoot "ProgramData"
   ${If} $ServiceDataRoot == ""
     StrCpy $ServiceDataRoot "$0\ProgramData"
@@ -122,11 +134,11 @@ Function SearchConfigPageLeave
   ${NSD_GetState} $ServiceCheckbox $InstallService
 
   ${If} $ScanRoot == ""
-    MessageBox MB_OK|MB_ICONEXCLAMATION "请输入兼容模式索引目录。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "请输入兼容模式索引目录。" /SD IDOK
     Abort
   ${EndIf}
   IfFileExists "$ScanRoot\*.*" scan_root_ok
-    MessageBox MB_OK|MB_ICONEXCLAMATION "兼容模式索引目录不存在：$ScanRoot"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "兼容模式索引目录不存在：$ScanRoot" /SD IDOK
     Abort
   scan_root_ok:
 FunctionEnd
@@ -135,20 +147,74 @@ Section "安装 everything_sm" SEC_MAIN
   SectionIn RO
   SetRegView 64
 
-  ; Only touch the service when SCM confirms that it exists. Compatibility-only
-  ; installs also contain esm_service.exe but do not register an SCM service.
+  ; Back up the old installation before stopping processes or touching SCM.
+  ReadRegStr $PreviousServiceMode HKLM "${PRODUCT_DIR_REGKEY}" "ServiceMode"
+  ${If} $PreviousServiceMode == ""
+    StrCpy $PreviousServiceMode "compatibility"
+  ${EndIf}
+  ReadRegStr $PreviousScanRoot HKLM "${PRODUCT_DIR_REGKEY}" "ScanRoot"
+  ${If} $PreviousScanRoot == ""
+    StrCpy $PreviousScanRoot $ScanRoot
+  ${EndIf}
+  InitPluginsDir
+  StrCpy $UpgradeBackupDir "$INSTDIR\.everything_sm-upgrade-backup"
+  IfFileExists "$INSTDIR\esm_gui.exe" 0 no_previous_install
+    StrCpy $HadPreviousInstall "1"
+    IfFileExists "$UpgradeBackupDir\*.*" 0 create_upgrade_backup
+      MessageBox MB_OK|MB_ICONSTOP "检测到上次失败升级留下的恢复目录：$UpgradeBackupDir。请先备份并处理该目录，本次安装不会覆盖它。" /SD IDOK
+      SetErrorLevel 1
+      Quit
+    create_upgrade_backup:
+    CreateDirectory "$UpgradeBackupDir"
+    ClearErrors
+    CopyFiles /SILENT "$INSTDIR\esm_gui.exe" "$UpgradeBackupDir\esm_gui.exe"
+    CopyFiles /SILENT "$INSTDIR\esm_launcher.exe" "$UpgradeBackupDir\esm_launcher.exe"
+    CopyFiles /SILENT "$INSTDIR\esm_server.exe" "$UpgradeBackupDir\esm_server.exe"
+    CopyFiles /SILENT "$INSTDIR\esm_service.exe" "$UpgradeBackupDir\esm_service.exe"
+    CopyFiles /SILENT "$INSTDIR\esm_cli.exe" "$UpgradeBackupDir\esm_cli.exe"
+    IfFileExists "$INSTDIR\everything_sm.ini" 0 +2
+      CopyFiles /SILENT "$INSTDIR\everything_sm.ini" "$UpgradeBackupDir\everything_sm.ini"
+    IfFileExists "$INSTDIR\README.md" 0 +2
+      CopyFiles /SILENT "$INSTDIR\README.md" "$UpgradeBackupDir\README.md"
+    IfFileExists "$INSTDIR\Uninstall.exe" 0 +2
+      CopyFiles /SILENT "$INSTDIR\Uninstall.exe" "$UpgradeBackupDir\Uninstall.exe"
+    IfFileExists "$INSTDIR\export-diagnostics.ps1" 0 +2
+      CopyFiles /SILENT "$INSTDIR\export-diagnostics.ps1" "$UpgradeBackupDir\export-diagnostics.ps1"
+    ${If} ${Errors}
+      RMDir /r "$UpgradeBackupDir"
+      MessageBox MB_OK|MB_ICONSTOP "无法完整备份旧版本，升级尚未修改现有安装。请关闭占用文件的程序后重试。" /SD IDOK
+      SetErrorLevel 1
+      Quit
+    ${EndIf}
+  no_previous_install:
+
+  ; Stop only processes whose image path belongs to this installation.
+  SetOutPath "$PLUGINSDIR"
+  File /oname=stop-install-processes.ps1 "${PROJECT_ROOT}\packaging\stop-install-processes.ps1"
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-install-processes.ps1" -InstallDirectory "$INSTDIR"'
+  Pop $0
+  ${If} $0 != "0"
+    RMDir /r "$UpgradeBackupDir"
+    MessageBox MB_OK|MB_ICONSTOP "无法安全停止安装目录中的旧程序（错误码 $0）。现有版本未被覆盖。" /SD IDOK
+    SetErrorLevel 1
+    Quit
+  ${EndIf}
+
   nsExec::ExecToLog '"$SYSDIR\sc.exe" query everything_sm'
   Pop $0
   ${If} $0 == "0"
+    StrCpy $HadPreviousService "1"
     IfFileExists "$INSTDIR\esm_service.exe" upgrade_stop_retry 0
-      MessageBox MB_OK|MB_ICONSTOP "SCM 中存在 everything_sm 服务，但安装目录缺少 esm_service.exe。为避免覆盖仍在运行或无法恢复的服务，本次升级已停止；请先修复或手动移除旧服务。"
+      RMDir /r "$UpgradeBackupDir"
+      MessageBox MB_OK|MB_ICONSTOP "SCM 中存在 everything_sm 服务，但安装目录缺少 esm_service.exe。本次升级停止。" /SD IDOK
       SetErrorLevel 1
       Quit
     upgrade_stop_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" stop'
     Pop $0
     ${If} $0 != "0"
-      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法停止旧版 everything_sm 服务（错误码 $0）。请选择“重试”，或取消安装以保留现有版本。" IDRETRY upgrade_stop_retry
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法停止旧版 everything_sm 服务（错误码 $0）。请选择“重试”，或取消安装以保留现有版本。" /SD IDCANCEL IDRETRY upgrade_stop_retry
+      RMDir /r "$UpgradeBackupDir"
       SetErrorLevel 1
       Quit
     ${EndIf}
@@ -156,25 +222,19 @@ Section "安装 everything_sm" SEC_MAIN
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
     Pop $0
     ${If} $0 != "0"
-      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法卸载旧版 everything_sm 服务（错误码 $0）。请选择“重试”，或取消安装以保留现有版本。" IDRETRY upgrade_uninstall_retry
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法卸载旧版 everything_sm 服务（错误码 $0）。请选择“重试”，或取消安装以保留现有版本。" /SD IDCANCEL IDRETRY upgrade_uninstall_retry
+      RMDir /r "$UpgradeBackupDir"
       SetErrorLevel 1
       Quit
     ${EndIf}
   ${ElseIf} $0 != "1060"
-    MessageBox MB_OK|MB_ICONSTOP "无法确认旧版 everything_sm 服务状态（SCM 查询错误码 $0）。本次升级已停止，避免在服务状态未知时覆盖程序。"
+    RMDir /r "$UpgradeBackupDir"
+    MessageBox MB_OK|MB_ICONSTOP "无法确认旧版 everything_sm 服务状态（SCM 查询错误码 $0）。本次升级停止。" /SD IDOK
     SetErrorLevel 1
     Quit
   ${EndIf}
 
-  ; These process-name fallbacks are retained until the GUI exposes a
-  ; path-scoped graceful shutdown command. The limitation is documented.
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_gui.exe'
-  Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_server.exe'
-  Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_launcher.exe'
-  Pop $0
-
+  ClearErrors
   SetOutPath "$INSTDIR"
   File /oname=esm_gui.exe "${BUILD_DIR}\esm_gui.exe"
   File /oname=esm_launcher.exe "${BUILD_DIR}\esm_launcher.exe"
@@ -182,6 +242,14 @@ Section "安装 everything_sm" SEC_MAIN
   File /oname=esm_service.exe "${BUILD_DIR}\esm_service.exe"
   File /oname=esm_cli.exe "${BUILD_DIR}\esm_cli.exe"
   File /oname=README.md "${PROJECT_ROOT}\README.md"
+  File /oname=export-diagnostics.ps1 "${PROJECT_ROOT}\tools\export-diagnostics.ps1"
+  ${If} ${Errors}
+    ${If} $HadPreviousInstall == "1"
+      Goto rollback_upgrade
+    ${EndIf}
+    MessageBox MB_OK|MB_ICONSTOP "安装文件解压失败。安装器将清理本次写入的文件。" /SD IDOK
+    Goto cleanup_failed_fresh_files
+  ${EndIf}
 
   StrCpy $ServiceInstallState "compatibility"
   ${If} $InstallService == ${BST_CHECKED}
@@ -191,49 +259,52 @@ Section "安装 everything_sm" SEC_MAIN
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" install-mft-auto "$ServiceDataDir" "${PRODUCT_PIPE}"'
     Pop $0
     ${If} $0 != "0"
-      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务安装失败（错误码 $0）。请选择“重试”；取消后会先确认并清理可能残留的服务，再明确安装为兼容模式。" IDRETRY service_install_retry
-      nsExec::ExecToLog '"$SYSDIR\sc.exe" query everything_sm'
-      Pop $1
-      ${If} $1 == "0"
-        service_install_cleanup_retry:
-        nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
-        Pop $1
-        ${If} $1 != "0"
-          MessageBox MB_RETRYCANCEL|MB_ICONSTOP "服务安装失败后仍存在残留服务，清理返回错误码 $1。请选择“重试”；取消将停止安装。" IDRETRY service_install_cleanup_retry
-          SetErrorLevel 1
-          Quit
-        ${EndIf}
-      ${ElseIf} $1 != "1060"
-        MessageBox MB_OK|MB_ICONSTOP "服务安装失败后无法确认 SCM 清理状态（查询错误码 $1）。本次安装已停止。"
-        SetErrorLevel 1
-        Quit
+      ${If} $HadPreviousInstall == "1"
+        Goto rollback_upgrade
       ${EndIf}
-      Goto service_configuration_done
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务安装失败（错误码 $0）。请选择“重试”；取消后会清理残留并使用兼容模式。" /SD IDCANCEL IDRETRY service_install_retry
+      Goto cleanup_failed_fresh_service
     ${EndIf}
 
     service_start_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" start'
     Pop $0
     ${If} $0 != "0"
-      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务启动失败（错误码 $0）。请选择“重试”；取消后会移除失败服务并使用兼容模式。" IDRETRY service_start_retry
-      service_cleanup_retry:
+      ${If} $HadPreviousInstall == "1"
+        Goto rollback_upgrade
+      ${EndIf}
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "高性能 NTFS MFT 服务启动失败（错误码 $0）。请选择“重试”；取消后会移除失败服务并使用兼容模式。" /SD IDCANCEL IDRETRY service_start_retry
+      Goto cleanup_failed_fresh_service
+    ${EndIf}
+
+    ; SERVICE_RUNNING is not sufficient: require one successful Pipe query.
+    nsExec::ExecToLog '"$INSTDIR\esm_service.exe" health "${PRODUCT_PIPE}" 120000'
+    Pop $0
+    ${If} $0 != "0"
+      ${If} $HadPreviousInstall == "1"
+        Goto rollback_upgrade
+      ${EndIf}
+      MessageBox MB_OK|MB_ICONEXCLAMATION "服务已启动但健康检查失败（错误码 $0）；安装器将移除服务并使用兼容模式。" /SD IDOK
+      Goto cleanup_failed_fresh_service
+    ${EndIf}
+    StrCpy $ServiceInstallState "mft-auto"
+    Goto service_configuration_done
+
+    cleanup_failed_fresh_service:
       nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
       Pop $1
       ${If} $1 != "0"
-        MessageBox MB_RETRYCANCEL|MB_ICONSTOP "失败服务清理未完成（错误码 $1）。请选择“重试”；取消将停止安装，避免把残留服务误报为兼容模式。" IDRETRY service_cleanup_retry
+        MessageBox MB_OK|MB_ICONSTOP "失败服务清理未完成（错误码 $1）。本次安装停止。" /SD IDOK
         SetErrorLevel 1
         Quit
       ${EndIf}
-      Goto service_configuration_done
-    ${EndIf}
-    StrCpy $ServiceInstallState "mft-auto"
+      StrCpy $ServiceInstallState "compatibility"
   ${EndIf}
   service_configuration_done:
 
   WriteINIStr "$INSTDIR\everything_sm.ini" "search" "scan_root" "$ScanRoot"
   WriteINIStr "$INSTDIR\everything_sm.ini" "search" "pipe_name" "${PRODUCT_PIPE}"
   WriteINIStr "$INSTDIR\everything_sm.ini" "search" "service_mode" "$ServiceInstallState"
-
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "InstallDir" "$INSTDIR"
@@ -248,16 +319,78 @@ Section "安装 everything_sm" SEC_MAIN
   WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKLM "${PRODUCT_UNINST_KEY}" "NoRepair" 1
 
-  ; Remove legacy all-users shortcuts, then expose the single-user service only
-  ; to the account whose SID was captured during installation.
   SetShellVarContext all
   Delete "$DESKTOP\everything_sm.lnk"
   RMDir /r "$SMPROGRAMS\everything_sm"
   SetShellVarContext current
   CreateDirectory "$SMPROGRAMS\everything_sm"
   CreateShortcut "$SMPROGRAMS\everything_sm\everything_sm.lnk" "$INSTDIR\esm_launcher.exe" "" "$INSTDIR\esm_gui.exe" 0 SW_SHOWNORMAL "" "快速文件搜索"
+  CreateShortcut "$SMPROGRAMS\everything_sm\导出诊断信息.lnk" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\export-diagnostics.ps1"' "$INSTDIR\esm_gui.exe" 0 SW_SHOWNORMAL "" "导出服务、版本、事件和资源诊断包（分享前请检查）"
   CreateShortcut "$SMPROGRAMS\everything_sm\卸载 everything_sm.lnk" "$INSTDIR\Uninstall.exe"
   CreateShortcut "$DESKTOP\everything_sm.lnk" "$INSTDIR\esm_launcher.exe" "" "$INSTDIR\esm_gui.exe" 0 SW_SHOWNORMAL "" "快速文件搜索"
+  RMDir /r "$UpgradeBackupDir"
+  Goto install_section_done
+
+  cleanup_failed_fresh_files:
+    Delete /REBOOTOK "$INSTDIR\esm_gui.exe"
+    Delete /REBOOTOK "$INSTDIR\esm_launcher.exe"
+    Delete /REBOOTOK "$INSTDIR\esm_server.exe"
+    Delete /REBOOTOK "$INSTDIR\esm_service.exe"
+    Delete /REBOOTOK "$INSTDIR\esm_cli.exe"
+    Delete /REBOOTOK "$INSTDIR\README.md"
+    Delete /REBOOTOK "$INSTDIR\export-diagnostics.ps1"
+    RMDir /r "$UpgradeBackupDir"
+    SetErrorLevel 1
+    Quit
+
+  rollback_upgrade:
+    nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
+    Pop $1
+    nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-install-processes.ps1" -InstallDirectory "$INSTDIR" -GraceMilliseconds 0'
+    Pop $1
+    ClearErrors
+    CopyFiles /SILENT "$UpgradeBackupDir\esm_gui.exe" "$INSTDIR\esm_gui.exe"
+    CopyFiles /SILENT "$UpgradeBackupDir\esm_launcher.exe" "$INSTDIR\esm_launcher.exe"
+    CopyFiles /SILENT "$UpgradeBackupDir\esm_server.exe" "$INSTDIR\esm_server.exe"
+    CopyFiles /SILENT "$UpgradeBackupDir\esm_service.exe" "$INSTDIR\esm_service.exe"
+    CopyFiles /SILENT "$UpgradeBackupDir\esm_cli.exe" "$INSTDIR\esm_cli.exe"
+    IfFileExists "$UpgradeBackupDir\everything_sm.ini" 0 +2
+      CopyFiles /SILENT "$UpgradeBackupDir\everything_sm.ini" "$INSTDIR\everything_sm.ini"
+    IfFileExists "$UpgradeBackupDir\README.md" 0 +2
+      CopyFiles /SILENT "$UpgradeBackupDir\README.md" "$INSTDIR\README.md"
+    IfFileExists "$UpgradeBackupDir\Uninstall.exe" 0 +2
+      CopyFiles /SILENT "$UpgradeBackupDir\Uninstall.exe" "$INSTDIR\Uninstall.exe"
+    IfFileExists "$UpgradeBackupDir\export-diagnostics.ps1" restore_diagnostics delete_new_diagnostics
+    restore_diagnostics:
+      CopyFiles /SILENT "$UpgradeBackupDir\export-diagnostics.ps1" "$INSTDIR\export-diagnostics.ps1"
+      Goto diagnostics_restored
+    delete_new_diagnostics:
+      Delete "$INSTDIR\export-diagnostics.ps1"
+    diagnostics_restored:
+    ${If} ${Errors}
+      MessageBox MB_OK|MB_ICONSTOP "新版本健康检查失败，而且旧文件恢复不完整。备份仍位于 $UpgradeBackupDir，请手动恢复。" /SD IDOK
+      SetErrorLevel 1
+      Quit
+    ${EndIf}
+    ${If} $HadPreviousService == "1"
+      nsExec::ExecToLog '"$INSTDIR\esm_service.exe" install-mft-auto "$ServiceDataDir" "${PRODUCT_PIPE}"'
+      Pop $1
+      ${If} $1 == "0"
+        nsExec::ExecToLog '"$INSTDIR\esm_service.exe" start'
+        Pop $1
+      ${EndIf}
+      ${If} $1 != "0"
+        MessageBox MB_OK|MB_ICONSTOP "旧文件已恢复，但旧服务重新启动失败（错误码 $1）。请重新安装旧版本。" /SD IDOK
+        SetErrorLevel 1
+        Quit
+      ${EndIf}
+    ${EndIf}
+    MessageBox MB_OK|MB_ICONSTOP "新版本未通过服务健康检查，安装器已回滚到旧版本。" /SD IDOK
+    RMDir /r "$UpgradeBackupDir"
+    SetErrorLevel 1
+    Quit
+
+  install_section_done:
 SectionEnd
 
 Function un.onInit
@@ -278,14 +411,14 @@ Section "Uninstall"
   Pop $0
   ${If} $0 == "0"
     IfFileExists "$INSTDIR\esm_service.exe" uninstall_stop_retry 0
-      MessageBox MB_OK|MB_ICONSTOP "SCM 中仍存在 everything_sm 服务，但卸载程序找不到 esm_service.exe。为避免留下不可恢复的服务，本次卸载已停止。"
+      MessageBox MB_OK|MB_ICONSTOP "SCM 中仍存在 everything_sm 服务，但卸载程序找不到 esm_service.exe。为避免留下不可恢复的服务，本次卸载已停止。" /SD IDOK
       SetErrorLevel 1
       Quit
     uninstall_stop_retry:
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" stop'
     Pop $0
     ${If} $0 != "0"
-      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法停止 everything_sm 服务（错误码 $0）。请选择“重试”，或取消卸载。" IDRETRY uninstall_stop_retry
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法停止 everything_sm 服务（错误码 $0）。请选择“重试”，或取消卸载。" /SD IDCANCEL IDRETRY uninstall_stop_retry
       SetErrorLevel 1
       Quit
     ${EndIf}
@@ -293,22 +426,26 @@ Section "Uninstall"
     nsExec::ExecToLog '"$INSTDIR\esm_service.exe" uninstall'
     Pop $0
     ${If} $0 != "0"
-      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法删除 everything_sm 服务（错误码 $0）。请选择“重试”，或取消卸载。" IDRETRY uninstall_service_retry
+      MessageBox MB_RETRYCANCEL|MB_ICONSTOP "无法删除 everything_sm 服务（错误码 $0）。请选择“重试”，或取消卸载。" /SD IDCANCEL IDRETRY uninstall_service_retry
       SetErrorLevel 1
       Quit
     ${EndIf}
   ${ElseIf} $0 != "1060"
-    MessageBox MB_OK|MB_ICONSTOP "无法确认 everything_sm 服务状态（SCM 查询错误码 $0）。本次卸载已停止。"
+    MessageBox MB_OK|MB_ICONSTOP "无法确认 everything_sm 服务状态（SCM 查询错误码 $0）。本次卸载已停止。" /SD IDOK
     SetErrorLevel 1
     Quit
   ${EndIf}
 
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_gui.exe'
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File /oname=stop-install-processes.ps1 "${PROJECT_ROOT}\packaging\stop-install-processes.ps1"
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-install-processes.ps1" -InstallDirectory "$INSTDIR"'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_server.exe'
-  Pop $0
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM esm_launcher.exe'
-  Pop $0
+  ${If} $0 != "0"
+    MessageBox MB_OK|MB_ICONSTOP "无法安全停止安装目录中的程序（错误码 $0）。本次卸载已停止。" /SD IDOK
+    SetErrorLevel 1
+    Quit
+  ${EndIf}
 
   Delete "$DESKTOP\everything_sm.lnk"
   RMDir /r "$SMPROGRAMS\everything_sm"
@@ -319,8 +456,11 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
   DeleteRegKey HKLM "${PRODUCT_DIR_REGKEY}"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\esm_service.exe"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\esm_gui.exe"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\esm_server.exe"
 
-  MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除机器级索引快照和当前用户设置？" IDNO keep_data
+  MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除机器级索引快照和当前用户设置？" /SD IDNO IDNO keep_data
     RMDir /r "$ServiceDataRoot\everything_sm"
     RMDir /r "$LOCALAPPDATA\everything_sm"
   keep_data:
@@ -332,6 +472,8 @@ Section "Uninstall"
   Delete /REBOOTOK "$INSTDIR\esm_cli.exe"
   Delete /REBOOTOK "$INSTDIR\everything_sm.ini"
   Delete /REBOOTOK "$INSTDIR\README.md"
+  Delete /REBOOTOK "$INSTDIR\export-diagnostics.ps1"
+  RMDir /r "$INSTDIR\.everything_sm-upgrade-backup"
   Delete /REBOOTOK "$INSTDIR\Uninstall.exe"
   RMDir /r "$INSTDIR"
 SectionEnd

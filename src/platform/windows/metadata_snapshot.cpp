@@ -1,10 +1,11 @@
-﻿#include "esm/metadata_snapshot.hpp"
+#include "esm/metadata_snapshot.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -19,6 +20,7 @@ static_assert(sizeof(wchar_t) == 2,
 constexpr std::uint64_t magic = 0x3150414e534d5345ULL; // "ESMSNAP1"
 constexpr std::uint32_t legacy_format_version = 1;
 constexpr std::uint32_t compact_format_version = 2;
+constexpr std::uint32_t index_format_version = 3;
 constexpr std::size_t legacy_fixed_header_size = 56;
 constexpr std::size_t compact_fixed_header_size = 80;
 constexpr std::size_t legacy_fixed_record_size = 48;
@@ -478,9 +480,12 @@ MetadataSnapshotIoResult save_compact_catalog_atomic(
     std::uint64_t root_id,
     std::wstring_view volume,
     std::span<const CatalogBaseNode> nodes,
-    std::span<const wchar_t> names) {
+    std::span<const wchar_t> names,
+    std::uint32_t format_version) {
     MetadataSnapshotIoResult result;
-    if (root_id == 0 || volume.empty() ||
+    if ((format_version != compact_format_version &&
+         format_version != index_format_version) ||
+        root_id == 0 || volume.empty() ||
         nodes.size() > max_record_count ||
         volume.size() > max_string_characters ||
         names.size() > (std::numeric_limits<std::uint32_t>::max)()) {
@@ -493,7 +498,14 @@ MetadataSnapshotIoResult save_compact_catalog_atomic(
         const auto& node = nodes[i];
         const auto name_end = static_cast<std::uint64_t>(node.name_offset) +
                               node.name_length;
+        const bool valid_reserved = format_version == compact_format_version
+            ? node.reserved[0] == 0 && node.reserved[1] == 0 &&
+                  node.reserved[2] == 0
+            : format_version == index_format_version &&
+                  node.reserved[0] <= 1 && node.reserved[1] == 0 &&
+                  node.reserved[2] == 0;
         if (node.id == 0 || (i != 0 && node.id <= previous_id) ||
+            node.directory > 1 || !valid_reserved ||
             name_end > names.size()) {
             result.error = ERROR_INVALID_DATA;
             return result;
@@ -530,7 +542,7 @@ MetadataSnapshotIoResult save_compact_catalog_atomic(
     SnapshotWriter writer(file.value);
     std::uint32_t error = ERROR_SUCCESS;
     if (!writer.u64(magic, error) ||
-        !writer.u32(compact_format_version, error) ||
+        !writer.u32(format_version, error) ||
         !writer.u32(0, error) ||
         !writer.u64(checkpoint.journal_id, error) ||
         !writer.i64(checkpoint.next_usn, error) ||
@@ -676,8 +688,33 @@ MetadataSnapshotIoResult save_metadata_catalog_snapshot_atomic(
     const NtfsCatalog& catalog) {
     auto view = catalog.storage_view();
     if (!view) return {false, ERROR_INVALID_STATE};
-    return save_compact_catalog_atomic(path, checkpoint, root_id, volume,
-                                       view.nodes(), view.names());
+    return save_compact_catalog_atomic(
+        path, checkpoint, root_id, volume, view.nodes(), view.names(),
+        compact_format_version);
+}
+
+MetadataSnapshotIoResult save_metadata_catalog_snapshot_atomic(
+    const std::filesystem::path& path,
+    JournalCheckpoint checkpoint,
+    std::uint64_t root_id,
+    std::wstring_view volume,
+    std::span<const CatalogBaseNode> nodes,
+    std::span<const wchar_t> names) {
+    return save_compact_catalog_atomic(
+        path, checkpoint, root_id, volume, nodes, names,
+        compact_format_version);
+}
+
+MetadataSnapshotIoResult save_metadata_index_snapshot_atomic(
+    const std::filesystem::path& path,
+    JournalCheckpoint checkpoint,
+    std::uint64_t root_id,
+    std::wstring_view volume,
+    std::span<const CatalogBaseNode> nodes,
+    std::span<const wchar_t> text) {
+    return save_compact_catalog_atomic(
+        path, checkpoint, root_id, volume, nodes, text,
+        index_format_version);
 }
 
 MappedMetadataSnapshotLoadResult load_metadata_snapshot_mapped(
@@ -727,7 +764,8 @@ MappedMetadataSnapshotLoadResult load_metadata_snapshot_mapped(
             result.error = corrupt_data_error;
             return result;
         }
-        if (version != compact_format_version) {
+        if (version != compact_format_version &&
+            version != index_format_version) {
             result.error = version == legacy_format_version
                 ? ERROR_REVISION_MISMATCH
                 : corrupt_data_error;
@@ -791,9 +829,13 @@ MappedMetadataSnapshotLoadResult load_metadata_snapshot_mapped(
         std::uint64_t previous_id = 0;
         for (std::uint64_t i = 0; i < record_count; ++i) {
             const auto& node = nodes[i];
+            const bool valid_reserved = version == compact_format_version
+                ? node.reserved[0] == 0 && node.reserved[1] == 0 &&
+                      node.reserved[2] == 0
+                : node.reserved[0] <= 1 && node.reserved[1] == 0 &&
+                      node.reserved[2] == 0;
             if (node.id == 0 || (i != 0 && node.id <= previous_id) ||
-                node.directory > 1 || node.reserved[0] != 0 ||
-                node.reserved[1] != 0 || node.reserved[2] != 0 ||
+                node.directory > 1 || !valid_reserved ||
                 node.name_length > max_string_characters ||
                 node.name_offset > name_characters ||
                 node.name_length > name_characters - node.name_offset) {
@@ -814,7 +856,7 @@ MappedMetadataSnapshotLoadResult load_metadata_snapshot_mapped(
         snapshot.catalog.name_count =
             static_cast<std::size_t>(name_characters);
         snapshot.catalog.mapped_bytes = mapped->size;
-        snapshot.format_version = compact_format_version;
+        snapshot.format_version = version;
         result.snapshot = std::move(snapshot);
         result.ok = true;
         result.error = ERROR_SUCCESS;
@@ -838,23 +880,87 @@ MetadataSnapshotLoadResult load_metadata_snapshot(
             snapshot.checkpoint = mapped.snapshot.checkpoint;
             snapshot.root_id = mapped.snapshot.root_id;
             snapshot.volume = mapped.snapshot.volume;
-            snapshot.records.reserve(mapped.snapshot.catalog.node_count);
-            for (std::size_t i = 0;
-                 i < mapped.snapshot.catalog.node_count; ++i) {
-                const auto& node = mapped.snapshot.catalog.nodes[i];
-                FileRecord record;
-                record.id = node.id;
-                record.parent_id = node.parent_id;
-                record.size = node.size;
-                record.last_write_time = node.last_write_time;
-                record.attributes = node.attributes;
-                record.directory = node.directory != 0;
-                if (node.name_length != 0) {
-                    record.name.assign(
-                        mapped.snapshot.catalog.names + node.name_offset,
-                        node.name_length);
+
+            if (mapped.snapshot.format_version == compact_format_version) {
+                NtfsCatalog catalog(snapshot.volume, snapshot.root_id);
+                if (!catalog.replace_mapped(
+                        std::move(mapped.snapshot.catalog))) {
+                    result.error = corrupt_data_error;
+                    return result;
                 }
-                snapshot.records.push_back(std::move(record));
+                snapshot.records = catalog.snapshot();
+            } else {
+                const auto* nodes = mapped.snapshot.catalog.nodes;
+                const auto node_count = mapped.snapshot.catalog.node_count;
+                const auto* text = mapped.snapshot.catalog.names;
+                snapshot.records.reserve(node_count);
+                for (std::size_t i = 0; i < node_count; ++i) {
+                    const auto& node = nodes[i];
+                    FileRecord record;
+                    record.id = node.id;
+                    record.parent_id = node.parent_id;
+                    record.size = node.size;
+                    record.last_write_time = node.last_write_time;
+                    record.attributes = node.attributes;
+                    record.directory = node.directory != 0;
+                    const std::wstring_view stored(
+                        text + node.name_offset, node.name_length);
+                    if (node.reserved[0] != 0) {
+                        if (stored.empty()) {
+                            result.error = corrupt_data_error;
+                            return result;
+                        }
+                        record.path.assign(stored);
+                        const auto separator = stored.find_last_of(L"\\/");
+                        record.name.assign(separator == std::wstring_view::npos
+                                               ? stored
+                                               : stored.substr(separator + 1));
+                    } else {
+                        record.name.assign(stored);
+                    }
+                    snapshot.records.push_back(std::move(record));
+                }
+
+                std::vector<std::uint8_t> path_state(node_count, 0);
+                const auto find_node = [&](std::uint64_t id) {
+                    const auto found = std::lower_bound(
+                        nodes, nodes + node_count, id,
+                        [](const CatalogBaseNode& node, std::uint64_t value) {
+                            return node.id < value;
+                        });
+                    return found != nodes + node_count && found->id == id
+                        ? static_cast<std::size_t>(found - nodes)
+                        : node_count;
+                };
+                std::function<bool(std::size_t, std::size_t)> resolve_path;
+                resolve_path = [&](std::size_t index,
+                                   std::size_t depth) -> bool {
+                    if (path_state[index] == 2) return true;
+                    if (path_state[index] == 1 || depth > 512) return false;
+                    path_state[index] = 1;
+                    auto& record = snapshot.records[index];
+                    if (nodes[index].reserved[0] == 0) {
+                        const auto parent = find_node(record.parent_id);
+                        if (parent == node_count || parent == index ||
+                            !resolve_path(parent, depth + 1)) {
+                            return false;
+                        }
+                        record.path = snapshot.records[parent].path;
+                        if (!record.path.ends_with(L"\\") &&
+                            !record.path.ends_with(L"/")) {
+                            record.path.push_back(L'\\');
+                        }
+                        record.path += record.name;
+                    }
+                    path_state[index] = 2;
+                    return true;
+                };
+                for (std::size_t i = 0; i < node_count; ++i) {
+                    if (!resolve_path(i, 0)) {
+                        result.error = corrupt_data_error;
+                        return result;
+                    }
+                }
             }
             result.snapshot = std::move(snapshot);
             result.ok = true;

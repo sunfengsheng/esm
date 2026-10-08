@@ -1,5 +1,6 @@
 #pragma once
 #include "esm/file_record.hpp"
+#include "esm/ntfs_catalog.hpp"
 #include "esm/query.hpp"
 #include "esm/usn_journal.hpp"
 #include <cstddef>
@@ -69,6 +70,10 @@ struct MetadataReuseStats {
     std::size_t unknown{};
     std::size_t stale{};
 };
+struct MetadataCatalogSnapshot {
+    std::vector<CatalogBaseNode> nodes;
+    std::vector<wchar_t> names;
+};
 class MetadataIndex {
 public:
     static constexpr std::size_t default_auto_compaction_threshold = 100'000;
@@ -113,6 +118,11 @@ public:
     // Materializes the current live base + overlay view, excluding removals,
     // in stable ID order for a durable checkpoint consolidation.
     [[nodiscard]] std::vector<FileRecord> snapshot_records() const;
+    // Exports the current live view in the compact version-3 component/anchor persistence
+    // layout. Only fixed-size node metadata, component names, and the small
+    // set of required full-path anchors are copied; search accelerators and
+    // complete paths for ordinary descendants are not duplicated.
+    [[nodiscard]] MetadataCatalogSnapshot catalog_snapshot() const;
     [[nodiscard]] bool compact();
     void set_auto_compaction_threshold(std::size_t threshold);
     [[nodiscard]] std::size_t compaction_count() const;

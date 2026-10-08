@@ -1819,6 +1819,120 @@ std::vector<FileRecord> MetadataIndex::snapshot_records() const {
     return result;
 }
 
+MetadataCatalogSnapshot MetadataIndex::catalog_snapshot() const {
+    std::shared_lock lock(mutex_);
+    MetadataCatalogSnapshot result;
+
+    // Overlay entries already own complete paths. Persisting those paths as
+    // anchors keeps checkpoint export independent from transient parent
+    // updates while the much larger immutable base remains componentized.
+    std::vector<const FileRecord*> live_overlay;
+    live_overlay.reserve(overlay_.size());
+    std::size_t total_text_chars = 0;
+    for (const auto& [id, record] : overlay_) {
+        if (removed_.find(id) != removed_.end()) continue;
+        live_overlay.push_back(&record);
+        total_text_chars += record.path.size();
+    }
+    std::sort(live_overlay.begin(), live_overlay.end(),
+              [](const FileRecord* left, const FileRecord* right) {
+                  return left->id < right->id;
+              });
+
+    std::wstring path_scratch;
+    for (const auto& record : records_) {
+        if (removed_.find(record.id) != removed_.end() ||
+            overlay_.find(record.id) != overlay_.end()) {
+            continue;
+        }
+        total_text_chars += record.name_only_path
+            ? record.name_length()
+            : path_view(record, path_scratch).size();
+    }
+    if (total_text_chars > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("catalog text arena exceeds 32-bit offsets");
+    }
+
+    result.nodes.reserve(live_size_);
+    result.names.reserve(total_text_chars);
+    const auto append = [&](std::uint64_t id, std::uint64_t parent,
+                            std::uint64_t size, std::int64_t write_time,
+                            std::uint32_t attributes, bool directory,
+                            std::wstring_view text, bool path_anchor) {
+        if (text.size() > std::numeric_limits<std::uint32_t>::max() ||
+            result.names.size() >
+                std::numeric_limits<std::uint32_t>::max() - text.size()) {
+            throw std::length_error("catalog text arena exceeds 32-bit offsets");
+        }
+        CatalogBaseNode node;
+        node.id = id;
+        node.parent_id = parent;
+        node.size = size;
+        node.last_write_time = write_time;
+        node.attributes = directory ? attributes | 0x10U
+                                    : attributes & ~0x10U;
+        node.name_offset = static_cast<std::uint32_t>(result.names.size());
+        node.name_length = static_cast<std::uint32_t>(text.size());
+        node.directory = directory ? 1 : 0;
+        node.reserved[0] = path_anchor ? 1 : 0;
+        result.names.insert(result.names.end(), text.begin(), text.end());
+        result.nodes.push_back(node);
+    };
+    const auto append_base = [&](const CompactRecord& record) {
+        const bool path_anchor = !record.name_only_path;
+        std::wstring scratch;
+        const auto text = path_anchor ? path_view(record, scratch)
+                                      : name_view(record);
+        append(record.id, parent_id(record), record.size,
+               record.last_write_time, record.attributes,
+               record.directory(), text, path_anchor);
+    };
+    const auto append_overlay = [&](const FileRecord& record) {
+        append(record.id, record.parent_id, record.size,
+               record.last_write_time, record.attributes,
+               record.directory, record.path, true);
+    };
+
+    std::size_t base_index = 0;
+    std::size_t overlay_index = 0;
+    while (base_index < records_.size() ||
+           overlay_index < live_overlay.size()) {
+        while (base_index < records_.size() &&
+               (removed_.find(records_[base_index].id) != removed_.end() ||
+                overlay_.find(records_[base_index].id) != overlay_.end())) {
+            ++base_index;
+        }
+        if (base_index == records_.size()) {
+            while (overlay_index < live_overlay.size()) {
+                append_overlay(*live_overlay[overlay_index++]);
+            }
+            break;
+        }
+        if (overlay_index == live_overlay.size()) {
+            while (base_index < records_.size()) {
+                const auto& base = records_[base_index++];
+                if (removed_.find(base.id) == removed_.end() &&
+                    overlay_.find(base.id) == overlay_.end()) {
+                    append_base(base);
+                }
+            }
+            break;
+        }
+
+        const auto& base = records_[base_index];
+        const auto* overlay = live_overlay[overlay_index];
+        if (overlay->id < base.id) {
+            append_overlay(*overlay);
+            ++overlay_index;
+        } else {
+            append_base(base);
+            ++base_index;
+        }
+    }
+
+    return result;
+}
+
 void MetadataIndex::rebuild_suppressed_base_ids_locked() {
     suppressed_base_ids_.clear();
     suppressed_base_ids_.reserve(overlay_.size() + removed_.size());
@@ -2460,7 +2574,10 @@ std::vector<SearchResult> MetadataIndex::search(
                 }
                 if (matches == nullptr) {
                     matches = &overlay_child_name_matches.try_emplace(
-                        parent, child_name_term_indices.size(), 0).first->second;
+                        parent,
+                        std::vector<std::uint8_t>(
+                            child_name_term_indices.size(), std::uint8_t{0}))
+                                   .first->second;
                 }
                 (*matches)[slot] = 1;
             }

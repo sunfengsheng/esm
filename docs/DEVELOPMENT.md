@@ -247,3 +247,34 @@ python tools\generate_content_icon.py
 ```
 
 脚本输出 `dist\everything-sm-content-<version>-dev-setup.exe` 和 SHA-256 文件。它是按用户、无管理员权限的独立包，不包含文件名搜索二进制。`-AllowDevelopmentPackage` 是强制的误发布保护：Xapian 静态链接的 GPL/source-distribution 方案尚未审查完成，不能把该产物上传到公开 release。
+
+## 11. P0 发布加固验证与签名
+
+本地无副作用验证：
+
+```powershell
+cmake --build build-release-hardening --parallel 4
+ctest --test-dir build-release-hardening --output-on-failure
+.\build-release-hardening\esm_tests.exe --recovery-fault-stress 100
+
+cmake --build build-msvc18-hardening --config Release --parallel 4
+ctest --test-dir build-msvc18-hardening -C Release --output-on-failure
+.\build-msvc18-hardening\Release\esm_tests.exe --recovery-fault-stress 20
+
+# 只编译安装器，不安装
+.\packaging\build-installer.ps1 -BuildDirectory build-release-hardening -SkipBuild
+```
+
+安装器 smoke 会创建/删除 SCM 服务，只允许在干净 VM 或 CI runner 中运行：
+
+```powershell
+.\tools\windows-install-smoke.ps1 -InstallerPath .\dist\everything_sm-0.1.0-setup.exe
+```
+
+`build-installer.ps1` 支持 Authenticode 参数或同名环境变量：证书路径、证书密码、时间戳 URL 和 `-RequireSignature`。构建顺序为签名全部发布 EXE → 生成并签名内嵌 `Uninstall.exe` → 编译最终 NSIS → 签名最终安装器 → 校验签名。标签 CI 需要：
+
+- `WINDOWS_SIGNING_CERTIFICATE_BASE64`；
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`；
+- 可访问的 RFC 3161 时间戳服务（由构建参数/环境配置）。
+
+标签缺少证书时必须失败。真实发布前还要在隔离 VM 检查安装后的 `Uninstall.exe`，确认其 Authenticode 链和时间戳有效；仅成功编译 unsigned 本地安装器不算签名验收。

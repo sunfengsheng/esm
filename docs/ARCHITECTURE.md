@@ -334,7 +334,7 @@ flowchart LR
 5. 当 delta 数量或运维操作触发 checkpoint 时，按 `base + overlay - tombstone` 物化新的 generation snapshot；
 6. 原子切换 generation 对应的 snapshot/WAL/state，再清理旧 generation 文件。
 
-checkpoint consolidation 已覆盖 base、overlay 和 tombstone 的 ID 语义，并有事务尾部、generation mismatch 和 crash-recovery 测试。当前 writer 仍会物化完整记录向量；百万级真实卷的 checkpoint 峰值内存和耗时仍需继续优化，不能把格式正确性测试当作真实端到端性能结果。
+checkpoint consolidation 已覆盖 base、overlay 和 tombstone 的 ID 语义，并有事务尾部、generation mismatch 和 crash-recovery 测试。默认多卷 writer 已直接消费紧凑 catalog 节点与名称 arena，不再物化完整记录向量；单卷旧路径和 snapshot 启动加载仍可能物化 `vector<FileRecord>`。百万级真实卷的 checkpoint 峰值内存和耗时仍需继续验证，不能把格式正确性测试当作真实端到端性能结果。
 
 ## NTFS 文件身份边界
 
@@ -402,3 +402,38 @@ flowchart LR
 ```
 
 列表选择变化时，窗口线程把命中的文件名、完整路径和索引摘要写入只读 RichEdit，并按服务端返回的 UTF-16 范围设置黄色粗体。预览不会重新读取原始 DOCX/PDF，也没有接入 Windows Preview Handler；因此它展示的是索引摘要，而不是文件页面、Word 排版或 PDF 渲染结果。
+
+## 14. P0 checkpoint 与发布恢复路径（2026-07-29）
+
+### 14.1 Snapshot v3 component/anchor
+
+默认多卷 checkpoint 从 `MetadataIndex::catalog_snapshot()` 导出按 ID 稳定排序的 `CatalogBaseNode` 和 UTF-16 text arena。v3 使用节点 `reserved[0]` 区分字符串含义：
+
+- `0`：普通名称组件，加载时沿 `parent_id` 链拼接路径；
+- `1`：完整路径 anchor，用于每个卷根以及无法安全依赖当前 base parent 的 overlay 记录；
+- `reserved[1..2]` 必须为 `0`。
+
+加载器验证严格递增 ID、字符串范围、anchor 非空、父节点存在、无自循环且递归深度有界。v2 catalog 继续由 `NtfsCatalog` 映射恢复；v3 materialized loader 先建立记录，再解析 component 的完整路径。
+
+```mermaid
+flowchart LR
+    A["活动 MetadataIndex"] --> B["导出 base + overlay - tombstone"]
+    B --> C["普通后代：名称组件"]
+    B --> D["卷根/overlay：完整路径 anchor"]
+    C --> E["v3 临时 snapshot + checksum"]
+    D --> E
+    E --> F["write-through 原子替换"]
+    F --> G["初始化新 generation WAL/state"]
+```
+
+checkpoint 不复制搜索 trigram、前缀表或普通后代完整路径，成功后也不调用 `MetadataIndex::replace()` 重建活动索引。初始 reconciliation 仍可能在新旧完整索引交接时产生重叠；本轮没有用真实百万级管理员 MFT 场景重新测峰值。
+
+### 14.2 服务健康与升级状态流
+
+`esm_service health` 同时检查 SCM 状态和真实 Named Pipe 空查询。NSIS 覆盖升级按以下顺序工作：检查遗留 recovery 目录 → 备份旧文件 → 路径限定停止 GUI/launcher/server → 停止并删除旧服务 → 写入新文件 → 安装/启动新服务 → Pipe 健康检查 → 提交并删除备份。任一步在已覆盖旧文件后失败会尝试恢复备份和旧服务。
+
+恢复目录位于 `$INSTDIR\.everything_sm-upgrade-backup`，故安装器进程退出后仍可保留人工恢复材料。该流程没有持久化 upgrade manifest，也没有对多文件替换提供单个原子提交点，因此只能称部分事务回滚。
+
+### 14.3 故障模型
+
+`esm_tests --recovery-fault-stress N` 启动子进程，在 snapshot/WAL/checkpoint 的多个阶段强制终止，再验证可恢复 generation、事务尾和查询状态。它覆盖进程强杀与撕裂尾部模型，不等价于机器掉电、存储控制器缓存丢失或 NTFS 元数据损坏。CI 的 installer smoke 在隔离 Windows runner 执行静默安装、同版本升级、健康检查和卸载；不能替代完整 Win10/Win11 发布矩阵。

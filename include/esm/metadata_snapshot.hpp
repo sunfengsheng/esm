@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,10 +54,31 @@ struct MappedMetadataSnapshotLoadResult : MetadataSnapshotIoResult {
     std::uint64_t root_id,
     std::wstring_view volume,
     const NtfsCatalog& catalog);
+// Writes an already-exported compact catalog. The node IDs must be strictly
+// increasing and every name range must refer to the supplied name arena.
+[[nodiscard]] MetadataSnapshotIoResult save_metadata_catalog_snapshot_atomic(
+    const std::filesystem::path& path,
+    JournalCheckpoint checkpoint,
+    std::uint64_t root_id,
+    std::wstring_view volume,
+    std::span<const CatalogBaseNode> nodes,
+    std::span<const wchar_t> names);
+// Writes the version-3 multi-root index format. reserved[0] marks entries
+// whose string is a complete path anchor; other entries store only a name and
+// reconstruct their path through parent_id.
+[[nodiscard]] MetadataSnapshotIoResult save_metadata_index_snapshot_atomic(
+    const std::filesystem::path& path,
+    JournalCheckpoint checkpoint,
+    std::uint64_t root_id,
+    std::wstring_view volume,
+    std::span<const CatalogBaseNode> nodes,
+    std::span<const wchar_t> text);
 [[nodiscard]] MetadataSnapshotLoadResult load_metadata_snapshot(
     const std::filesystem::path& path);
-// Loads the version-2 compact snapshot as a read-only file mapping. Version-1
-// snapshots return ERROR_REVISION_MISMATCH so callers can use the legacy loader.
+// Loads version-2 catalog and version-3 multi-root index snapshots as a
+// read-only file mapping. Version-1 snapshots return ERROR_REVISION_MISMATCH
+// so callers can use the legacy loader. Callers must inspect format_version
+// before handing the mapped nodes to NtfsCatalog; version 3 contains anchors.
 [[nodiscard]] MappedMetadataSnapshotLoadResult load_metadata_snapshot_mapped(
     const std::filesystem::path& path);
 } // namespace esm

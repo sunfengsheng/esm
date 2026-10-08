@@ -118,6 +118,20 @@ flowchart LR
 
 详细设计见 [架构文档](docs/ARCHITECTURE.md)。
 
+## P0 发布加固状态
+
+当前安装包面向 **64 位 Windows 的单用户受信设备**，安装和服务管理需要管理员权限。文件名搜索主程序已具备：
+
+- SCM 延迟自动启动服务、安装用户 SID 限定的本地 Named Pipe；
+- generation-bound 名称/USN WAL、metadata WAL、snapshot 与 checkpoint 恢复；
+- `esm_service health` 的 SCM + Pipe 端到端健康检查；
+- 覆盖升级前备份、失败健康检查回滚、WER dump 和诊断 ZIP；
+- MinGW/MSVC Release 测试、恢复故障压力入口和 CI 安装器 smoke；
+- snapshot v3 多根 component/anchor checkpoint，避免 checkpoint 时复制全部完整路径。
+
+仍不能把当前版本描述为 Everything 100% 兼容或面向企业多用户环境的正式稳定版：per-request impersonation、按文件 ACL 过滤、真实生产证书签名、Win10/Win11 隔离 VM 发布矩阵，以及同机同数据集的 Everything 端到端性能对照仍是发布门槛。详见 [当前状态](docs/CURRENT_STATUS.md)、[运维说明](docs/OPERATIONS.md) 和 [兼容性矩阵](docs/EVERYTHING_COMPATIBILITY.md)。
+
+
 ## 文档
 
 - [文档导航](docs/README.md)
@@ -132,6 +146,7 @@ flowchart LR
 - [路线图](docs/ROADMAP.md)
 - [贡献指南](CONTRIBUTING.md)
 - [变更记录](CHANGELOG.md)
+
 
 ## 文档同步规则
 

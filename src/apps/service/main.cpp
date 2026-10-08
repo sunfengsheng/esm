@@ -766,14 +766,13 @@ struct MftAutoPersistenceResult {
     }
 };
 
-MftAutoPersistenceResult persist_mft_auto_generation(
+MftAutoPersistenceResult finish_mft_auto_generation(
     const std::filesystem::path& snapshot_path,
-    std::vector<esm::FileRecord>& records,
     const std::vector<VolumeLiveState>& states,
-    std::uint64_t generation) {
+    std::uint64_t generation,
+    esm::MetadataSnapshotIoResult snapshot) {
     MftAutoPersistenceResult result;
-    result.snapshot = save_mft_auto_snapshot(
-        snapshot_path, records, generation);
+    result.snapshot = snapshot;
     if (!result.snapshot.ok) return result;
 
     result.hydration_wal = esm::initialize_metadata_hydration_wal(
@@ -793,6 +792,28 @@ MftAutoPersistenceResult persist_mft_auto_generation(
         esm::mft_auto_state_path(snapshot_path),
         make_mft_auto_state(generation, states));
     return result;
+}
+
+MftAutoPersistenceResult persist_mft_auto_generation(
+    const std::filesystem::path& snapshot_path,
+    std::vector<esm::FileRecord>& records,
+    const std::vector<VolumeLiveState>& states,
+    std::uint64_t generation) {
+    return finish_mft_auto_generation(
+        snapshot_path, states, generation,
+        save_mft_auto_snapshot(snapshot_path, records, generation));
+}
+
+MftAutoPersistenceResult persist_mft_auto_catalog_generation(
+    const std::filesystem::path& snapshot_path,
+    const esm::MetadataCatalogSnapshot& catalog,
+    const std::vector<VolumeLiveState>& states,
+    std::uint64_t generation) {
+    return finish_mft_auto_generation(
+        snapshot_path, states, generation,
+        esm::save_metadata_index_snapshot_atomic(
+            snapshot_path, {generation, 0}, 1, mft_auto_snapshot_marker,
+            catalog.nodes, catalog.names));
 }
 
 
@@ -1202,15 +1223,18 @@ void run_mft_auto_service() {
                          mft_delta_checkpoint_interval)) {
                     const auto old_generation = current_generation;
                     const auto old_states = states;
-                    auto checkpoint_records = index.snapshot_records();
+                    // Export only fixed-size catalog nodes and file-name
+                    // components. Materializing every complete path and then
+                    // rebuilding the live search index caused a multi-gigabyte
+                    // checkpoint peak on multi-million-entry machines.
+                    auto checkpoint_catalog = index.catalog_snapshot();
                     const auto next_generation =
                         create_snapshot_generation();
-                    const auto persisted = persist_mft_auto_generation(
-                        snapshot_path, checkpoint_records, states,
+                    const auto persisted = persist_mft_auto_catalog_generation(
+                        snapshot_path, checkpoint_catalog, states,
                         next_generation);
                     if (persisted.committed()) {
-                        const auto count = checkpoint_records.size();
-                        index.replace(std::move(checkpoint_records));
+                        const auto count = checkpoint_catalog.nodes.size();
                         current_generation = next_generation;
                         changes_since_checkpoint = 0;
                         last_delta_checkpoint = checkpoint_now;
@@ -1931,6 +1955,65 @@ DWORD status_service() {
     return ERROR_SUCCESS;
 }
 
+DWORD health_service(std::wstring_view pipe_name, DWORD timeout_ms) {
+    ServiceHandle manager;
+    ServiceHandle service;
+    DWORD error = open_service_with_access(
+        SERVICE_QUERY_STATUS, manager, service);
+    if (error != ERROR_SUCCESS) return error;
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    std::uint32_t last_pipe_error = ERROR_FILE_NOT_FOUND;
+    for (;;) {
+        SERVICE_STATUS_PROCESS status{};
+        if (!query_status(service.value, status, error)) return error;
+        if (status.dwCurrentState == SERVICE_STOPPED) {
+            return status.dwWin32ExitCode == ERROR_SUCCESS
+                       ? ERROR_SERVICE_NOT_ACTIVE
+                       : status.dwWin32ExitCode;
+        }
+        if (status.dwCurrentState == SERVICE_RUNNING) {
+            esm::IpcSearchRequest request;
+            request.limit = 1;
+            request.query.clear();
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline -
+                                           std::chrono::steady_clock::now());
+            const auto request_timeout = static_cast<std::uint32_t>(
+                std::clamp<std::int64_t>(remaining.count(), 1, 2'000));
+            const auto response = esm::query_named_pipe_search(
+                pipe_name, request, request_timeout);
+            if (response.error == ERROR_SUCCESS) {
+                std::wcout << L"Service health: ready\n"
+                           << L"Pipe: " << esm::normalize_pipe_name(pipe_name)
+                           << L"\n"
+                           << L"Indexed results sampled: "
+                           << response.response.results.size() << L"\n";
+                return ERROR_SUCCESS;
+            }
+            last_pipe_error = response.error;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+            return last_pipe_error == ERROR_SUCCESS ? ERROR_TIMEOUT
+                                                    : last_pipe_error;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+bool parse_timeout(std::wstring_view text, DWORD& value) {
+    if (text.empty()) return false;
+    std::uint64_t parsed = 0;
+    for (const wchar_t ch : text) {
+        if (ch < L'0' || ch > L'9') return false;
+        parsed = parsed * 10 + static_cast<unsigned>(ch - L'0');
+        if (parsed > 600'000) return false;
+    }
+    if (parsed == 0) return false;
+    value = static_cast<DWORD>(parsed);
+    return true;
+}
+
 void usage() {
     std::wcout
         << L"Usage:\n"
@@ -1940,7 +2023,8 @@ void usage() {
         << L"  esm_service uninstall\n"
         << L"  esm_service start\n"
         << L"  esm_service stop\n"
-        << L"  esm_service status\n";
+        << L"  esm_service status\n"
+        << L"  esm_service health [pipe-name] [timeout-ms]\n";
 }
 
 void reject_service_configuration(DWORD error, std::wstring message) {
@@ -2064,6 +2148,14 @@ int wmain(int argc, wchar_t** argv) {
     } else if (command == L"status") {
         if (argc != 2) return 2;
         error = status_service();
+    } else if (command == L"health") {
+        if (argc > 4) return 2;
+        const std::wstring_view pipe =
+            argc >= 3 ? std::wstring_view(argv[2])
+                      : std::wstring_view(default_pipe_name);
+        DWORD timeout_ms = 120'000;
+        if (argc == 4 && !parse_timeout(argv[3], timeout_ms)) return 2;
+        error = health_service(pipe, timeout_ms);
     } else {
         reject_service_configuration(
             ERROR_INVALID_PARAMETER,

@@ -118,10 +118,10 @@
 - [ ] per-request impersonation。
 - [ ] 按用户 ACL 过滤查询结果。
 - [ ] 服务最小权限设计。
-- [ ] 结构化日志、日志轮转和诊断包。
-- [ ] 崩溃报告和隐私策略。
-- [ ] 代码签名与安装包签名。
-- [ ] 安全自动升级、回滚和数据库迁移。
+- [x] WER LocalDumps 与包含基础脱敏报告的诊断 ZIP；[ ] 结构化文件日志和日志轮转。
+- [x] Windows WER LocalDumps 配置；[ ] dump 上传、保留和隐私策略。
+- [x] EXE、内嵌卸载器和最终安装器签名流水线；[ ] 生产证书、时间戳和已安装卸载器实签验收。
+- [x] 覆盖升级备份、SCM + Pipe 健康门控和失败回滚；[ ] 持久 upgrade state machine、掉电恢复、自动下载通道和数据库迁移。
 - [ ] 稳定公开 SDK/API 版本策略。
 - [ ] HTTP/ETP 服务；如实现 ETP，必须明确兼容范围。
 
@@ -164,9 +164,23 @@ P7 下一批工作按以下顺序推进：
 - [x] 事务 checksum、撕裂尾部恢复、durable journal cursor 和 checkpoint 恢复测试；
 - [x] `base + overlay - tombstone` checkpoint consolidation；
 - [x] generation-bound metadata hydration WAL 与状态 sidecar；
-- [ ] 将 checkpoint writer 改为真正流式/映射写入，避免完整 `vector<FileRecord>`；
+- [x] v3 component/anchor checkpoint 导出避免完整 `vector<FileRecord>`、普通后代完整路径和活动索引重建；[ ] 进一步直接映射/共享持久索引并测真实峰值；
 - [ ] 在真实百万级多卷环境建立 reconciliation 时间、峰值内存、磁盘写入和恢复基准；
 - [ ] 在 snapshot/WAL/provider 中引入完整 NTFS object identity 与 directory-entry identity；
 - [ ] 让每个 hard-link 目录入口都能独立索引和返回；
 - [ ] 传播并验证 MFT record/parent sequence，覆盖 slot 重用、parent 重用、WAL replay 和 hydration stale 边界；
 - [ ] 建立同机 Everything 自动化对照 runner，逐项关闭功能、GUI、恢复和性能差距。
+
+## 2026-07-29：P0 正式发布剩余门槛
+
+- [x] SCM + Named Pipe 端到端健康命令；
+- [x] 安装目录限定进程停止、覆盖升级持久备份和健康失败回滚；
+- [x] WER LocalDumps、诊断 ZIP、MinGW/MSVC CI、安装器 smoke 和恢复强杀压力；
+- [x] v3 多根 component/anchor checkpoint consolidation；
+- [ ] per-request impersonation、按文件 ACL 过滤和 UAC alternate credentials 身份模型；
+- [ ] 生产 PFX、RFC 3161 时间戳、tag release 和已安装 `Uninstall.exe` 实签验证；
+- [ ] Win10/Win11、管理员/标准用户、中文路径、单盘/多盘、睡眠唤醒、升级失败注入和长时间 GUI 输入矩阵；
+- [ ] 真实百万级多卷 checkpoint/reconciliation 峰值、耗时与磁盘写入基线；
+- [ ] 同机、同卷集合、同查询集、同冷/热缓存的 Everything 端到端对照。
+
+这些项目完成前，发布描述必须使用“预发布/部分兼容”，不得宣称 Everything 100% 功能或性能兼容。

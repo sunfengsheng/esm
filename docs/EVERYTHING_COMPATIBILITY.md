@@ -37,8 +37,8 @@
 | Shell 操作 | 打开、定位、重命名、删除、复制/移动 | PARTIAL | 与 Explorer/Everything 的所有错误语义未对齐 |
 | Preview | Windows Preview Handler | PARTIAL | 当前仅基础预览信息，未接完整 Preview Handler |
 | ETP/HTTP/SDK/CLI | 对外协议和稳定 SDK | FAIL | 缺 ETP/HTTP 与 SDK conformance tests |
-| 安装/服务/恢复 | UAC、SCM、snapshot/WAL 恢复 | PARTIAL | 自动升级、签名、崩溃报告仍缺 |
-| 日志/配置/发布 | 可运维发布产品 | FAIL | 日志轮转、签名和升级通道未完成 |
+| 安装/服务/恢复 | UAC、SCM、snapshot/WAL 恢复 | PARTIAL | 已有健康门控升级回滚、WER dump 和恢复压力；仍缺掉电级升级事务与完整 VM 矩阵 |
+| 日志/配置/发布 | 可运维发布产品 | PARTIAL | 已有诊断 ZIP 和签名流水线；仍缺生产实签、日志轮转、自动更新与长期支持策略 |
 
 ## 性能矩阵
 
@@ -66,3 +66,7 @@
 4. 继续降低 checkpoint、启动构建和稳态内存；
 5. 把 GUI、查询、恢复和安全矩阵中的 FAIL/UNTESTED 项逐项转为可重复测试；
 6. 在完成前持续明确标注“部分兼容”，不使用 Everything 100% 兼容宣传。
+
+## P0 发布兼容边界（2026-07-29）
+
+本轮增强的是恢复、安装、诊断和 checkpoint 机制，不改变本表对 Everything 功能/性能兼容的总体判断。`esm_service health`、v3 checkpoint、双编译器测试和进程强杀恢复通过，不能替代 Everything 查询语法 conformance、真实 GUI 端到端延迟、百万级资源对照或多用户 ACL 安全验收。

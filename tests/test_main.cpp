@@ -28,6 +28,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2479,9 +2480,11 @@ void test_mapped_metadata_snapshot() {
 
     const auto materialized = esm::load_metadata_snapshot(snapshot_path);
     require(materialized.ok && materialized.snapshot.records.size() == 2 &&
+                materialized.snapshot.records[0].path == L"D:\\docs" &&
                 materialized.snapshot.records[1].name == L"\u62a5\u544a.txt" &&
-                materialized.snapshot.records[1].path.empty(),
-            "compact snapshot compatibility materialization");
+                materialized.snapshot.records[1].path ==
+                    L"D:\\docs\\\u62a5\u544a.txt",
+            "compact snapshot compatibility materialization restores paths");
 
     const auto mapped_file_bytes = mapped.snapshot.catalog.mapped_bytes;
     esm::NtfsCatalog catalog(L"D:", 5, 0);
@@ -2901,6 +2904,13 @@ void test_index_checkpoint_materialization() {
     std::vector<esm::FileRecord> base;
     base.push_back(record(10, L"removed.txt", L"D:\\removed.txt"));
     base.push_back(record(20, L"base.txt", L"D:\\base.txt"));
+    auto folder = record(40, L"folder", L"D:\\folder", true);
+    folder.parent_id = 999;
+    folder.attributes = FILE_ATTRIBUTE_DIRECTORY;
+    base.push_back(std::move(folder));
+    auto child = record(50, L"child.txt", L"D:\\folder\\child.txt");
+    child.parent_id = 40;
+    base.push_back(std::move(child));
     index.replace(std::move(base));
 
     std::vector<esm::FileRecord> upserts;
@@ -2909,11 +2919,109 @@ void test_index_checkpoint_materialization() {
     index.apply_delta(std::move(upserts), {10});
 
     const auto snapshot = index.snapshot_records();
-    require(snapshot.size() == 2 && snapshot[0].id == 20 &&
+    require(snapshot.size() == 4 && snapshot[0].id == 20 &&
                 snapshot[0].name == L"updated.txt" &&
                 snapshot[1].id == 30 &&
-                snapshot[1].name == L"created.txt",
+                snapshot[1].name == L"created.txt" &&
+                snapshot[2].id == 40 && snapshot[3].id == 50,
             "checkpoint materialization merges overlay and removals in ID order");
+
+    const auto catalog = index.catalog_snapshot();
+    const auto catalog_text = [&](std::size_t offset) {
+        const auto& node = catalog.nodes.at(offset);
+        return std::wstring_view(catalog.names.data() + node.name_offset,
+                                 node.name_length);
+    };
+    require(catalog.nodes.size() == 4 && catalog.nodes[0].id == 20 &&
+                catalog.nodes[0].reserved[0] == 1 &&
+                catalog_text(0) == L"D:\\updated.txt" &&
+                catalog.nodes[1].id == 30 &&
+                catalog.nodes[1].reserved[0] == 1 &&
+                catalog_text(1) == L"D:\\created.txt" &&
+                catalog.nodes[2].id == 40 &&
+                catalog.nodes[2].reserved[0] == 1 &&
+                catalog_text(2) == L"D:\\folder" &&
+                catalog.nodes[3].id == 50 &&
+                catalog.nodes[3].parent_id == 40 &&
+                catalog.nodes[3].reserved[0] == 0 &&
+                catalog_text(3) == L"child.txt",
+            "compact checkpoint export keeps anchors and componentized children");
+
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("esm-index-catalog-checkpoint-" + std::to_string(suffix));
+    const auto path = root / "checkpoint.metadata";
+    require(esm::save_metadata_index_snapshot_atomic(
+                path, {123, 0}, 1, L"MFT-AUTO-V1", catalog.nodes,
+                catalog.names).ok,
+            "compact index checkpoint save");
+    {
+        const auto mapped = esm::load_metadata_snapshot_mapped(path);
+        require(mapped.ok && mapped.snapshot.format_version == 3 &&
+                    mapped.snapshot.checkpoint.journal_id == 123 &&
+                    mapped.snapshot.catalog.node_count == 4 &&
+                    mapped.snapshot.catalog.nodes[0].id == 20 &&
+                    mapped.snapshot.catalog.nodes[3].id == 50,
+                "compact index checkpoint mapped round trip");
+    }
+    const auto loaded = esm::load_metadata_snapshot(path);
+    require(loaded.ok && loaded.snapshot.records.size() == 4 &&
+                loaded.snapshot.records[0].name == L"updated.txt" &&
+                loaded.snapshot.records[0].path == L"D:\\updated.txt" &&
+                loaded.snapshot.records[1].name == L"created.txt" &&
+                loaded.snapshot.records[1].path == L"D:\\created.txt" &&
+                loaded.snapshot.records[2].name == L"folder" &&
+                loaded.snapshot.records[2].path == L"D:\\folder" &&
+                loaded.snapshot.records[3].name == L"child.txt" &&
+                loaded.snapshot.records[3].path ==
+                    L"D:\\folder\\child.txt",
+            "compact index checkpoint restores anchor and component paths");
+
+    auto invalid_reserved = catalog.nodes;
+    invalid_reserved[0].reserved[0] = 2;
+    const auto rejected_anchor = esm::save_metadata_index_snapshot_atomic(
+        root / "invalid-anchor.metadata", {123, 0}, 1, L"MFT-AUTO-V1",
+        invalid_reserved, catalog.names);
+    require(!rejected_anchor.ok && rejected_anchor.error == ERROR_INVALID_DATA,
+            "v3 checkpoint rejects unknown anchor markers");
+
+    invalid_reserved = catalog.nodes;
+    invalid_reserved[0].reserved[1] = 1;
+    const auto rejected_reserved = esm::save_metadata_index_snapshot_atomic(
+        root / "invalid-reserved.metadata", {123, 0}, 1, L"MFT-AUTO-V1",
+        invalid_reserved, catalog.names);
+    require(!rejected_reserved.ok &&
+                rejected_reserved.error == ERROR_INVALID_DATA,
+            "v3 checkpoint rejects nonzero reserved bytes");
+
+    auto missing_parent = catalog.nodes;
+    missing_parent[3].parent_id = 9999;
+    const auto missing_parent_path = root / "missing-parent.metadata";
+    require(esm::save_metadata_index_snapshot_atomic(
+                missing_parent_path, {123, 0}, 1, L"MFT-AUTO-V1",
+                missing_parent, catalog.names).ok &&
+                !esm::load_metadata_snapshot(missing_parent_path).ok,
+            "v3 checkpoint rejects a missing component parent during replay");
+
+    auto self_parent = catalog.nodes;
+    self_parent[3].parent_id = self_parent[3].id;
+    const auto self_parent_path = root / "self-parent.metadata";
+    require(esm::save_metadata_index_snapshot_atomic(
+                self_parent_path, {123, 0}, 1, L"MFT-AUTO-V1",
+                self_parent, catalog.names).ok &&
+                !esm::load_metadata_snapshot(self_parent_path).ok,
+            "v3 checkpoint rejects a self-referential component parent");
+
+    auto empty_anchor = catalog.nodes;
+    empty_anchor[0].name_length = 0;
+    const auto empty_anchor_path = root / "empty-anchor.metadata";
+    require(esm::save_metadata_index_snapshot_atomic(
+                empty_anchor_path, {123, 0}, 1, L"MFT-AUTO-V1",
+                empty_anchor, catalog.names).ok &&
+                !esm::load_metadata_snapshot(empty_anchor_path).ok,
+            "v3 checkpoint rejects an empty path anchor during replay");
+    remove_test_tree_with_retry(root);
 }
 
 void test_metadata_wal_recovery() {
@@ -3064,6 +3172,11 @@ struct ChildProcess {
     ChildProcess() = default;
     ChildProcess(const ChildProcess&) = delete;
     ChildProcess& operator=(const ChildProcess&) = delete;
+    ChildProcess(ChildProcess&& other) noexcept
+        : information(other.information) {
+        other.information = {};
+    }
+    ChildProcess& operator=(ChildProcess&&) = delete;
     ~ChildProcess() {
         if (information.hProcess != nullptr) {
             if (WaitForSingleObject(information.hProcess, 0) == WAIT_TIMEOUT) {
@@ -3077,14 +3190,245 @@ struct ChildProcess {
     }
 };
 
-std::filesystem::path current_executable_directory() {
-    std::wstring path(MAX_PATH, L'\0');
+std::filesystem::path current_executable_path() {
+    std::wstring path(32'768, L'\0');
     const DWORD size = GetModuleFileNameW(
         nullptr, path.data(), static_cast<DWORD>(path.size()));
     require(size != 0 && size < path.size(),
-            "resolve test executable directory");
+            "resolve test executable path");
     path.resize(size);
-    return std::filesystem::path(path).parent_path();
+    return std::filesystem::path(path);
+}
+
+std::filesystem::path current_executable_directory() {
+    return current_executable_path().parent_path();
+}
+
+std::filesystem::path recovery_fault_root() {
+    const DWORD required = GetEnvironmentVariableW(
+        L"ESM_RECOVERY_FAULT_ROOT", nullptr, 0);
+    if (required <= 1) return {};
+    std::wstring value(required - 1, L'\0');
+    if (GetEnvironmentVariableW(L"ESM_RECOVERY_FAULT_ROOT", value.data(),
+                                required) != required - 1) {
+        return {};
+    }
+    return std::filesystem::path(value);
+}
+
+esm::MetadataSnapshot recovery_fault_snapshot(std::uint64_t generation) {
+    esm::MetadataSnapshot snapshot;
+    snapshot.checkpoint.journal_id = generation;
+    snapshot.checkpoint.next_usn = static_cast<std::int64_t>(generation * 100);
+    snapshot.root_id = 1;
+    snapshot.volume = L"everything_sm-recovery-fault-v1";
+    snapshot.records.reserve(12'000);
+    for (std::uint64_t id = 1; id <= 12'000; ++id) {
+        auto value = record(id, L"fault-" + std::to_wstring(generation) +
+                                    L"-" + std::to_wstring(id), L"");
+        value.parent_id = 1;
+        value.size = generation * 1'000 + id;
+        value.last_write_time = static_cast<std::int64_t>(generation * 10 + id);
+        value.attributes = FILE_ATTRIBUTE_ARCHIVE;
+        snapshot.records.push_back(std::move(value));
+    }
+    return snapshot;
+}
+
+esm::MftAutoState recovery_fault_state(std::uint64_t generation) {
+    esm::MftAutoState state;
+    state.generation = generation;
+    esm::MftAutoVolumeState volume;
+    volume.volume.root = L"C:";
+    volume.volume.mount_path = L"C:\\";
+    volume.volume.identity = L"\\\\?\\Volume{recovery-fault}\\";
+    volume.volume.serial_number = 0x12345678;
+    volume.root_id = 5;
+    volume.journal_id = generation + 100;
+    volume.cursor = static_cast<std::int64_t>(generation * 1'000);
+    volume.live = true;
+    state.volumes.push_back(std::move(volume));
+    return state;
+}
+
+int run_recovery_fault_worker(int argc, char** argv) {
+    if (argc < 4) return 64;
+    const auto root = recovery_fault_root();
+    if (root.empty()) return 65;
+    const std::string mode = argv[2];
+    const auto generation = std::stoull(argv[3]);
+    if (mode == "snapshot") {
+        const auto path = root / "database.metadata";
+        const auto snapshot = recovery_fault_snapshot(generation);
+        for (;;) {
+            const auto saved = esm::save_metadata_snapshot_atomic(path, snapshot);
+            if (!saved.ok) return static_cast<int>(saved.error ? saved.error : 66);
+        }
+    }
+    if (mode == "state") {
+        const auto path = root / "database.state";
+        const auto state = recovery_fault_state(generation);
+        for (;;) {
+            const auto saved = esm::save_mft_auto_state_atomic(path, state);
+            if (!saved.ok) return static_cast<int>(saved.error ? saved.error : 67);
+        }
+    }
+    if (mode == "wal") {
+        if (argc != 5) return 68;
+        const auto start_usn = static_cast<std::int64_t>(std::stoll(argv[4]));
+        esm::UsnChangeBatch batch;
+        batch.next_usn = start_usn + 100;
+        for (std::uint64_t i = 0; i < 16; ++i) {
+            std::wstring name = L"fault-" + std::to_wstring(start_usn) +
+                                L"-" + std::to_wstring(i) + L"-";
+            name.append(2'000, static_cast<wchar_t>(L'a' + (i % 20)));
+            batch.changes.push_back(
+                {1'000'000 + static_cast<std::uint64_t>(start_usn) * 32 + i,
+                 10, start_usn + static_cast<std::int64_t>(i) + 1,
+                 USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE,
+                 std::move(name)});
+        }
+        const auto appended = esm::append_metadata_wal(
+            root / "database.wal", 77, start_usn, batch);
+        return appended.ok ? 0
+                           : static_cast<int>(appended.error ? appended.error : 69);
+    }
+    return 70;
+}
+
+ChildProcess launch_recovery_fault_worker(std::string_view mode,
+                                          std::uint64_t generation,
+                                          std::int64_t start_usn,
+                                          const std::filesystem::path& root) {
+    require(SetEnvironmentVariableW(L"ESM_RECOVERY_FAULT_ROOT",
+                                    root.c_str()) != FALSE,
+            "set recovery fault worker root");
+    const auto executable = current_executable_path();
+    std::wstring command = L"\"" + executable.wstring() +
+                           L"\" --recovery-fault-worker " +
+                           std::wstring(mode.begin(), mode.end()) + L" " +
+                           std::to_wstring(generation);
+    if (mode == "wal") command += L" " + std::to_wstring(start_usn);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    ChildProcess child;
+    const BOOL created = CreateProcessW(
+        nullptr, command.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child.information);
+    SetEnvironmentVariableW(L"ESM_RECOVERY_FAULT_ROOT", nullptr);
+    require(created != FALSE, "launch recovery fault worker");
+    return child;
+}
+
+void crash_child_after(ChildProcess& child, DWORD milliseconds) {
+    const DWORD wait = WaitForSingleObject(child.information.hProcess,
+                                           milliseconds);
+    if (wait == WAIT_TIMEOUT) {
+        require(TerminateProcess(child.information.hProcess, 0xE5A00001) != FALSE,
+                "terminate recovery fault worker");
+        require(WaitForSingleObject(child.information.hProcess, 10'000) ==
+                    WAIT_OBJECT_0,
+                "wait for terminated recovery fault worker");
+    } else {
+        require(wait == WAIT_OBJECT_0, "wait for recovery fault worker");
+    }
+}
+
+void run_recovery_fault_stress(std::size_t rounds) {
+    require(rounds != 0 && rounds <= 1'000,
+            "recovery fault stress round count");
+    const auto suffix = std::chrono::steady_clock::now()
+                            .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("esm-recovery-fault-" + std::to_string(suffix));
+    std::filesystem::create_directories(root);
+    try {
+        std::mt19937 generator(0x45534d31U);
+        std::uniform_int_distribution<DWORD> snapshot_delay(0, 12);
+        std::uniform_int_distribution<DWORD> state_delay(0, 4);
+        std::uniform_int_distribution<DWORD> wal_delay(0, 5);
+
+        std::uint64_t snapshot_generation = 1;
+        require(esm::save_metadata_snapshot_atomic(
+                    root / "database.metadata",
+                    recovery_fault_snapshot(snapshot_generation)).ok,
+                "seed recovery fault snapshot");
+        for (std::size_t round = 0; round < rounds; ++round) {
+            const auto target = snapshot_generation + 1;
+            auto child = launch_recovery_fault_worker(
+                "snapshot", target, 0, root);
+            crash_child_after(child, round % 5 == 4 ? 750 : snapshot_delay(generator));
+            const auto loaded = esm::load_metadata_snapshot(
+                root / "database.metadata");
+            require(loaded.ok &&
+                        (loaded.snapshot.checkpoint.journal_id ==
+                             snapshot_generation ||
+                         loaded.snapshot.checkpoint.journal_id == target),
+                    "crashed snapshot publish keeps old or complete new generation");
+            snapshot_generation = loaded.snapshot.checkpoint.journal_id;
+        }
+
+        std::uint64_t state_generation = 1;
+        require(esm::save_mft_auto_state_atomic(
+                    root / "database.state",
+                    recovery_fault_state(state_generation)).ok,
+                "seed recovery fault state");
+        for (std::size_t round = 0; round < rounds; ++round) {
+            const auto target = state_generation + 1;
+            auto child = launch_recovery_fault_worker(
+                "state", target, 0, root);
+            crash_child_after(child, round % 5 == 4 ? 200 : state_delay(generator));
+            const auto target_state = esm::load_mft_auto_state(
+                root / "database.state", target);
+            if (target_state.ok) {
+                state_generation = target;
+            } else {
+                const auto previous_state = esm::load_mft_auto_state(
+                    root / "database.state", state_generation);
+                require(previous_state.ok,
+                        "crashed state publish keeps old or complete new generation");
+            }
+        }
+
+        const auto wal_path = root / "database.wal";
+        require(esm::reset_metadata_wal(wal_path).ok,
+                "seed recovery fault WAL");
+        std::int64_t expected_usn = 100;
+        std::size_t committed_transactions = 0;
+        for (std::size_t round = 0; round < rounds; ++round) {
+            auto child = launch_recovery_fault_worker(
+                "wal", static_cast<std::uint64_t>(round + 1),
+                expected_usn, root);
+            crash_child_after(child, round % 5 == 4 ? 500 : wal_delay(generator));
+            esm::NtfsCatalog catalog(L"C:", 10);
+            esm::MetadataIndex index;
+            const auto replay = esm::replay_metadata_wal(
+                wal_path, 77, 100, catalog, index);
+            require(replay.ok &&
+                        (replay.next_usn == expected_usn ||
+                         replay.next_usn == expected_usn + 100) &&
+                        (replay.transactions == committed_transactions ||
+                         replay.transactions == committed_transactions + 1),
+                    "crashed WAL append replays only a complete prefix");
+            if (replay.next_usn == expected_usn + 100) {
+                expected_usn += 100;
+                ++committed_transactions;
+            }
+        }
+        if (rounds >= 5) {
+            require(snapshot_generation > 1 && state_generation > 1 &&
+                        committed_transactions > 0,
+                    "recovery fault stress must observe committed generations");
+        }
+        std::cout << "recovery fault stress passed: rounds=" << rounds
+                  << ", snapshot_generation=" << snapshot_generation
+                  << ", state_generation=" << state_generation
+                  << ", wal_transactions=" << committed_transactions << "\n";
+    } catch (...) {
+        remove_test_tree_with_retry(root);
+        throw;
+    }
+    remove_test_tree_with_retry(root);
 }
 
 template <typename Predicate>
@@ -3384,8 +3728,19 @@ void test_scanner() {
     remove_test_tree_with_retry(root);
 }
 }
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc >= 2 && std::string_view(argv[1]) ==
+                             "--recovery-fault-worker") {
+            return run_recovery_fault_worker(argc, argv);
+        }
+        if (argc >= 2 && std::string_view(argv[1]) ==
+                             "--recovery-fault-stress") {
+            if (argc != 3) return 2;
+            run_recovery_fault_stress(
+                static_cast<std::size_t>(std::stoull(argv[2])));
+            return 0;
+        }
         test_interactive_search_timing(); test_result_metadata_pipeline(); test_multi_volume_namespacing(); test_ntfs_volume_discovery(); test_multi_volume_snapshot_round_trip(); test_gui_settings(); test_query_parser(); test_filelist_query(); test_everything_date_constants(); test_advanced_query_and_sorting(); test_child_count_query_functions(); test_wildcard(); test_unicode_substring_search(); test_diacritic_matching(); test_efu_round_trip(); test_saved_search_round_trip(); test_index_search(); test_index_rvalue_replace_releases_source(); test_index_componentized_path_fallback_and_compaction(); test_index_direct_ntfs_changes(); test_direct_ntfs_change_metadata_hydration(); test_shared_directory_path_signatures(); test_compressed_trigram_postings(); test_simple_query_top_k(); test_sorted_top_k_accelerators(); test_diacritic_insensitive_top_k(); test_path_query_top_k_early_exit(); test_index_delta_overlay(); test_index_compaction(); test_index_background_metadata_batches(); test_index_reuses_search_metadata(); test_search_metadata_batch_hydration(); test_file_metadata_hydration(); test_ipc_protocol_round_trip(); test_pipe_search_diagnostics_format(); test_named_pipe_security_policy(); test_named_pipe_search(); test_named_pipe_diagnostics_exception_isolated(); test_named_pipe_missing_server_error(); test_named_pipe_concurrent_search(); test_ntfs_catalog_updates(); test_ntfs_catalog_compact_overlay(); test_journal_replay_transaction(); test_journal_checkpoint(); test_metadata_snapshot(); test_mapped_metadata_snapshot(); test_streaming_catalog_snapshot(); test_metadata_hydration_wal_recovery(); test_mft_auto_state_round_trip(); test_bound_metadata_wal_recovery(); test_index_checkpoint_materialization(); test_metadata_wal_recovery(); test_snapshot_wal_checkpoint_crash_recovery(); test_directory_watcher(); test_scanner(); test_scan_server_reconciliation();
         std::cout << "all tests passed\n";
         return 0;

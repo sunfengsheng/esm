@@ -202,7 +202,7 @@ IPC 正确返回 `D:\test1\123456789.txt`。首次 `123456789.txt` 冷查询出�
 ## 8. 下一步
 
 - 安装 USN 驱动修复版并连续运行超过原 30 分钟周期，确认没有新的无条件 reconciliation 事件且 Private Bytes 保持接近首轮基线；
-- 将 snapshot 直接流式读入紧凑索引，降低当前约 2.30 GiB 的单进程构建峰值；
+- v3 checkpoint 已避免为普通后代复制完整路径和搜索加速器；下一步在真实百万级多卷环境重新测 checkpoint 峰值，并继续减少初始 reconciliation 新旧索引交接重叠；
 - 减少完整路径重复和 UTF-16 字符串对象开销；
 - 将名称索引直接持久化或并行/增量构建；
 - 对 `path:` 建立路径组件/gram 索引；
@@ -458,3 +458,20 @@ ctest --test-dir build-ucrt-vendor-final -C Release --output-on-failure
 2026-07-29 的自动测试通过真实本地 Named Pipe 请求验证 observer 会得到 request id、limit、query 字符数、flags、结果数以及各阶段计时，并在 12 个并发客户端/4 个 Pipe worker 场景中为每个成功请求回调一次；格式测试验证毫秒换算和排序/flags 输出。测试数据只有 2 条内存记录，目的仅是验证诊断字段、线程调用和 IPC v1 兼容边界，不是查询吞吐或延迟基准。
 
 `search_ms` 与客户端响应中的 `elapsed_microseconds` 同源，只覆盖索引查询；`total_ms` 从服务端连接建立后开始并包含协议处理和写回，不包含客户端连接排队、GUI debounce、窗口线程调度、列表绘制、Shell 图标或异步元数据补齐。尚未采集真实 330 万记录上的分阶段 p50/p95，因此本轮没有发布新的性能数字，也不能从新增日志推导“搜索已经变快”。
+
+## 14. v3 checkpoint 机制验证（2026-07-29）
+
+### 测试方法
+
+- MinGW Release：完整 `ctest`，随后 `esm_tests.exe --recovery-fault-stress 100`；
+- MSVC Release：完整 `ctest -C Release`，随后 20 轮相同恢复压力；
+- checkpoint 单元测试覆盖 base/overlay/tombstone 合并、多卷 root anchor、overlay anchor、parent component 路径恢复，以及非法 reserved、缺父、自循环和空 anchor；
+- NSIS 仅执行 `/WX` 编译，没有在当前开发机安装或卸载。
+
+两套编译器测试和恢复压力均通过。该结果证明 v3 格式和进程强杀恢复路径在自动测试样本中可用，不是搜索吞吐、GUI 延迟或真实断电结果。
+
+### 内存结论边界
+
+历史真实观察：约 326 万记录稳态 `esm_service.exe` Private Bytes 为 436–437 MiB；同机 Everything 观察约 316.77 MiB；旧完整 repair/checkpoint 构建峰值约 2.3 GiB。记录集、进程模型和采样阶段并非完全同条件，因此只能作为差距指示。
+
+本轮 checkpoint 不再创建完整 `vector<FileRecord>`，不复制普通后代完整路径，也不在 checkpoint 后重建活动索引；从机制上消除了一条已知的大额临时分配路径。但尚未重新运行真实管理员 MFT、多卷、百万级 checkpoint 峰值与耗时测试，因此不能给出新的峰值数字，更不能宣称已达到 Everything。

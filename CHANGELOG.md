@@ -6,6 +6,11 @@
 
 ### Added
 
+- 新增 `esm_service health [pipe-name] [timeout-ms]`：先确认 SCM 服务为 Running，再通过真实 Named Pipe 空查询验证索引端到端可用；安装器和 CI 安装 smoke 不再只把“进程已启动”当作健康。
+- 新增路径限定的 `stop-install-processes.ps1`、WER LocalDumps 配置和 `export-diagnostics.ps1` 诊断 ZIP；停止进程只作用于当前安装目录中的 everything_sm 可执行文件，诊断报告默认对用户名和用户目录做基础脱敏；复制的原始日志需在分享前人工检查。
+- 新增 MinGW 与 MSVC Release 双编译器 CI、100/20 轮进程强杀恢复压力入口，以及静默安装、同版本覆盖升级、Pipe 健康检查和静默卸载 smoke job。标签发布新增 EXE、内嵌卸载器和最终 NSIS 安装器 Authenticode 签名入口；没有配置真实证书时标签发布会失败而不是生成伪签名包。
+- 新增 metadata snapshot v3 多根 component/anchor 格式：`reserved[0] == 1` 保存完整路径 anchor，普通记录只保存名称组件并通过 `parent_id` 恢复路径；加载器拒绝非法 anchor 标记、非零保留字节、缺失父节点、自循环和空 anchor。
+
 - 为所有 Windows EXE 增加由 CMake 项目版本统一生成的 VERSIONINFO；为 `esm_service.exe` 嵌入 Event Log message table，安装服务时注册 `everything_sm` Application Event source，使生命周期、恢复和慢查询事件可显示可读消息。 同时兼容 Windows SDK 将 `READ_USN_JOURNAL_DATA` 映射为 V1 的 48 字节布局，为全部 C++ target 统一启用 MSVC `/utf-8`，并修复 GUI 参数名与 Windows SDK `small` 定义冲突及 64 位控件 ID 转换，恢复 MSVC/Windows SDK 全目标构建路径；目录 watcher 测试对杀毒/索引器造成的短暂 sharing violation 采用最长 2 秒的有界重试，避免把环境竞争误判为产品失败。
 - Windows 自动测试临时目录清理仅对 `ERROR_SHARING_VIOLATION`/`ERROR_ACCESS_DENIED` 执行最长 2 秒的有界重试；scanner 测试在扫描前显式关闭并校验输出流。持续句柄占用、超时或其他错误仍使测试失败，不用无限重试掩盖句柄泄漏。
 - SCM 服务安装新增自动启动、延迟启动、服务 SID、失败时 5 秒/30 秒/5 分钟三级重启以及 24 小时失败计数重置；任一关键服务配置或 Event source 注册失败都会删除本次创建的服务并返回失败。旧 ImagePath 缺少 SID 或运行参数损坏时仍先连接 SCM，再以明确 Win32 状态停止并写事件，不再表现为 1053/“服务未及时响应启动或控制请求”。
@@ -40,6 +45,10 @@
 
 ### Changed
 
+- 默认多卷 checkpoint consolidation 改为直接导出紧凑节点和字符串 arena，不再先物化完整 `vector<FileRecord>`、复制全部后代完整路径或在 checkpoint 成功后重建活动搜索索引；overlay 和每个卷根作为完整路径 anchor 写入 v3 snapshot。
+- NSIS 覆盖升级改为在安装目录内使用持久 recovery 目录备份旧二进制、配置、卸载器和诊断脚本；新服务只有通过 SCM + Named Pipe 健康检查后才提交升级，失败时恢复旧文件并尝试重启旧服务。该实现是健康门控的部分事务回滚，不是掉电级多文件原子事务。
+- 静默安装/卸载为所有交互错误和删除数据提示设置保守默认值；静默卸载默认保留索引与用户设置。
+
 - 文件名搜索 GUI 对首个输入继续采用 15 ms 低延迟，对 150 ms 内的连续输入改用 60 ms 突发防抖，减少快速输入期间的中间 Named Pipe 查询；仍保持最多一个服务查询在途并丢弃过期 generation。
 - 首个交互查询少于 200 条时现在直接视为完整响应，不再发送无意义的第二次最终查询；可立即安排缺失元数据补齐和历史写入。只有首屏刚好达到 200 条且设置的最终上限更大时才保留 `200+` 状态并执行 refinement。
 - 文件名搜索的最终结果不再无条件访问文件系统补齐全部元数据；默认只补齐服务结果中修改时间仍未知的条目，按创建时间、访问时间或 NTFS Change 时间排序时才补齐全部结果。后台交接从深复制整个结果向量改为只复制所需结果的槽位和路径，最多 4 个 worker 读取，并在 UI 线程原位应用纯数值更新。
@@ -62,6 +71,9 @@
 
 ### Fixed
 
+- 修正 NSIS `MessageBox /SD` 参数顺序，使 `/WX` 编译能够正确解析静默默认返回值；同时处理安装文件解压失败、上次失败升级 recovery 目录未清理和诊断脚本回滚边界。
+- 修正 metadata snapshot v3 writer 仍写 v2 版本号、mapped loader 只接受 v2，以及 v2 materialized loader 未恢复完整路径的问题。
+
 - 修复初始 NTFS MFT 基线只有名称/父关系/属性、旧文件大小和修改时间长期为零的问题：CLI、前台 server 和单卷服务在路径重建后同步原地补齐；默认多卷服务先发布名称索引，再后台有界分批补齐紧凑索引保存的大小、修改时间、属性和目录状态。不可访问或枚举后瞬时消失的条目保留原值并计入 metadata errors，不会阻断名称搜索。
 
 - 修正相对日期兼容语义：`pastweek` / `pastmonth` / `pastyear` 改为滚动下界，`last` / `prev` 保持上一个完整自然周期；周边界改为读取 Windows 当前用户“每周第一天”设置，`this*` 周期不再包含今天之后的未来日期。
@@ -76,6 +88,8 @@
 - 文档明确多卷 NTFS 服务、数据存放位置、管理员权限要求和“只能搜索 C 盘”等常见问题的排查步骤。
 
 ### Performance
+
+- checkpoint 峰值路径不再复制普通后代的完整路径和搜索加速器。本轮仅完成机制验证、MinGW/MSVC 单元测试和进程强杀恢复压力；尚未重新取得真实多卷百万级 checkpoint 峰值，不能据此宣称已经达到 Everything 的内存或 checkpoint 性能。
 
 - 2026-07-28 在同一台机器、同一 `mft-index.snapshot`（1,022,362,538 字节）和同一已安装 Named Pipe 服务上，用正确保留双引号的参数分别对提交 `9e905a7` 与本轮 Release 二进制重复 5 次：精确文件名列表服务端中位数从 854.474 ms 降至 12.899 ms，精确完整路径列表从 4091.17 ms 降至 13.122 ms。该样本只覆盖服务端计时，不是 GUI p50/p95；通配符 `filelist:` 尚未使用本优化。
 

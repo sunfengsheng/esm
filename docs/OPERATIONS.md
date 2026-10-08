@@ -208,7 +208,7 @@ Get-Volume | Select-Object DriveLetter,FileSystem,DriveType,HealthStatus
 
 ## 7. 升级和卸载
 
-NSIS 安装程序先通过 SCM 确认旧服务存在，再在覆盖二进制前停止并卸载；只有 `sc query` 返回 1060 才按“服务不存在”继续，其他 SCM 查询错误会中止且返回非零退出码。若 SCM 中有服务但旧服务管理程序缺失，或停止/卸载失败，安装器会停止流程而不覆盖二进制。新服务安装或启动失败会提示重试；取消后会再次查询并清理可能残留的服务，只有确认服务不存在时才写入 `service_mode=compatibility`。服务管理命令在 `DeleteService` 已报告 marked-for-delete 时仍会等待 SCM 完成真实删除，降低立即重装竞态。正式卸载同样不会忽略服务状态查询、停止或删除失败。当前仍没有旧二进制备份、完整事务回滚、后台自动升级或数据库 schema 自动迁移承诺，因此升级前应备份 ProgramData 索引目录。旧 GUI/前台 server 仍按进程名终止，可能影响其他目录下同名开发进程。
+NSIS 安装程序先通过 SCM 确认旧服务存在，再在覆盖二进制前停止并卸载；只有 `sc query` 返回 1060 才按“服务不存在”继续，其他 SCM 查询错误会中止且返回非零退出码。覆盖升级会先把旧程序、配置、README、卸载器和诊断脚本备份到 `$INSTDIR\.everything_sm-upgrade-backup`，并拒绝覆盖上次失败升级遗留的 recovery 目录；路径限定脚本只停止当前安装目录中的 everything_sm 进程，不会按名称终止其他开发目录中的同名进程。新服务必须通过 `esm_service health everything_sm_service 120000` 的 SCM + Named Pipe 查询后才提交升级；失败时恢复旧文件并尝试重启旧服务。服务管理命令在 `DeleteService` 已报告 marked-for-delete 时仍会等待 SCM 完成真实删除，降低立即重装竞态。正式卸载同样不会忽略服务状态查询、停止或删除失败。当前流程仍没有持久 upgrade manifest/state machine、多文件单点原子提交、后台自动升级或数据库 schema 自动迁移承诺，因此升级前仍应备份 ProgramData 索引目录。
 
 卸载：
 
@@ -304,3 +304,40 @@ GUI `esm_content.exe` 会按需以无控制台窗口方式启动服务。相同 
 配置和数据库是当前用户级状态；独立开发安装包不需要管理员权限，也不安装 SCM 服务。停止服务可关闭 GUI 后按 PID 终止 `esm_content_service.exe`，或在前台调试时使用 `Ctrl+C`。卸载程序会询问是否删除 `%LOCALAPPDATA%\everything_sm_content`。
 
 若需要整机固定盘索引，必须显式把配置中的 `all_fixed` 改为 `1` 或传入 `--all-fixed`。操作前应确认数据库空间、排除目录、当前用户访问权限和首次扫描负载。多用户不得共享同一个可写 Xapian 数据库；当前尚无 per-request impersonation。
+
+## 11. P0 健康检查、诊断与升级恢复
+
+### 服务健康检查
+
+```powershell
+# 默认 Pipe=everything_sm，默认等待 120000 ms
+.\esm_service.exe health
+
+# 安装包当前使用的 Pipe 和自定义等待时间
+.\esm_service.exe health everything_sm_service 180000
+```
+
+返回成功表示 SCM 为 Running 且 Named Pipe 已完成一次真实查询；只看到进程存在或 `sc query` 为 Running 不代表索引已经可用。非零退出时先查看 Application 日志中的 `everything_sm` provider，再导出诊断包。
+
+### 诊断包与 WER dump
+
+管理员安装会为 `esm_service.exe`、`esm_gui.exe` 和 `esm_server.exe` 配置 WER LocalDumps。dump 可能包含查询、路径、文件名和进程内存中的其他敏感数据，只能按敏感诊断材料传输和保存。
+
+```powershell
+& "$env:ProgramFiles\everything_sm\export-diagnostics.ps1" `
+  -OutputPath "$env:USERPROFILE\Desktop\everything_sm-diagnostics.zip"
+```
+
+诊断脚本收集服务状态、ImagePath、版本、有限的 ProgramData 文件清单、最近 Application 事件和最多 10 个日志文件，并对报告中的当前用户名/用户目录做基础脱敏；复制进 ZIP 的日志文件保持原样，它不会自动收集 dump。提交前仍应人工检查整个 ZIP。
+
+### 覆盖升级与 recovery 目录
+
+升级备份位于：
+
+```text
+%ProgramFiles%\everything_sm\.everything_sm-upgrade-backup
+```
+
+新版本只有通过 `esm_service health` 后才删除该目录。健康检查失败时安装器恢复旧文件并尝试重启旧服务；若恢复不完整，目录会保留供人工处理，下一次安装会拒绝覆盖。此流程不是掉电级原子升级：不要在升级时强制关机，生产升级前应另行备份 `%ProgramData%\everything_sm`。
+
+静默卸载使用保守默认值：遇到不可恢复错误时取消，删除数据提示默认选择“否”，因此 `/S` 默认保留机器索引和当前用户设置。

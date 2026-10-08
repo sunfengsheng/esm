@@ -2,6 +2,13 @@
 
 本文描述当前 `main` 分支能力，不代表稳定版本承诺。项目目标是接近 Everything 的体验和性能，但目前不能称为完整复刻或完全兼容。
 
+## P0 发布加固结论（2026-07-29）
+
+本轮已完成代码层面的服务健康检查、覆盖升级备份/失败回滚、安装目录限定进程停止、WER LocalDumps、诊断 ZIP、双编译器 CI、安装器 smoke、进程强杀恢复压力入口和 v3 多根紧凑 checkpoint。MinGW Release 全量测试及 100 轮恢复压力、MSVC Release 全量测试及 20 轮恢复压力均通过；NSIS `/WX` 编译、PowerShell parser 和 workflow YAML parser 通过。当前机器未执行安装/卸载 smoke，避免影响已安装服务；该路径由 CI 隔离 runner 执行。
+
+仍未完成的正式发布门槛包括：per-request impersonation 与按文件 ACL 过滤、UAC alternate credentials 下真实交互用户身份模型、生产 PFX/时间戳和已安装 `Uninstall.exe` 签名验证，以及 Win10/Win11、标准用户、中文路径、多卷、睡眠唤醒和长期 GUI 输入的隔离 VM 矩阵。安装器回滚是健康门控的“部分事务化”实现，没有持久 upgrade manifest/state machine，不能宣称掉电级原子升级。
+
+
 ## 1. 已实现
 
 ### 索引与实时更新
@@ -18,9 +25,9 @@
 
 - 校验和保护的 metadata snapshot。
 - 临时文件 + write-through rename 原子替换。
-- memory-mapped v2 紧凑 snapshot。
+- memory-mapped v2 紧凑 catalog snapshot，以及 v3 多根 component/anchor index snapshot。
 - live checkpoint 的追加 WAL、完整事务重放、撕裂尾部截断和 checkpoint consolidation。
-- Catalog snapshot 保存可直接流式写紧凑节点和名称 arena，避免创建完整临时 `vector<FileRecord>`。
+- Catalog snapshot 可直接写紧凑节点和名称 arena；默认多卷 checkpoint 使用 v3 component/anchor 导出，普通后代不复制完整路径、搜索加速器或临时 `vector<FileRecord>`。
 - 多卷后台补齐新增 generation-bound metadata WAL：每批只追加成功读取项的 ID、路径 fingerprint、大小、修改时间和属性，并持久化 `next_id`/完成状态；启动可重放并从 durable cursor 续跑，不需要导出完整 `vector<FileRecord>`。完整 reconciliation 产生新 generation 时，若当前 live USN 状态仍连续可信，并且 MFT 扫描完成后新旧共有卷可再次追赶到当前 journal 边界，会按 ID/完整路径从当前 live base/overlay 复用已知元数据，并把复用结果直接写入新 snapshot；启动 state 失效、扫描后追赶失败、普通 USN 读取失败或 journal gap 时禁用复用。
 - 多卷状态 sidecar 保存 snapshot generation、卷身份/root file ID、journal ID、原始 USN boundary 和 live 状态。重新发现的卷集合及 USN checkpoint 全部有效时，健康重启跳过立即完整 MFT reconciliation；状态缺失、损坏、generation 不匹配、卷变化或 journal gap 时保留名称 snapshot 提供查询并安排完整修复。
 
@@ -74,7 +81,7 @@
 
 ### WAL/增量持久化
 
-单卷 live 路径具有 WAL 和 checkpoint 恢复。默认多卷服务仍以完整名称 snapshot 为基线，但后台大小/修改时间/属性已通过独立 generation-bound metadata WAL 持久化，并由状态 sidecar 保存 durable cursor 和启动恢复所需的卷/USN boundary。健康重启可重放元数据并续跑；WAL 损坏时保留名称 snapshot、从 ID 0 重新补齐。完整 reconciliation 创建新 generation 前，只有当前 live USN 状态仍连续可信，并且 MFT 扫描后新旧共有卷完成一次额外 USN catch-up，才会把新 MFT 记录原地按 ID 排序，并从当前 live base/overlay 线性复用 ID、完整路径一致且修改时间已知的大小、时间和属性；后台批次跳过这些已知项，只对新文件、路径变化、删除竞争或旧读取失败项执行文件 I/O。启动 state 失效、扫描后 catch-up 失败、普通 USN 读取失败或 journal gap 会禁用复用，因为旧索引可能漏掉路径不变的内容修改。多卷名称变化和 USN delta 仍未形成通用 append-only WAL，运行期 cursor 也不能覆盖 snapshot 所代表的原始 journal boundary；因此该路径尚不是统一的 base snapshot + delta replay + checkpoint consolidation 数据库。
+单卷 live 路径和默认多卷服务都已有 generation-bound append-only WAL 与 checkpoint 恢复。多卷名称/USN WAL v2 绑定 generation、卷身份、root 和 journal boundary，使用事务 checksum、撕裂尾部截断和 durable cursor；大小/修改时间/属性由独立 metadata WAL 与状态 sidecar 持久化。checkpoint 按 `base + overlay - tombstone` 合并并写入 v3 component/anchor snapshot，然后切换到新 generation。健康重启可重放 delta 并续跑；状态、WAL 或 journal boundary 不可信时保留可用名称基线并安排 reconciliation。仍缺掉电级整机故障注入、真实百万级恢复时间/峰值基准和统一到单一数据库文件的长期演进方案。
 
 ### 非 NTFS
 
@@ -82,7 +89,7 @@
 
 ### 安全和发布
 
-已有绑定安装用户 SID 的本地 Pipe DACL、NSIS、服务自动/延迟启动、三级 SCM 故障重启、可读 Event Log message source、统一 EXE 版本资源、CI artifact、tag release 和受限慢查询诊断；仍缺 per-request impersonation、按文件 ACL 过滤、多用户安装模型、代码签名、自动升级、崩溃报告、文件日志轮转和稳定 SDK。
+已有绑定安装用户 SID 的本地 Pipe DACL、NSIS、服务自动/延迟启动、三级 SCM 故障重启、SCM + Pipe 健康检查、可读 Event Log、WER LocalDumps、包含基础脱敏报告的诊断 ZIP、统一 EXE 版本资源、覆盖升级备份/失败回滚、双编译器 CI、安装器 smoke 和标签签名入口。仍缺 per-request impersonation、按文件 ACL 过滤、多用户安装模型、生产证书与时间戳实签验证、掉电级升级事务、文件日志轮转、自动更新通道和稳定 SDK。
 
 ### 测试运行库基线
 
@@ -152,7 +159,7 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 - NSIS 会区分 `mft-auto` 与 `compatibility` 安装状态，服务失败时要求重试或明确降级，并把快捷方式限制在安装用户；
 - CI 暂停生成 portable ZIP，只上传主 NSIS 安装包和校验文件。
 
-上述变更要求同时通过 MinGW Release、MSVC/Windows SDK 全目标构建、`esm_tests` 和 NSIS 编译；MSVC target 统一使用 `/utf-8`，并避开 Windows SDK `small` 标识符冲突。尚未在干净 Windows 用户/多用户矩阵中完成提升安装、SCM recovery、Event Viewer 消息和升级失败注入的端到端发布验证。安装器仍使用按进程名 `taskkill` 关闭旧 GUI/前台 server，也没有旧二进制备份与完整事务回滚。
+上述变更要求同时通过 MinGW Release、MSVC/Windows SDK 全目标构建、`esm_tests` 和 NSIS 编译；MSVC target 统一使用 `/utf-8`，并避开 Windows SDK `small` 标识符冲突。安装器现通过路径限定脚本只停止当前安装目录中的 GUI/前台 server，并在持久 recovery 目录备份旧二进制、配置和卸载器；新服务未通过 SCM + Pipe 健康检查时恢复旧文件并尝试重启旧服务。尚未在干净 Windows 用户/多用户矩阵中完成提升安装、SCM recovery、Event Viewer 消息和升级失败注入的端到端发布验证；升级也仍不是掉电级多文件原子事务。
 
 
 当前可用于开发验证和单用户个人机器试用；经过本轮加固后，默认本机 Pipe 不再向所有 Authenticated Users 开放，但仍不能作为具备 per-request ACL 过滤、多用户权限隔离、完整事务升级、签名供应链和跨 provider 支持的企业级发布。任何状态变化都必须同步更新本文件和 `CHANGELOG.md`。
@@ -187,7 +194,7 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 - checkpoint 按 `base + overlay - tombstone` 生成新 generation，并原子切换 snapshot/WAL/state；
 - 已有小规模 crash-recovery 与 10 万 delta 合成 consolidation 测试。
 
-仍未完成的边界：checkpoint writer 仍可能物化完整 `vector<FileRecord>`；真实百万级 MFT + 增量场景的耗时、Private Bytes、磁盘 flush 和 SCM/UAC 端到端恢复尚未建立发布级基线。hard-link 每个目录入口的独立表示、完整 MFT slot/parent sequence 传播和 Everything 100% 功能/性能兼容仍未完成。
+仍未完成的边界：默认多卷 checkpoint writer 已不再物化完整 `vector<FileRecord>`，但 snapshot 启动加载、初始 reconciliation 和单卷旧路径仍可能物化完整记录；真实百万级 MFT + 增量场景的耗时、Private Bytes、磁盘 flush 和 SCM/UAC 端到端恢复尚未建立发布级基线。hard-link 每个目录入口的独立表示、完整 MFT slot/parent sequence 传播和 Everything 100% 功能/性能兼容仍未完成。
 
 ## 2026-07-29：内容搜索独立应用状态
 

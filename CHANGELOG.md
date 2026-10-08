@@ -4,11 +4,15 @@
 
 ## Unreleased
 
+### Changed
+
+- GitHub 标签构建在配置生产 PFX 时继续生成并校验签名安装包；未配置证书时不再中止，而是生成带 `UNSIGNED-PRERELEASE.txt` 警告的未签名预发布包，并把 GitHub Release 标记为 prerelease。MSVC CI 改为使用 runner 当前默认 Visual Studio 生成器，安装 smoke 使用无空格的临时安装目录，避免 runner 工具链升级和参数拆分造成误失败。
+
 ### Added
 
 - 新增 `esm_service health [pipe-name] [timeout-ms]`：先确认 SCM 服务为 Running，再通过真实 Named Pipe 空查询验证索引端到端可用；安装器和 CI 安装 smoke 不再只把“进程已启动”当作健康。
 - 新增路径限定的 `stop-install-processes.ps1`、WER LocalDumps 配置和 `export-diagnostics.ps1` 诊断 ZIP；停止进程只作用于当前安装目录中的 everything_sm 可执行文件，诊断报告默认对用户名和用户目录做基础脱敏；复制的原始日志需在分享前人工检查。
-- 新增 MinGW 与 MSVC Release 双编译器 CI、100/20 轮进程强杀恢复压力入口，以及静默安装、同版本覆盖升级、Pipe 健康检查和静默卸载 smoke job。标签发布新增 EXE、内嵌卸载器和最终 NSIS 安装器 Authenticode 签名入口；没有配置真实证书时标签发布会失败而不是生成伪签名包。
+- 新增 MinGW 与 MSVC Release 双编译器 CI、100/20 轮进程强杀恢复压力入口，以及静默安装、同版本覆盖升级、Pipe 健康检查和静默卸载 smoke job。标签发布新增 EXE、内嵌卸载器和最终 NSIS 安装器 Authenticode 签名入口；无证书标签只能生成明确标记的未签名预发布包，不能冒充生产实签版本。
 - 新增 metadata snapshot v3 多根 component/anchor 格式：`reserved[0] == 1` 保存完整路径 anchor，普通记录只保存名称组件并通过 `parent_id` 恢复路径；加载器拒绝非法 anchor 标记、非零保留字节、缺失父节点、自循环和空 anchor。
 
 - 为所有 Windows EXE 增加由 CMake 项目版本统一生成的 VERSIONINFO；为 `esm_service.exe` 嵌入 Event Log message table，安装服务时注册 `everything_sm` Application Event source，使生命周期、恢复和慢查询事件可显示可读消息。 同时兼容 Windows SDK 将 `READ_USN_JOURNAL_DATA` 映射为 V1 的 48 字节布局，为全部 C++ target 统一启用 MSVC `/utf-8`，并修复 GUI 参数名与 Windows SDK `small` 定义冲突及 64 位控件 ID 转换，恢复 MSVC/Windows SDK 全目标构建路径；目录 watcher 测试对杀毒/索引器造成的短暂 sharing violation 采用最长 2 秒的有界重试，避免把环境竞争误判为产品失败。

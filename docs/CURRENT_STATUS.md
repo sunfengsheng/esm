@@ -1,10 +1,12 @@
-# 当前状态（2026-07-29）
+# 当前状态（2026-10-08）
 
 本文描述当前 `main` 分支能力，不代表稳定版本承诺。项目目标是接近 Everything 的体验和性能，但目前不能称为完整复刻或完全兼容。
 
 ## P0 发布加固结论（2026-07-29）
 
 本轮已完成代码层面的服务健康检查、覆盖升级备份/失败回滚、安装目录限定进程停止、WER LocalDumps、诊断 ZIP、双编译器 CI、安装器 smoke、进程强杀恢复压力入口和 v3 多根紧凑 checkpoint。MinGW Release 全量测试及 100 轮恢复压力、MSVC Release 全量测试及 20 轮恢复压力均通过；NSIS `/WX` 编译、PowerShell parser 和 workflow YAML parser 通过。当前机器未执行安装/卸载 smoke，避免影响已安装服务；该路径由 CI 隔离 runner 执行。
+
+2026-10-08 首次标签流水线暴露出三项发布环境差异：仓库未配置生产签名证书、Windows runner 已不保证安装 VS 2022，以及带空格 smoke 安装目录存在参数歧义。CI 已改为无证书时发布明确标记的 unsigned prerelease、由 CMake 选择 runner 当前默认 Visual Studio，并使用无空格临时 smoke 目录。只有后续标签流水线全部通过并实际生成 GitHub Release，才能把该次发布记为成功。
 
 仍未完成的正式发布门槛包括：per-request impersonation 与按文件 ACL 过滤、UAC alternate credentials 下真实交互用户身份模型、生产 PFX/时间戳和已安装 `Uninstall.exe` 签名验证，以及 Win10/Win11、标准用户、中文路径、多卷、睡眠唤醒和长期 GUI 输入的隔离 VM 矩阵。安装器回滚是健康门控的“部分事务化”实现，没有持久 upgrade manifest/state machine，不能宣称掉电级原子升级。
 

@@ -271,10 +271,12 @@ ctest --test-dir build-msvc18-hardening -C Release --output-on-failure
 .\tools\windows-install-smoke.ps1 -InstallerPath .\dist\everything_sm-0.1.0-setup.exe
 ```
 
-`build-installer.ps1` 支持 Authenticode 参数或同名环境变量：证书路径、证书密码、时间戳 URL 和 `-RequireSignature`。构建顺序为签名全部发布 EXE → 生成并签名内嵌 `Uninstall.exe` → 编译最终 NSIS → 签名最终安装器 → 校验签名。标签 CI 需要：
+`build-installer.ps1` 支持 Authenticode 参数或同名环境变量：证书路径、证书密码、时间戳 URL 和 `-RequireSignature`。构建顺序为签名全部发布 EXE → 生成并签名内嵌 `Uninstall.exe` → 编译最终 NSIS → 签名最终安装器 → 校验签名。生产标签 CI 使用：
 
 - `WINDOWS_SIGNING_CERTIFICATE_BASE64`；
 - `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`；
 - 可访问的 RFC 3161 时间戳服务（由构建参数/环境配置）。
 
-标签缺少证书时必须失败。真实发布前还要在隔离 VM 检查安装后的 `Uninstall.exe`，确认其 Authenticode 链和时间戳有效；仅成功编译 unsigned 本地安装器不算签名验收。
+标签缺少证书时仍会生成安装包，但流水线同时发布 `UNSIGNED-PRERELEASE.txt`，并把 GitHub Release 标记为 **unsigned prerelease**；它只能用于测试，不能冒充生产实签版本。配置证书后标签构建会启用 `-RequireSignature`，任何 EXE、内嵌卸载器或最终安装器签名/校验失败都会阻断发布。真实正式发布前还要在隔离 VM 检查安装后的 `Uninstall.exe`，确认其 Authenticode 链和时间戳有效。
+
+MSVC job 不固定 Visual Studio 主版本，而由 GitHub Windows runner 的 CMake 选择当前默认 VS 生成器，以兼容 runner 从 VS 2022 升级到 VS 2026。安装 smoke 显式使用 `$RUNNER_TEMP\everything_sm-ci` 这类无空格目录，避免 `Start-Process`/NSIS `/D=` 参数在带空格路径上产生歧义；产品默认安装路径仍由独立发布矩阵覆盖。

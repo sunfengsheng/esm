@@ -96,11 +96,14 @@ jobs:
           SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64)) {
-            throw 'Release tags require WINDOWS_SIGNING_CERTIFICATE_BASE64.'
+            Write-Warning 'WINDOWS_SIGNING_CERTIFICATE_BASE64 is not configured; publishing an unsigned prerelease package.'
+            "ESM_RELEASE_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
           }
           $path = Join-Path $env:RUNNER_TEMP 'everything_sm-signing.pfx'
           [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_BASE64))
           "ESM_SIGN_CERTIFICATE_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ESM_RELEASE_SIGNED=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build NSIS installer
         shell: pwsh
@@ -120,9 +123,18 @@ jobs:
             }
             $version = $Matches[1]
             $arguments.Version = $version
-            $arguments.RequireSignature = $true
+            if ($env:ESM_RELEASE_SIGNED -eq 'true') {
+              $arguments.RequireSignature = $true
+            }
           }
           .\packaging\build-installer.ps1 @arguments
+          if ($env:ESM_REF_TYPE -eq 'tag' -and $env:ESM_RELEASE_SIGNED -ne 'true') {
+            @(
+              'This is an unsigned prerelease build.'
+              'Windows may display an Unknown publisher warning.'
+              'Verify the adjacent SHA-256 file before installation.'
+            ) | Set-Content -LiteralPath 'dist/UNSIGNED-PRERELEASE.txt' -Encoding utf8
+          }
 
       - name: Remove signing certificate
         if: always() && github.ref_type == 'tag'
@@ -139,6 +151,7 @@ jobs:
           path: |
             dist/*.exe
             dist/*.sha256
+            dist/UNSIGNED-PRERELEASE.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
@@ -156,7 +169,7 @@ jobs:
       - name: Configure MSVC Release build
         shell: pwsh
         run: >-
-          cmake -S . -B build-msvc-ci -G "Visual Studio 17 2022" -A x64
+          cmake -S . -B build-msvc-ci -A x64
           -DESM_BUILD_TESTS=ON
           -DESM_BUILD_BENCHMARKS=OFF
           -DESM_BUILD_CONTENT_SEARCH=OFF
@@ -194,7 +207,8 @@ jobs:
         shell: pwsh
         run: |
           $installer = Get-ChildItem -LiteralPath dist -Filter 'everything_sm-*-setup.exe' -File | Select-Object -Single
-          .\tools\windows-install-smoke.ps1 -InstallerPath $installer.FullName
+          $installDirectory = Join-Path $env:RUNNER_TEMP 'everything_sm-ci'
+          .\tools\windows-install-smoke.ps1 -InstallerPath $installer.FullName -InstallDirectory $installDirectory
 
   release:
     name: Publish tagged release
@@ -218,8 +232,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_flags=()
+          release_title="everything_sm $GITHUB_REF_NAME"
+          if [[ -f dist/UNSIGNED-PRERELEASE.txt ]]; then
+            release_flags+=(--prerelease)
+            release_title="$release_title (unsigned prerelease)"
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${release_flags[@]}" --title "$release_title"
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "everything_sm $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${release_flags[@]}" --title "$release_title"
           fi

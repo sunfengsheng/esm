@@ -177,6 +177,7 @@ P7 下一批工作按以下顺序推进：
 - [x] 安装目录限定进程停止、覆盖升级持久备份和健康失败回滚；
 - [x] WER LocalDumps、诊断 ZIP、MinGW/MSVC CI、安装器 smoke 和恢复强杀压力；
 - [x] v3 多根 component/anchor checkpoint consolidation；
+- [x] 无生产证书时生成明确标记的 unsigned prerelease，而不是把未签名包冒充正式实签发布；
 - [ ] per-request impersonation、按文件 ACL 过滤和 UAC alternate credentials 身份模型；
 - [ ] 生产 PFX、RFC 3161 时间戳、tag release 和已安装 `Uninstall.exe` 实签验证；
 - [ ] Win10/Win11、管理员/标准用户、中文路径、单盘/多盘、睡眠唤醒、升级失败注入和长时间 GUI 输入矩阵；

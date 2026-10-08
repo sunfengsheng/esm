@@ -1,5 +1,6 @@
 #include "esm/content_named_pipe.hpp"
 #include "esm/content_settings.hpp"
+#include "index_roots_dialog.hpp"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -38,6 +39,7 @@ constexpr int control_preview_path = 111;
 constexpr int control_preview_text = 112;
 constexpr int command_copy_path = 2001;
 constexpr int command_toggle_preview = 2002;
+constexpr int command_manage_index_roots = 2003;
 
 enum class ServiceState { unavailable, indexing, ready, searching };
 
@@ -641,6 +643,228 @@ bool ensure_content_service_running(App& app, std::wstring& error) {
     return start_content_service(app, error);
 }
 
+std::wstring content_service_mutex_name(std::wstring_view pipe) {
+    auto name = std::wstring(L"Local\\EverythingSmContentService-") +
+                std::wstring(pipe);
+    std::replace(name.begin(), name.end(), L'\\', L'_');
+    return name;
+}
+
+bool wait_for_content_service_exit(std::wstring_view pipe,
+                                   std::uint32_t timeout_ms) {
+    const auto mutex_name = content_service_mutex_name(pipe);
+    const auto deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        const HANDLE mutex =
+            OpenMutexW(SYNCHRONIZE, FALSE, mutex_name.c_str());
+        if (!mutex) {
+            if (GetLastError() == ERROR_FILE_NOT_FOUND) return true;
+        } else {
+            CloseHandle(mutex);
+        }
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(50);
+    }
+}
+
+bool tokens_have_same_user(HANDLE process, std::wstring& error) {
+    HANDLE current_token{};
+    HANDLE process_token{};
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &current_token) ||
+        !OpenProcessToken(process, TOKEN_QUERY, &process_token)) {
+        error = L"无法校验旧内容服务的用户身份，错误码 " +
+                std::to_wstring(GetLastError());
+        if (current_token) CloseHandle(current_token);
+        if (process_token) CloseHandle(process_token);
+        return false;
+    }
+    auto read_user = [](HANDLE token, std::vector<std::uint8_t>& bytes) {
+        DWORD required{};
+        GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+        if (required == 0) return false;
+        bytes.resize(required);
+        return GetTokenInformation(token, TokenUser, bytes.data(), required,
+                                   &required) != FALSE;
+    };
+    std::vector<std::uint8_t> current_user;
+    std::vector<std::uint8_t> process_user;
+    const bool read = read_user(current_token, current_user) &&
+                      read_user(process_token, process_user);
+    CloseHandle(current_token);
+    CloseHandle(process_token);
+    if (!read) {
+        error = L"无法读取旧内容服务的用户身份，错误码 " +
+                std::to_wstring(GetLastError());
+        return false;
+    }
+    const auto* current =
+        reinterpret_cast<const TOKEN_USER*>(current_user.data());
+    const auto* target =
+        reinterpret_cast<const TOKEN_USER*>(process_user.data());
+    if (!EqualSid(current->User.Sid, target->User.Sid)) {
+        error = L"旧内容服务不属于当前用户，已拒绝强制停止。";
+        return false;
+    }
+    return true;
+}
+
+enum class LegacyStopResult { stopped, canceled, failed };
+
+LegacyStopResult stop_legacy_content_service(HWND owner,
+                                             std::uint32_t process_id,
+                                             std::wstring& error) {
+    error.clear();
+    if (process_id == 0 || process_id == GetCurrentProcessId()) {
+        error = L"旧内容服务进程标识无效。";
+        return LegacyStopResult::failed;
+    }
+    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                                           PROCESS_TERMINATE | SYNCHRONIZE,
+                                       FALSE, process_id);
+    if (!process) {
+        error = L"无法打开旧内容服务进程，错误码 " +
+                std::to_wstring(GetLastError());
+        return LegacyStopResult::failed;
+    }
+
+    std::wstring image_path(32768, L'\0');
+    DWORD image_length = static_cast<DWORD>(image_path.size());
+    if (!QueryFullProcessImageNameW(process, 0, image_path.data(),
+                                    &image_length)) {
+        error = L"无法校验旧内容服务路径，错误码 " +
+                std::to_wstring(GetLastError());
+        CloseHandle(process);
+        return LegacyStopResult::failed;
+    }
+    image_path.resize(image_length);
+    const auto filename = std::filesystem::path(image_path).filename().wstring();
+    if (CompareStringOrdinal(filename.c_str(), -1,
+                             L"esm_content_service.exe", -1, TRUE) !=
+        CSTR_EQUAL ||
+        !tokens_have_same_user(process, error)) {
+        if (error.empty())
+            error = L"Named Pipe 所属进程不是可验证的内容服务。";
+        CloseHandle(process);
+        return LegacyStopResult::failed;
+    }
+
+    const auto answer = MessageBoxW(
+        owner,
+        (L"当前运行的是不支持安全重启的旧版内容服务：\n" +
+         image_path +
+         L"\n\n为了立即应用新索引根，需要停止一次旧进程。"
+         L"这可能中断当前扫描，之后会使用新版服务继续建立索引。\n\n"
+         L"是否继续？")
+            .c_str(),
+        L"停止旧版内容服务",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (answer != IDYES) {
+        CloseHandle(process);
+        return LegacyStopResult::canceled;
+    }
+    if (!TerminateProcess(process, ERROR_PROCESS_ABORTED)) {
+        error = L"无法停止旧内容服务，错误码 " +
+                std::to_wstring(GetLastError());
+        CloseHandle(process);
+        return LegacyStopResult::failed;
+    }
+    const auto wait = WaitForSingleObject(process, 10'000);
+    CloseHandle(process);
+    if (wait != WAIT_OBJECT_0) {
+        error = L"旧内容服务未在 10 秒内退出。";
+        return LegacyStopResult::failed;
+    }
+    return LegacyStopResult::stopped;
+}
+
+void manage_index_roots(App& app) {
+    auto settings = esm::default_content_app_settings();
+    std::wstring error;
+    if (std::filesystem::exists(app.config_path) &&
+        !esm::load_content_app_settings(app.config_path, settings, error)) {
+        MessageBoxW(app.window, error.c_str(), L"内容索引设置",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    error.clear();
+    if (!esm::content_gui::show_index_roots_dialog(app.window, settings,
+                                                   error)) {
+        if (!error.empty()) {
+            MessageBoxW(app.window, error.c_str(), L"内容索引设置",
+                        MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+    if (!esm::save_content_app_settings(app.config_path, settings, error)) {
+        MessageBoxW(app.window, error.c_str(), L"保存内容索引设置失败",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    app.generation.fetch_add(1, std::memory_order_relaxed);
+    clear_results(app);
+    const auto active_pipe = app.pipe;
+    std::uint32_t active_service_process_id{};
+    const auto process_id_error =
+        esm::query_content_named_pipe_server_process_id(
+            active_pipe, active_service_process_id, 500);
+    const auto shutdown =
+        esm::request_content_named_pipe_shutdown(active_pipe, 2'000);
+    const bool service_was_absent =
+        shutdown.error == ERROR_FILE_NOT_FOUND ||
+        shutdown.error == ERROR_PIPE_NOT_CONNECTED;
+    if (shutdown.error != ERROR_SUCCESS && !service_was_absent) {
+        if (process_id_error != ERROR_SUCCESS) {
+            error = L"设置已保存，但无法确认旧内容服务进程（错误码 " +
+                    std::to_wstring(process_id_error) + L"）。";
+            MessageBoxW(app.window, error.c_str(), L"内容服务需要重启",
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const auto legacy_result = stop_legacy_content_service(
+            app.window, active_service_process_id, error);
+        if (legacy_result == LegacyStopResult::canceled) {
+            app.service_text = L"配置已保存，但旧版内容服务仍在使用旧配置";
+            update_status_bar(app);
+            MessageBoxW(
+                app.window,
+                L"新配置已保存，但尚未应用。旧版内容服务是独立后台进程，"
+                L"只关闭 GUI 不会停止它。请再次点击“应用”并确认停止旧服务。",
+                L"索引根尚未应用", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        if (legacy_result == LegacyStopResult::failed) {
+            MessageBoxW(app.window, error.c_str(), L"无法停止旧版内容服务",
+                        MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    if (!service_was_absent &&
+        !wait_for_content_service_exit(active_pipe, 10'000)) {
+        MessageBoxW(app.window,
+                    L"设置已保存，但内容服务未在 10 秒内退出。"
+                    L"请稍后重新打开内容搜索。",
+                    L"内容服务停止超时", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    if (!app.pipe_overridden) app.pipe = settings.pipe_name;
+    app.service_start_attempted = false;
+    app.service_state = ServiceState::indexing;
+    app.service_text = L"配置已保存，正在按新范围启动内容索引……";
+    app.activity_text.clear();
+    update_status_bar(app);
+    if (!ensure_content_service_running(app, error)) {
+        app.service_state = ServiceState::unavailable;
+        app.service_text = error;
+        update_status_bar(app);
+        MessageBoxW(app.window, error.c_str(), L"启动内容服务失败",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    queue_status(app);
+}
+
 void draw_status_dot(const App& app, const DRAWITEMSTRUCT& draw) {
     COLORREF color = RGB(210, 55, 55);
     if (app.service_state == ServiceState::ready)
@@ -675,8 +899,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
     }
     case WM_CREATE: {
         HMENU menu_bar = CreateMenu();
+        HMENU index_menu = CreatePopupMenu();
         app->view_menu = CreatePopupMenu();
-        if (menu_bar && app->view_menu) {
+        if (menu_bar && index_menu && app->view_menu) {
+            AppendMenuW(index_menu, MF_STRING, command_manage_index_roots,
+                        L"管理索引根(&R)…");
+            AppendMenuW(menu_bar, MF_POPUP,
+                        reinterpret_cast<UINT_PTR>(index_menu), L"索引(&I)");
             AppendMenuW(app->view_menu, MF_STRING | MF_CHECKED,
                         command_toggle_preview,
                         L"预览窗格\tCtrl+Shift+P");
@@ -689,6 +918,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
                 DestroyMenu(app->view_menu);
                 app->view_menu = nullptr;
             }
+            if (index_menu) DestroyMenu(index_menu);
             if (menu_bar) DestroyMenu(menu_bar);
         }
         app->search_label = CreateWindowExW(
@@ -819,6 +1049,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
         } else if (LOWORD(wparam) == control_preview_toggle ||
                    LOWORD(wparam) == command_toggle_preview) {
             set_preview_visible(*app, !app->preview_visible);
+        } else if (LOWORD(wparam) == command_manage_index_roots) {
+            manage_index_roots(*app);
         }
         return 0;
     case WM_TIMER:

@@ -6,12 +6,15 @@
 
 ### Changed
 
+- 内容服务在未显式使用 `--db` 时，即使只有一个根也改用 `<database_root>\volumes\<root-key>\xapian` 独立分片，避免 GUI 更换单根后复用旧 `index\xapian` 并返回旧根文档。旧单根数据库不会自动删除，升级后会在 root-key 分片中重建。
 - GitHub 标签构建在配置生产 PFX 时继续生成并校验签名安装包；未配置证书时不再中止，而是生成带 `UNSIGNED-PRERELEASE.txt` 警告的未签名预发布包，并把 GitHub Release 标记为 prerelease。MSVC CI 改为使用 runner 当前默认 Visual Studio 生成器，安装 smoke 使用无空格的临时安装目录，避免 runner 工具链升级和参数拆分造成误失败。
 - 未签名预发布版在 MinGW/MSVC 构建和测试通过后允许保留可下载 Release，即使隔离 runner 的安装 smoke 失败，也会把失败状态写入 `UNSIGNED-PRERELEASE.txt`；生产签名标签仍把 smoke 成功作为发布硬门槛。安装 smoke 增加命令、退出码、安装目录和 SCM 状态诊断。
 - 内容搜索打包脚本与主安装包统一探测 PATH、`Program Files (x86)\NSIS`、`Program Files\NSIS` 和仓库缓存的 `makensis.exe`，兼容 GitHub Windows runner 上 Chocolatey 安装但未创建命令 shim 的 NSIS。
 
 ### Added
 
+- 独立内容搜索 GUI 新增“索引 → 管理索引根”：可添加/移除多个根目录和排除目录、选择所有固定磁盘、开关默认排除项，并设置 1–64 MiB 单文件上限。应用时会校验目录、去重并持久化配置，再通过新的 shutdown IPC 安全重启内容服务。如果正在运行的是不支持 shutdown IPC 的旧版服务，GUI 会从 Named Pipe 取得真实服务 PID，校验同一用户 SID 和 `esm_content_service.exe` 文件名，并在用户确认后停止一次旧进程完成升级切换。
+- 内容 IPC 新增受控停止请求/响应和真实 Named Pipe 停止回归测试；内容 Pipe DACL 从通用 Authenticated Users 收紧为当前用户 SID、SYSTEM 和 Administrators，避免其他普通本机用户查询或停止该用户的内容服务。
 - 新增独立内容搜索 GPL-2.0-or-later 公开预览发布：标签流水线生成按用户安装的 `everything-sm-content-<version>-preview-setup.exe`、SHA-256、版本匹配的完整对应源码 ZIP 及源码 SHA-256；安装包内含项目内容搜索授权说明、GPL 全文、Xapian 上游许可证和精确源码下载地址。
 - 新增 `esm_service health [pipe-name] [timeout-ms]`：先确认 SCM 服务为 Running，再通过真实 Named Pipe 空查询验证索引端到端可用；安装器和 CI 安装 smoke 不再只把“进程已启动”当作健康。
 - 新增路径限定的 `stop-install-processes.ps1`、WER LocalDumps 配置和 `export-diagnostics.ps1` 诊断 ZIP；停止进程只作用于当前安装目录中的 everything_sm 可执行文件，诊断报告默认对用户名和用户目录做基础脱敏；复制的原始日志需在分享前人工检查。

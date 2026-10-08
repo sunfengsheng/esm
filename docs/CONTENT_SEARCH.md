@@ -81,7 +81,7 @@ root0=C:\Users\name
 exclude_count=0
 ```
 
-多根和排除目录使用连续编号：`root0`、`root1`、`exclude0`、`exclude1`。`maximum_bytes` 当前限制在 1 KiB 到 64 MiB。配置、数据库、Pipe 和进程均不复用文件名搜索的状态。
+多根和排除目录使用连续编号：`root0`、`root1`、`exclude0`、`exclude1`。配置层的 `maximum_bytes` 上限是 64 MiB；GUI 管理器提供 1–64 MiB 的用户可选范围。配置、数据库、Pipe 和进程均不复用文件名搜索的状态。
 
 ## 4. 构建
 
@@ -110,6 +110,12 @@ ctest --test-dir build-content -R esm_content_tests --output-on-failure
 ```
 
 GUI 会读取默认配置，并在 Pipe 不可用时使用 `CREATE_NO_WINDOW` 启动同目录下的 `esm_content_service.exe`。内容服务有按 Pipe 命名的单实例互斥体，重复启动不会建立第二套相同 Pipe 的扫描任务。
+
+GUI 的“索引 → 管理索引根…”会编辑同一份 `ContentAppSettings`：可添加/移除根目录和排除目录、开关所有固定磁盘与默认排除项、设置 1–64 MiB 单文件上限。应用前会把根转为可访问的规范绝对目录，对根和排除项做 Windows 大小写不敏感去重；没有显式根时必须开启 `all_fixed`。保存成功后 GUI 发送受控 shutdown IPC，等待按 Pipe 命名的服务互斥体消失，再以同一配置重启服务。
+
+为了处理“新 GUI 已替换，旧内容服务仍在后台运行”的一次性升级边界，客户端会先用 `GetNamedPipeServerProcessId` 记录当前 Pipe server PID。如果旧服务拒绝未知的 shutdown 消息，GUI 只在 PID 仍可打开、进程 token SID 与当前用户相同、文件名精确为 `esm_content_service.exe` 且用户明确确认时停止该进程。正常新版之间仍始终使用有响应的 shutdown IPC，不走强制回退。
+
+未显式使用 `--db` 时，单根和多根统一使用 `<database_root>\volumes\<root-key>\xapian`，因此更换单根不会读取另一个根的旧文档。从使用旧 `index\xapian` 的预览版升级后会在 root-key 分片中重建索引；旧目录暂时保留，不会被自动删除。显式单根 `--db <directory>` 仍用于开发和兼容场景。
 
 使用指定配置：
 
@@ -194,6 +200,7 @@ Windows IFilter 是环境相关的扩展路径；第三方 IFilter 当前直接�
 - 结果显示 Shell 文件图标，支持双击或“打开”按钮打开，支持“打开所在目录”，右键可复制完整路径；
 - `Ctrl+L` 聚焦并全选搜索框，`Esc` 清空，`Enter` 立即查询或打开当前选中结果；
 - 窗口有最小尺寸，结果列会随窗口宽度调整。
+- “索引 → 管理索引根…”提供多根、所有固定盘、排除目录和文件大小上限管理；选择所有固定盘会显示资源负载确认。
 
 初次扫描在后台执行。Pipe 会先开放，因此建库过程中可以查询已经提交的文档；尚未建立索引的文件暂时不会命中。
 
@@ -239,7 +246,8 @@ dist\everything-sm-content-<version>-source.zip.sha256
 
 - `ContentAppSettings` 配置保存/加载 round-trip；
 - 默认内容数据根与文件名搜索数据根隔离；
-- 协议 search/status 和 UTF-16 高亮范围 round-trip；
+- 协议 search/status/shutdown、UTF-16 高亮范围 round-trip，真实 Pipe server PID 识别，以及 shutdown 后服务线程退出；
+- GUI 配置校验的根/排除路径规范化去重、空根 + `all_fixed` 和大小边界；
 - 纯文本编码、二进制和大小过滤，以及统一提取调度保持纯文本行为；
 - 自生成 stored/deflate DOCX 的 ZIP/XML/实体提取和损坏文档诊断；
 - 自生成基础 PDF 的文本流提取，以及 `.pdf`/`.doc`/`.docx` 白名单；
@@ -256,6 +264,8 @@ dist\everything-sm-content-<version>-source.zip.sha256
 ## 10. 已知限制和下一阶段
 
 - 内容服务仍不是 SCM Windows Service；
+- 移除配置根后旧 Xapian shard 暂时保留，尚无安全的 stale-shard 自动删除/空间回收流程；
+- 收紧排除项或 `maximum_bytes` 只会影响后续扫描/watcher，尚不会清理同一 shard 中以前已建索引的文档；
 - 服务停止期间发生的删除可能留下 stale 文档，尚无持久任务队列和周期性全量 reconciliation；
 - watcher 通知溢出后仍需重启校准；
 - 文本提取仍在内容服务进程内，尚无受限 extractor worker、超时和崩溃隔离；

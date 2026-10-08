@@ -52,10 +52,35 @@ std::wstring normalize_content_pipe_name(std::wstring_view name) {
 
 bool make_security(LocalSecurityDescriptor& descriptor,
                    SECURITY_ATTRIBUTES& attributes, std::uint32_t& error) {
-    constexpr wchar_t sddl[] =
-        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+    Handle token{nullptr};
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.value)) {
+        error = GetLastError();
+        return false;
+    }
+    DWORD token_bytes{};
+    GetTokenInformation(token.value, TokenUser, nullptr, 0, &token_bytes);
+    if (token_bytes == 0) {
+        error = GetLastError();
+        return false;
+    }
+    std::vector<std::uint8_t> token_buffer(token_bytes);
+    if (!GetTokenInformation(token.value, TokenUser, token_buffer.data(),
+                             token_bytes, &token_bytes)) {
+        error = GetLastError();
+        return false;
+    }
+    auto* token_user = reinterpret_cast<TOKEN_USER*>(token_buffer.data());
+    wchar_t* sid_text{};
+    if (!ConvertSidToStringSidW(token_user->User.Sid, &sid_text)) {
+        error = GetLastError();
+        return false;
+    }
+    const std::wstring sddl =
+        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;" + std::wstring(sid_text) +
+        L")";
+    LocalFree(sid_text);
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, SDDL_REVISION_1, &descriptor.value, nullptr)) {
+            sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr)) {
         error = GetLastError();
         return false;
     }
@@ -160,7 +185,8 @@ Handle connect_to_pipe(std::wstring_view pipe_name, std::uint32_t timeout_ms,
     }
 }
 
-std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
+std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index,
+                         std::atomic_bool& stop) {
     const auto normalized = normalize_content_pipe_name(pipe_name);
     LocalSecurityDescriptor descriptor;
     SECURITY_ATTRIBUTES security{};
@@ -186,6 +212,7 @@ std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
 
     ContentIpcMessageType response_type{};
     std::vector<std::uint8_t> response_payload;
+    bool shutdown_requested = false;
     try {
         if (request_frame.header.type == ContentIpcMessageType::search_request) {
             ContentIpcSearchResponse response;
@@ -209,6 +236,18 @@ std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
             }
             response_type = ContentIpcMessageType::status_response;
             response_payload = encode_content_status_response(response);
+        } else if (request_frame.header.type ==
+                   ContentIpcMessageType::shutdown_request) {
+            ContentIpcShutdownResponse response;
+            if (!request_frame.payload.empty()) {
+                response.error = ERROR_INVALID_DATA;
+                response.message = L"停止请求格式无效";
+            } else {
+                response.message = L"内容服务正在停止";
+                shutdown_requested = true;
+            }
+            response_type = ContentIpcMessageType::shutdown_response;
+            response_payload = encode_content_shutdown_response(response);
         } else {
             DisconnectNamedPipe(pipe.value);
             return ERROR_INVALID_DATA;
@@ -221,12 +260,19 @@ std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
             response.message = L"\u5185\u5bb9\u670d\u52a1\u5185\u90e8\u9519\u8bef";
             response_type = ContentIpcMessageType::search_response;
             response_payload = encode_content_search_response(response);
-        } else {
+        } else if (request_frame.header.type ==
+                   ContentIpcMessageType::status_request) {
             ContentIpcStatusResponse response;
             response.error = ERROR_INTERNAL_ERROR;
             response.status.message = L"内容服务内部错误";
             response_type = ContentIpcMessageType::status_response;
             response_payload = encode_content_status_response(response);
+        } else {
+            ContentIpcShutdownResponse response;
+            response.error = ERROR_INTERNAL_ERROR;
+            response.message = L"内容服务内部错误";
+            response_type = ContentIpcMessageType::shutdown_response;
+            response_payload = encode_content_shutdown_response(response);
         }
     } catch (...) {
         if (request_frame.header.type == ContentIpcMessageType::search_request) {
@@ -235,12 +281,19 @@ std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
             response.message = L"\u5185\u5bb9\u670d\u52a1\u53d1\u751f\u672a\u8bc6\u522b\u7684\u5185\u90e8\u9519\u8bef";
             response_type = ContentIpcMessageType::search_response;
             response_payload = encode_content_search_response(response);
-        } else {
+        } else if (request_frame.header.type ==
+                   ContentIpcMessageType::status_request) {
             ContentIpcStatusResponse response;
             response.error = ERROR_INTERNAL_ERROR;
             response.status.message = L"\u5185\u5bb9\u670d\u52a1\u53d1\u751f\u672a\u8bc6\u522b\u7684\u5185\u90e8\u9519\u8bef";
             response_type = ContentIpcMessageType::status_response;
             response_payload = encode_content_status_response(response);
+        } else {
+            ContentIpcShutdownResponse response;
+            response.error = ERROR_INTERNAL_ERROR;
+            response.message = L"\u5185\u5bb9\u670d\u52a1\u53d1\u751f\u672a\u8bc6\u522b\u7684\u5185\u90e8\u9519\u8bef";
+            response_type = ContentIpcMessageType::shutdown_response;
+            response_payload = encode_content_shutdown_response(response);
         }
     }
 
@@ -257,6 +310,7 @@ std::uint32_t serve_once(std::wstring_view pipe_name, ContentIndex& index) {
         return ERROR_BUFFER_OVERFLOW;
     }
     DisconnectNamedPipe(pipe.value);
+    if (shutdown_requested) stop.store(true, std::memory_order_relaxed);
     return ERROR_SUCCESS;
 }
 
@@ -312,7 +366,7 @@ std::uint32_t serve_content_named_pipe(std::wstring_view pipe_name,
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&, name = std::wstring(pipe_name)] {
             while (!stop.load(std::memory_order_relaxed)) {
-                const auto error = serve_once(name, index);
+                const auto error = serve_once(name, index, stop);
                 if (stop.load(std::memory_order_relaxed)) break;
                 if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_NAME ||
                     error == ERROR_NOT_ENOUGH_MEMORY) {
@@ -358,5 +412,27 @@ ContentPipeStatusResult query_content_named_pipe_status(
         pipe_name, ContentIpcMessageType::status_request,
         ContentIpcMessageType::status_response, {}, timeout_ms,
         decode_content_status_response);
+}
+
+ContentPipeShutdownResult request_content_named_pipe_shutdown(
+    std::wstring_view pipe_name, std::uint32_t timeout_ms) {
+    return query_pipe<ContentPipeShutdownResult>(
+        pipe_name, ContentIpcMessageType::shutdown_request,
+        ContentIpcMessageType::shutdown_response, {}, timeout_ms,
+        decode_content_shutdown_response);
+}
+
+std::uint32_t query_content_named_pipe_server_process_id(
+    std::wstring_view pipe_name, std::uint32_t& process_id,
+    std::uint32_t timeout_ms) {
+    process_id = 0;
+    std::uint32_t error{};
+    auto pipe = connect_to_pipe(pipe_name, timeout_ms, error);
+    if (pipe.value == INVALID_HANDLE_VALUE) return error;
+    ULONG server_process_id{};
+    if (!GetNamedPipeServerProcessId(pipe.value, &server_process_id))
+        return GetLastError();
+    process_id = server_process_id;
+    return ERROR_SUCCESS;
 }
 } // namespace esm

@@ -171,7 +171,7 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 已完成第一阶段可运行原型：
 
 - `esm_content_service.exe`：单根或多根后台启动扫描、显式 `--all-fixed` 固定卷发现、每根 Xapian 持久分片数据库和递归 watcher、全局聚合查询、独立 `everything_sm_content` Pipe；
-- `esm_content.exe`：160 ms debounce、单一长期 IPC worker、过期响应丢弃、服务状态灯、Shell 文件图标、名称/路径/内容摘要/相关度列、黄色匹配高亮、按钮/右键菜单/快捷键，以及显示文件名、完整路径和高亮索引摘要的右侧可开关预览窗格；
+- `esm_content.exe`：160 ms debounce、单一长期 IPC worker、过期响应丢弃、服务状态灯、Shell 文件图标、名称/路径/内容摘要/相关度列、黄色匹配高亮、按钮/右键菜单/快捷键、右侧可开关预览窗格，以及多根/排除目录/所有固定磁盘/单文件上限的 GUI 配置窗口；
 - `esm_content_cli.exe`：status/search 真实 IPC 诊断；
 - 纯文本扩展名白名单、UTF-8/UTF-16 BOM/本地 ANSI 解码、二进制 NUL 检测和 4 MiB 默认上限；`.docx` 支持 IFilter + 内置 ZIP/XML 回退，`.pdf` 支持 IFilter + 受限基础文本流回退，旧 `.doc` 依赖系统 IFilter；
 - Xapian 默认 AND、phrase/boolean/love-hate/wildcard 和 CJK n-gram；
@@ -206,10 +206,12 @@ MinGW/UCRT 的 `esm_tests.exe` 现在与发布程序一样静态链接运行库�
 - 内容配置、索引和 Pipe 默认分别为 `%LOCALAPPDATA%\everything_sm_content\content.ini`、`%LOCALAPPDATA%\everything_sm_content\index` 和 `everything_sm_content_service`；
 - GUI 可按需使用 `CREATE_NO_WINDOW` 启动同目录的 `esm_content_service.exe`；
 - 内容服务按 Pipe 创建单实例互斥体，避免 GUI 重复启动相同扫描任务；
+- GUI 可通过“索引 → 管理索引根”修改并校验 `ContentAppSettings`，保存后使用 shutdown IPC 停止旧服务、等待单实例互斥体释放后重启；对不识别 shutdown 的旧版服务，只在 Named Pipe PID、同用户 SID、可执行文件名全部校验并获得用户确认后执行一次停止；内容 Pipe 只允许当前用户 SID、SYSTEM 和 Administrators；
+- 默认单根与多根都使用 root-key Xapian 分片，更换单根不再复用旧根数据库；显式 `--db` 仍保留单根直接数据库兼容语义；
 - GUI、服务和 CLI 都支持 `--config`，命令行参数仍可覆盖配置；
 - 默认首次配置只索引当前用户目录，不会未经确认执行 `--all-fixed`；
 - 新增设置持久化、DOCX/PDF 提取自动测试、TXT/DOCX/PDF 临时单根服务/CLI E2E 验证和独立 GPL NSIS 预览安装包；
 - 内容应用使用与文件名搜索不同的专属图标；GUI 增加 160 ms 防抖、长期 worker、状态灯、Shell 图标、结果按钮、右键菜单、快捷键和 Everything 风格的右侧摘要预览窗格；
 - 文件名搜索进程、数据库、安装包和 IPC 未改为依赖内容搜索。
 
-2026-10-08 已明确内容搜索及其构建相关代码的 GPL-2.0-or-later 授权范围；标签发布同时提供独立预览安装包、GPL/Xapian 许可证、精确源码地址、完整对应源码 ZIP 和 SHA-256。仍未完成 Windows Preview Handler、PDF/Word 页面级渲染、图片/OCR 预览、SCM 内容服务、持久任务队列、删除 reconciliation、受限 extractor worker、ACL/per-request impersonation、完整复杂 PDF/Office 语义和真实整机长期基准。因此内容搜索仍是预览功能，不能声称达到生产发布标准。
+2026-10-08 已明确内容搜索及其构建相关代码的 GPL-2.0-or-later 授权范围；标签发布同时提供独立预览安装包、GPL/Xapian 许可证、精确源码地址、完整对应源码 ZIP 和 SHA-256。仍未完成移除根后的 stale shard 自动删除、排除项/大小上限收紧后的已索引文档清理、Windows Preview Handler、PDF/Word 页面级渲染、图片/OCR 预览、SCM 内容服务、持久任务队列、删除 reconciliation、受限 extractor worker、ACL/per-request impersonation、完整复杂 PDF/Office 语义和真实整机长期基准。因此内容搜索仍是预览功能，不能声称达到生产发布标准。

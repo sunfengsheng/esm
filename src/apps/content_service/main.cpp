@@ -368,15 +368,11 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<esm::ContentIndexShardSpec> shard_specs;
     shard_specs.reserve(roots.size());
     for (const auto& root : roots) {
-        std::filesystem::path database;
-        if (roots.size() == 1) {
-            database = direct_database_set
-                           ? normalize_path(direct_database)
-                           : database_root / L"xapian";
-        } else {
-            database = database_root / L"volumes" /
-                       esm::content_root_database_key(root) / L"xapian";
-        }
+        auto database = direct_database_set
+                            ? normalize_path(direct_database)
+                            : database_root / L"volumes" /
+                                  esm::content_root_database_key(root) /
+                                  L"xapian";
         shard_specs.push_back({root, std::move(database)});
     }
 

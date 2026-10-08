@@ -203,6 +203,30 @@ void test_content_settings_round_trip() {
     const auto default_root = esm::default_content_app_data_root().wstring();
     require(default_root.find(L"everything_sm_content") != std::wstring::npos,
             "content data root should be isolated from filename-search data");
+
+    const auto real_root = directory.path() / L"documents";
+    std::filesystem::create_directories(real_root);
+    esm::ContentAppSettings validated = expected;
+    validated.roots = {real_root, real_root / L".." / L"documents"};
+    validated.excluded_paths = {real_root / L"cache",
+                                real_root / L"cache" / L"."};
+    validated.maximum_bytes = 1U * 1024U * 1024U;
+    require(esm::validate_content_app_settings(validated, error) &&
+                validated.roots.size() == 1 &&
+                validated.excluded_paths.size() == 1,
+            "GUI content settings validation should normalize and deduplicate paths");
+
+    validated.roots.clear();
+    validated.all_fixed = true;
+    require(esm::validate_content_app_settings(validated, error),
+            "all-fixed content settings should allow an empty explicit root list");
+    validated.all_fixed = false;
+    require(!esm::validate_content_app_settings(validated, error),
+            "content settings should require a root when all-fixed is disabled");
+    validated.all_fixed = true;
+    validated.maximum_bytes = 65U * 1024U * 1024U;
+    require(!esm::validate_content_app_settings(validated, error),
+            "content settings should reject files larger than the 64 MiB limit");
 }
 
 void test_protocol_round_trip() {
@@ -273,6 +297,25 @@ void test_protocol_round_trip() {
                 decoded_status.status.ready && !decoded_status.status.indexing &&
                 decoded_status.status.message == status.status.message,
             "content status response should round-trip");
+
+    esm::ContentIpcShutdownResponse shutdown;
+    shutdown.message = L"内容服务正在停止";
+    const auto shutdown_payload =
+        esm::encode_content_shutdown_response(shutdown);
+    esm::ContentIpcShutdownResponse decoded_shutdown;
+    require(esm::decode_content_shutdown_response(
+                shutdown_payload, decoded_shutdown, error) &&
+                decoded_shutdown.error == ERROR_SUCCESS &&
+                decoded_shutdown.message == shutdown.message,
+            "content shutdown response should round-trip");
+
+    const auto shutdown_frame = esm::encode_content_frame(
+        esm::ContentIpcMessageType::shutdown_request, 74, {});
+    require(esm::decode_content_frame(shutdown_frame, frame, error) &&
+                frame.header.type ==
+                    esm::ContentIpcMessageType::shutdown_request &&
+                frame.payload.empty(),
+            "content shutdown request frame should round-trip");
 }
 
 class FakeContentIndex final : public esm::ContentIndex {
@@ -317,6 +360,12 @@ void test_named_pipe_round_trip() {
     });
 
     try {
+        std::uint32_t server_process_id{};
+        require(esm::query_content_named_pipe_server_process_id(
+                    pipe, server_process_id, 2'000) == ERROR_SUCCESS &&
+                    server_process_id == GetCurrentProcessId(),
+                "content client should identify the named-pipe server process");
+
         const auto status = esm::query_content_named_pipe_status(pipe, 2'000);
         require(status.error == ERROR_SUCCESS &&
                     status.response.status.documents == 9 &&
@@ -334,13 +383,18 @@ void test_named_pipe_round_trip() {
                     search.response.result.hits.front().relevance_percent == 88 &&
                     search.response.result.hits.front().highlights.size() == 1,
                 "content search should cross the named pipe");
+
+        const auto shutdown =
+            esm::request_content_named_pipe_shutdown(pipe, 2'000);
+        require(shutdown.error == ERROR_SUCCESS &&
+                    !shutdown.response.message.empty(),
+                "content shutdown should cross the named pipe");
     } catch (...) {
         stop.store(true, std::memory_order_relaxed);
         server.join();
         throw;
     }
 
-    stop.store(true, std::memory_order_relaxed);
     server.join();
     require(server_error.load(std::memory_order_relaxed) == ERROR_SUCCESS,
             "content named pipe server should stop cleanly");

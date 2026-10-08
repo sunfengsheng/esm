@@ -316,7 +316,7 @@ flowchart LR
 
 内容文档当前以规范化小写路径的 FNV-1a 64 位哈希形成 Xapian boolean unique term；正文由 `TermGenerator::FLAG_NGRAMS` 建索引，查询和摘要启用 n-gram。完整路径与提取正文暂存在 Xapian document data 中，因此当前空间模型不能视为最终方案。
 
-服务创建 shard 后立即启动 Named Pipe；每个根由独立 `std::jthread` 执行后台初次扫描，随后进入该根的递归 `DirectoryWatcher`。多根数据库位于 `<db-root>\volumes\<root-key>\xapian`，路径过滤器在递归遍历和通知消费两处应用，并始终排除数据库目录。启动扫描和 watcher 目前都在 `esm_content_service.exe` 内执行。正式架构计划增加受限 extractor worker、启动 reconciliation、内容正文压缩 sidecar、统一 `FileIdentity(volume + file-id)`、权限过滤和 SCM 生命周期。详细边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
+服务创建 shard 后立即启动 Named Pipe；每个根由独立 `std::jthread` 执行后台初次扫描，随后进入该根的递归 `DirectoryWatcher`。未显式指定 `--db` 时，单根和多根数据库统一位于 `<db-root>\volumes\<root-key>\xapian`，保证根配置切换不会打开另一个根的旧 shard；显式单根 `--db` 保留直接数据库兼容路径。路径过滤器在递归遍历和通知消费两处应用，并始终排除数据库目录。启动扫描和 watcher 目前都在 `esm_content_service.exe` 内执行。正式架构计划增加受限 extractor worker、启动 reconciliation、内容正文压缩 sidecar、统一 `FileIdentity(volume + file-id)`、权限过滤和 SCM 生命周期。详细边界见 [CONTENT_SEARCH.md](CONTENT_SEARCH.md)。
 
 内容 shard 的 writer 在 `commit()` 发布新 revision 时取得独占 revision 锁，查询在打开只读 `Xapian::Database`、取得 MSet、读取 document data 和生成摘要的整个期间持有共享 revision 锁。这样多个查询仍可并行，但不会与本进程的 commit 交叉而得到失效快照。若数据库被外部变化或底层 revision 竞争打断，查询最多重新打开数据库重试 3 次；其余 `Xapian::Error` 在索引边界转换为 `std::runtime_error`。Named Pipe 请求处理、每根扫描/监听工作线程和 `wmain` 还有 `catch (...)` 最后防线，避免 Xapian 不继承 `std::exception` 的异常越过进程边界。该策略优先保证原型稳定性，尚未实现可取消查询、查询优先级或跨 shard 并行执行。
 
@@ -362,7 +362,11 @@ flowchart LR
     NameService --> NameDb["Metadata snapshot + WAL"]
 ```
 
-`ContentAppSettings` 是三个内容程序共享的只读启动配置模型。GUI 在启动时加载配置；Pipe 不可用时，它通过 `CREATE_NO_WINDOW` 启动同目录服务。服务使用由 Pipe 名派生的 `Local\EverythingSmContentService-*` 互斥体阻止重复实例。服务仍在各根的后台线程执行初次扫描和 watcher，并在每根独立 Xapian shard 上聚合查询。
+`ContentAppSettings` 是三个内容程序共享的启动配置模型。GUI 在启动时加载配置；Pipe 不可用时，它通过 `CREATE_NO_WINDOW` 启动同目录服务。“管理索引根”先在 GUI 内校验并保存 INI，再向旧服务发送 `shutdown_request`；旧服务返回 `shutdown_response` 后设置共享 stop flag，唤醒 Pipe worker，请求每根 `jthread` 停止并关闭 shard。GUI 等待由 Pipe 名派生的 `Local\EverythingSmContentService-*` 互斥体消失后才启动新进程，避免新实例在旧 shard writer 未退出时竞争。服务仍在各根的后台线程执行初次扫描和 watcher，并在每根独立 Xapian shard 上聚合查询。
+
+内容 Pipe 的 DACL 在创建时从当前进程 token 取得用户 SID，只授予该 SID、SYSTEM 和 Administrators 访问，同时保留 `PIPE_REJECT_REMOTE_CLIENTS`。这保护了 search/status/shutdown 控制面，但查询仍没有 per-request impersonation 或按文件 ACL 过滤，因此不是共享多用户内容服务设计。移除配置根仅使对应 shard 不再加载；旧 shard 目录暂时保留，避免配置界面直接执行不可恢复的递归删除。
+
+旧版升级是特殊边界：旧进程不识别 `shutdown_request`，而 GUI 退出也不会结束已脱离的后台服务。GUI 在发起 shutdown 之前通过 `GetNamedPipeServerProcessId` 保留服务 PID；只有当新协议失败、PID 不是 GUI 自身、目标同用户 SID、映像文件名为 `esm_content_service.exe` 且用户确认时，才使用 `TerminateProcess` 停止一次旧进程。这是为无控制协议的预览版提供的有界升级迁移，不是新版的常规停止路径。
 
 隔离约束：
 

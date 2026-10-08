@@ -154,6 +154,7 @@ if(ESM_BUILD_CONTENT_SEARCH)
 
   add_executable(esm_content WIN32
       src/apps/content_gui/main.cpp
+      src/apps/content_gui/index_roots_dialog.cpp
       src/apps/content_gui/resources.rc
   )
   target_link_libraries(esm_content PRIVATE

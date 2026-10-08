@@ -113,7 +113,7 @@ bool utf8_to_wide(std::string_view value, std::wstring& result) {
 
 bool known_type(std::uint16_t type) {
     return type >= static_cast<std::uint16_t>(ContentIpcMessageType::search_request) &&
-           type <= static_cast<std::uint16_t>(ContentIpcMessageType::status_response);
+           type <= static_cast<std::uint16_t>(ContentIpcMessageType::shutdown_response);
 }
 } // namespace
 
@@ -311,6 +311,27 @@ bool decode_content_status_response(std::span<const std::uint8_t> payload,
     }
     response.status.ready = ready != 0;
     response.status.indexing = indexing != 0;
+    return true;
+}
+
+std::vector<std::uint8_t> encode_content_shutdown_response(
+    const ContentIpcShutdownResponse& response) {
+    Writer writer;
+    writer.u32(response.error);
+    writer.string(wide_to_utf8(response.message));
+    return writer.take();
+}
+
+bool decode_content_shutdown_response(std::span<const std::uint8_t> payload,
+                                      ContentIpcShutdownResponse& response,
+                                      std::string& error) {
+    Reader reader(payload);
+    std::string message;
+    if (!reader.u32(response.error) || !reader.string(message) ||
+        !reader.finished() || !utf8_to_wide(message, response.message)) {
+        error = "invalid content shutdown response";
+        return false;
+    }
     return true;
 }
 } // namespace esm

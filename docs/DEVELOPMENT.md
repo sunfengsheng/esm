@@ -227,7 +227,7 @@ cmake --build build-content --target `
 ctest --test-dir build-content -R esm_content_tests --output-on-failure
 ```
 
-`esm_content_tests` 现在覆盖 `ContentAppSettings` 的 INI 保存/加载、独立默认数据根、统一提取调度、DOCX ZIP/XML/实体提取、基础 PDF 文本流提取和损坏文档诊断。测试样本在运行时自行生成，因此 CI 不依赖安装 Microsoft Office、PDF 阅读器或系统第三方 IFilter。Windows IFilter 仍是环境相关的扩展路径，不能把某台开发机上的可用性当作发布保证。旧目标 `esm_content_lab` 不再生成。
+`esm_content_tests` 现在覆盖 `ContentAppSettings` 的 INI 保存/加载、GUI 路径规范化/去重/大小边界、独立默认数据根、search/status/shutdown 协议编解码、Named Pipe server PID 识别和安全停止、统一提取调度、DOCX ZIP/XML/实体提取、基础 PDF 文本流提取和损坏文档诊断。测试样本在运行时自行生成，因此 CI 不依赖安装 Microsoft Office、PDF 阅读器或系统第三方 IFilter。Windows IFilter 仍是环境相关的扩展路径，不能把某台开发机上的可用性当作发布保证。旧目标 `esm_content_lab` 不再生成。
 
 内容应用图标由仓库脚本生成：
 

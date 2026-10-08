@@ -21,6 +21,12 @@ struct ContentPipeStatusResult {
     ContentIpcStatusResponse response;
 };
 
+struct ContentPipeShutdownResult {
+    std::uint32_t error{};
+    std::string protocol_error;
+    ContentIpcShutdownResponse response;
+};
+
 [[nodiscard]] std::uint32_t serve_content_named_pipe(
     std::wstring_view pipe_name,
     ContentIndex& index,
@@ -31,5 +37,12 @@ struct ContentPipeStatusResult {
     std::uint32_t timeout_ms = 5'000);
 [[nodiscard]] ContentPipeStatusResult query_content_named_pipe_status(
     std::wstring_view pipe_name,
+    std::uint32_t timeout_ms = 2'000);
+[[nodiscard]] ContentPipeShutdownResult request_content_named_pipe_shutdown(
+    std::wstring_view pipe_name,
+    std::uint32_t timeout_ms = 2'000);
+[[nodiscard]] std::uint32_t query_content_named_pipe_server_process_id(
+    std::wstring_view pipe_name,
+    std::uint32_t& process_id,
     std::uint32_t timeout_ms = 2'000);
 } // namespace esm

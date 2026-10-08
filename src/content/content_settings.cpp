@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cwchar>
 #include <limits>
 #include <system_error>
 
@@ -81,6 +82,36 @@ std::vector<std::filesystem::path> read_path_list(
     }
     return values;
 }
+
+bool equal_path_text(const std::filesystem::path& left,
+                     const std::filesystem::path& right) {
+    return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) ==
+           CSTR_EQUAL;
+}
+
+void deduplicate_paths(std::vector<std::filesystem::path>& paths) {
+    std::vector<std::filesystem::path> unique;
+    unique.reserve(paths.size());
+    for (auto& path : paths) {
+        if (path.empty()) continue;
+        if (std::none_of(unique.begin(), unique.end(), [&](const auto& item) {
+                return equal_path_text(item, path);
+            })) {
+            unique.push_back(std::move(path));
+        }
+    }
+    paths = std::move(unique);
+}
+
+void trim_trailing_separators(std::filesystem::path& path) {
+    auto text = path.wstring();
+    const auto root_length = path.root_path().wstring().size();
+    while (text.size() > root_length &&
+           (text.back() == L'\\' || text.back() == L'/')) {
+        text.pop_back();
+    }
+    path = std::move(text);
+}
 } // namespace
 
 std::filesystem::path default_content_app_data_root() {
@@ -113,6 +144,54 @@ void normalize_content_app_settings(ContentAppSettings& settings) {
         settings.roots.resize(maximum_roots);
     if (settings.excluded_paths.size() > maximum_excludes)
         settings.excluded_paths.resize(maximum_excludes);
+}
+
+bool validate_content_app_settings(ContentAppSettings& settings,
+                                   std::wstring& error) {
+    error.clear();
+    constexpr std::size_t mib = 1024U * 1024U;
+    if (settings.maximum_bytes < mib ||
+        settings.maximum_bytes > maximum_indexed_file_bytes) {
+        error = L"单文件大小上限必须在 1–64 MiB 之间。";
+        return false;
+    }
+
+    for (auto& root : settings.roots) {
+        std::error_code filesystem_error;
+        auto normalized = std::filesystem::absolute(root, filesystem_error);
+        if (filesystem_error) normalized = root;
+        normalized = normalized.lexically_normal();
+        if (!std::filesystem::is_directory(normalized, filesystem_error) ||
+            filesystem_error) {
+            error = L"索引根不是可访问的目录：" + normalized.wstring();
+            return false;
+        }
+        auto canonical = std::filesystem::weakly_canonical(
+            normalized, filesystem_error);
+        root = filesystem_error ? std::move(normalized)
+                                : std::move(canonical);
+        trim_trailing_separators(root);
+    }
+    deduplicate_paths(settings.roots);
+
+    for (auto& excluded : settings.excluded_paths) {
+        if (excluded.is_absolute()) {
+            std::error_code filesystem_error;
+            auto absolute = std::filesystem::absolute(excluded, filesystem_error);
+            excluded = (filesystem_error ? excluded : absolute).lexically_normal();
+        } else {
+            excluded = excluded.lexically_normal();
+        }
+        trim_trailing_separators(excluded);
+    }
+    deduplicate_paths(settings.excluded_paths);
+
+    if (!settings.all_fixed && settings.roots.empty()) {
+        error = L"请至少添加一个索引根，或选择“索引所有固定磁盘”。";
+        return false;
+    }
+    normalize_content_app_settings(settings);
+    return true;
 }
 
 bool load_content_app_settings(const std::filesystem::path& path,

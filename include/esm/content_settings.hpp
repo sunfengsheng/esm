@@ -25,6 +25,9 @@ struct ContentAppSettings {
 [[nodiscard]] std::filesystem::path default_content_config_path();
 [[nodiscard]] ContentAppSettings default_content_app_settings();
 void normalize_content_app_settings(ContentAppSettings& settings);
+[[nodiscard]] bool validate_content_app_settings(
+    ContentAppSettings& settings,
+    std::wstring& error);
 [[nodiscard]] bool load_content_app_settings(
     const std::filesystem::path& path,
     ContentAppSettings& settings,

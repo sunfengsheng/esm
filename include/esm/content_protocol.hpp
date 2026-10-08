@@ -20,6 +20,8 @@ enum class ContentIpcMessageType : std::uint16_t {
     search_response = 2,
     status_request = 3,
     status_response = 4,
+    shutdown_request = 5,
+    shutdown_response = 6,
 };
 
 struct ContentIpcFrameHeader {
@@ -47,6 +49,11 @@ struct ContentIpcSearchResponse {
 struct ContentIpcStatusResponse {
     std::uint32_t error{};
     ContentIndexStatus status;
+};
+
+struct ContentIpcShutdownResponse {
+    std::uint32_t error{};
+    std::wstring message;
 };
 
 [[nodiscard]] std::vector<std::uint8_t> encode_content_frame(
@@ -79,5 +86,11 @@ struct ContentIpcStatusResponse {
 [[nodiscard]] bool decode_content_status_response(
     std::span<const std::uint8_t> payload,
     ContentIpcStatusResponse& response,
+    std::string& error);
+[[nodiscard]] std::vector<std::uint8_t> encode_content_shutdown_response(
+    const ContentIpcShutdownResponse& response);
+[[nodiscard]] bool decode_content_shutdown_response(
+    std::span<const std::uint8_t> payload,
+    ContentIpcShutdownResponse& response,
     std::string& error);
 } // namespace esm
